@@ -1,0 +1,11 @@
+{
+    "name": "NFTAuth Token",
+    "description": "This NFT verifies the device used for passwordless login.",
+    "attributes": [
+      {
+        "trait_type": "Access Level",
+        "value": "Owner"
+      }
+    ]
+  }
+  

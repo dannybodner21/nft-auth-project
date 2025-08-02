@@ -1,0 +1,23 @@
+{
+    "name": "NFTAuth Token",
+    "description": "This NFT verifies the device and user for passwordless login.",
+    "attributes": [
+      {
+        "trait_type": "Access Level",
+        "value": "Owner"
+      },
+      {
+        "trait_type": "Device ID",
+        "value": "2F224883-2D11-432D-BB7D-74A5BAC4A868"
+      },
+      {
+        "trait_type": "Email",
+        "value": "test1@gmail.com"
+      },
+      {
+        "trait_type": "Registered At",
+        "value": "2025-08-01T00:00:00Z"
+      }
+    ]
+  }
+  

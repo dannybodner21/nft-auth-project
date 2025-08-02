@@ -137,7 +137,7 @@ app.get("/debug", (req, res) => {
 // Start server
 //app.listen(4000, () => console.log('🔐 NFT Login server running at http://localhost:4000'));
 
-const PORT = process.env.PORT || 4000;
+const PORT = 8080;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🔐 NFT Login server running on port ${PORT}`);
 });

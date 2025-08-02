@@ -68,6 +68,8 @@ app.post('/request-login', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email required' });
 
+  console.log("📩 Received login request for:", email);
+
   const requestId = uuidv4();
   pendingLogins[requestId] = {
     email,

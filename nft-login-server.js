@@ -11,23 +11,19 @@ const app = express();
 app.use(express.json());
 
 
+const allowedOrigin = "https://nft-auth-two.webflow.io";
+
 app.use((req, res, next) => {
-    res.setHeader("Access-Control-Allow-Origin", "https://nft-auth-two.webflow.io");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  
-    if (req.method === "OPTIONS") {
-      return res.status(200).end();
-    }
-  
-    next();
-  });
-  
-  // Catch-all 404 route
-  app.use((req, res, next) => {
-    res.setHeader("Access-Control-Allow-Origin", "https://nft-auth-two.webflow.io");
-    res.status(404).json({ success: false, error: "Not found" });
-  });
+  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
 
 
 // 🔐 Load Firebase service account
@@ -132,6 +128,10 @@ app.get('/check-login/:requestId', (req, res) => {
     
     res.setHeader('Content-Type', 'application/json');
     res.json({ success: true, status: request.status });
+});
+
+app.get("/debug", (req, res) => {
+    res.json({ success: true, message: "This is the real nft-login-server.js" });
 });
 
 // Start server

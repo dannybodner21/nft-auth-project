@@ -14,15 +14,18 @@ app.use(express.json());
 const allowedOrigin = "https://nft-auth-two.webflow.io";
 
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
+    console.log(`➡️  ${req.method} ${req.url}`);
 
-  next();
+    res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    if (req.method === "OPTIONS") {
+        return res.sendStatus(200);
+    }
+
+    next();
 });
 
 

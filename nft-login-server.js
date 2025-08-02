@@ -11,13 +11,19 @@ const app = express();
 app.use(express.json());
 
 
-const allowedOrigin = "https://nft-auth-two.webflow.io";
+const allowedOrigins = [
+    "https://nft-auth-two.webflow.io",
+    "https://linear-template-48cfc7.webflow.io"
+];
 
 app.use((req, res, next) => {
-
     console.log(`➡️  ${req.method} ${req.url}`);
 
-    res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+    const origin = req.headers.origin;
+    if (allowedOrigins.includes(origin)) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+    }
+
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 

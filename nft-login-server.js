@@ -197,17 +197,23 @@ app.post('/get-credentials', (req, res) => {
 
 app.post('/delete-credential', (req, res) => {
     const { email, deviceId, credentialId } = req.body;
-  
+
+    console.log("🧠 Incoming DELETE request with:");
+    console.log("email:", email);
+    console.log("deviceId:", deviceId);
+    console.log("credentialId:", credentialId);
+    console.log("userCredentials[email]:", userCredentials[email]);
+
     if (!email || !deviceId || !credentialId) {
       return res.status(400).json({ error: 'Missing fields' });
     }
-  
+
     const userCreds = userCredentials[email];
     if (!userCreds) return res.status(404).json({ error: 'No credentials found' });
-  
+
     const updatedCreds = userCreds.filter(c => c.id !== credentialId);
     userCredentials[email] = updatedCreds;
-  
+
     console.log(`✅ Deleted credential ${credentialId} for ${email}`);
     res.json({ success: true });
 });

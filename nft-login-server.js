@@ -187,7 +187,9 @@ app.post('/get-credentials', (req, res) => {
     if (!token) return res.status(403).json({ error: 'No registered device token' });
   
     const creds = userCredentials[email] || [];
-  
+    
+    console.log("Full credential map:", userCredentials);
+
     console.log(`Returned ${creds.length} credentials for ${email}`);
     res.json({ success: true, credentials: creds });
   });  

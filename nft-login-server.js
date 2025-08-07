@@ -171,16 +171,16 @@ app.post('/store-credentials', (req, res) => {
     // For now we skip full NFT ownership verification here – assumed to be done in app
   
     userCredentials[email] = credentials;
-    console.log(`💾 Stored ${credentials.length} encrypted credentials for ${email}`);
+    console.log(`Stored ${credentials.length} encrypted credentials for ${email}`);
     res.json({ success: true });
 });
 
 
 app.post('/get-credentials', (req, res) => {
-    const { email, deviceId } = req.body;
+    const { email } = req.body;
   
-    if (!email || !deviceId) {
-      return res.status(400).json({ error: 'Missing fields' });
+    if (!email) {
+      return res.status(400).json({ error: 'Missing email' });
     }
   
     const token = userTokens[email];
@@ -188,16 +188,16 @@ app.post('/get-credentials', (req, res) => {
   
     const creds = userCredentials[email] || [];
   
-    console.log(`📤 Returned ${creds.length} credentials for ${email}`);
-    res.json({ credentials: creds });
-});  
+    console.log(`Returned ${creds.length} credentials for ${email}`);
+    res.json({ success: true, credentials: creds });
+  });  
 
 
 // Start server
-//app.listen(4000, () => console.log('🔐 NFT Login server running at http://localhost:4000'));
+//app.listen(4000, () => console.log('NFT Login server running at http://localhost:4000'));
 
 
 const PORT = 8080;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🔐 NFT Login server running on port ${PORT}`);
+  console.log(`NFT Login server running on port ${PORT}`);
 });

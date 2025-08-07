@@ -47,6 +47,12 @@ admin.initializeApp({
 let pendingLogins = {};   // { requestId: { email, status, timestamp } }
 let userTokens = {};      // { email: deviceToken }
 
+// In-memory encrypted credentials store
+let userCredentials = {
+    // email: [{ url, username, passwordEncrypted }]
+};
+
+
 // 🔐 Save device token from app
 app.post('/save-token', (req, res) => {
   const { email, deviceToken } = req.body;
@@ -60,6 +66,7 @@ app.post('/save-token', (req, res) => {
   res.json({ success: true });
 });
 
+
 // 🟢 Used by /request-login to fetch the token for an email
 const db = {
   getUserByEmail: async (email) => {
@@ -68,6 +75,7 @@ const db = {
     return { email, deviceToken: token };
   }
 };
+
 
 // 🔐 Request login → sends push to device
 app.post('/request-login', async (req, res) => {
@@ -121,6 +129,7 @@ app.post('/request-login', async (req, res) => {
   }
 });
 
+
 // ✅ App confirms login decision
 app.post('/confirm-login', (req, res) => {
   const { requestId, approved } = req.body;
@@ -130,6 +139,7 @@ app.post('/confirm-login', (req, res) => {
   request.status = approved ? 'approved' : 'denied';
   res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
 });
+
 
 // 🟢 Frontend checks login status
 app.get('/check-login/:requestId', (req, res) => {
@@ -141,12 +151,51 @@ app.get('/check-login/:requestId', (req, res) => {
     res.json({ success: true, status: request.status });
 });
 
+
 app.get("/debug", (req, res) => {
     res.json({ success: true, message: "This is the real nft-login-server.js" });
 });
 
+
+app.post('/store-credentials', (req, res) => {
+    const { email, deviceId, credentials } = req.body;
+  
+    if (!email || !deviceId || !Array.isArray(credentials)) {
+      return res.status(400).json({ error: 'Missing or invalid fields' });
+    }
+  
+    // Check if device is registered
+    const user = userTokens[email];
+    if (!user) return res.status(403).json({ error: 'Unregistered device' });
+  
+    // For now we skip full NFT ownership verification here – assumed to be done in app
+  
+    userCredentials[email] = credentials;
+    console.log(`💾 Stored ${credentials.length} encrypted credentials for ${email}`);
+    res.json({ success: true });
+});
+
+
+app.post('/get-credentials', (req, res) => {
+    const { email, deviceId } = req.body;
+  
+    if (!email || !deviceId) {
+      return res.status(400).json({ error: 'Missing fields' });
+    }
+  
+    const token = userTokens[email];
+    if (!token) return res.status(403).json({ error: 'No registered device token' });
+  
+    const creds = userCredentials[email] || [];
+  
+    console.log(`📤 Returned ${creds.length} credentials for ${email}`);
+    res.json({ credentials: creds });
+});  
+
+
 // Start server
 //app.listen(4000, () => console.log('🔐 NFT Login server running at http://localhost:4000'));
+
 
 const PORT = 8080;
 app.listen(PORT, "0.0.0.0", () => {

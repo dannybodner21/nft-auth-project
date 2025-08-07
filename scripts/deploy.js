@@ -5,12 +5,12 @@ async function main() {
 
   console.log("Deploying contract with:", deployer.address);
 
-  const NFTAuth = await hre.ethers.getContractFactory("NFTAuth");
+  const PersonaAuth = await hre.ethers.getContractFactory("PersonaAuth");
 
   // Set a high gas price (e.g. 200 Gwei)
   const gasPrice = hre.ethers.utils.parseUnits("200", "gwei");
 
-  const contract = await NFTAuth.deploy(deployer.address, {
+  const contract = await PersonaAuth.deploy(deployer.address, {
     gasPrice: gasPrice,
   });
 
@@ -18,7 +18,7 @@ async function main() {
 
   await contract.deployed();
 
-  console.log("NFTAuth deployed to:", contract.address);
+  console.log("PersonaAuth deployed to:", contract.address);
 }
 
 main().catch((error) => {

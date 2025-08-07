@@ -217,6 +217,16 @@ app.post('/delete-credential', (req, res) => {
     console.log(`✅ Deleted credential ${credentialId} for ${email}`);
     res.json({ success: true });
 });
+
+
+app.post('/wipe-credentials', (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Missing email' });
+
+    delete userCredentials[email];
+    console.log(`🧹 Wiped all credentials for ${email}`);
+    res.json({ success: true });
+});
   
 
 // Start server

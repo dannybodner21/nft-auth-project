@@ -192,8 +192,26 @@ app.post('/get-credentials', (req, res) => {
 
     console.log(`Returned ${creds.length} credentials for ${email}`);
     res.json({ success: true, credentials: creds });
-  });  
+});
 
+
+app.post('/delete-credential', (req, res) => {
+    const { email, deviceId, credentialId } = req.body;
+  
+    if (!email || !deviceId || !credentialId) {
+      return res.status(400).json({ error: 'Missing fields' });
+    }
+  
+    const userCreds = userCredentials[email];
+    if (!userCreds) return res.status(404).json({ error: 'No credentials found' });
+  
+    const updatedCreds = userCreds.filter(c => c.id !== credentialId);
+    userCredentials[email] = updatedCreds;
+  
+    console.log(`✅ Deleted credential ${credentialId} for ${email}`);
+    res.json({ success: true });
+});
+  
 
 // Start server
 //app.listen(4000, () => console.log('NFT Login server running at http://localhost:4000'));

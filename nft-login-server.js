@@ -130,18 +130,18 @@ app.post('/request-login', async (req, res) => {
 
 // ✅ App confirms login decision
 app.post('/confirm-login', (req, res) => {
-
     const { requestId, approved, devicePublicKeyJwk } = req.body || {};
     const request = pendingLogins[requestId];
     if (!request) return res.status(404).json({ success: false, error: 'Request not found' });
-
+  
     request.status = approved ? 'approved' : 'denied';
-
+  
     // store the phone’s P-256 JWK when approved
     if (approved && devicePublicKeyJwk) {
-        request.devicePublicKeyJwk = devicePublicKeyJwk;
+      request.devicePublicKeyJwk = devicePublicKeyJwk;
+      devicePubKeys[request.email] = devicePublicKeyJwk;   // ⬅️ remember it by email
     }
-
+  
     res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
 });
 
@@ -159,6 +159,14 @@ app.get('/check-login/:requestId', (req, res) => {
 app.get("/debug", (req, res) => {
     res.json({ success: true, message: "This is the real nft-login-server.js" });
 });
+
+app.post('/get-device-pubkey', (req, res) => {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ success: false, error: 'Missing email' });
+    const jwk = devicePubKeys[email];
+    if (!jwk) return res.json({ success: true, found: false });
+    res.json({ success: true, found: true, devicePublicKeyJwk: jwk });
+});  
 
 app.post('/store-credentials', (req, res) => {
     const { email, deviceId, credentials } = req.body;
@@ -261,6 +269,11 @@ app.post('/wipe-credentials', (req, res) => {
 // In-memory: latest session key (wrapped for the device) per email
 let sessionKeyForDevice = {
     // [email]: { keyId, wrapped: { alg, iv, ct, salt, eph } }
+};
+
+// In-memory: latest device public key per email
+let devicePubKeys = {
+    // [email]: JWK
 };
   
 // Publish extension's session key (encrypted to device pubkey)

@@ -52,7 +52,6 @@ let userCredentials = {
     // email: [{ url, username, passwordEncrypted }]
 };
 
-
 // 🔐 Save device token from app
 app.post('/save-token', (req, res) => {
   const { email, deviceToken } = req.body;
@@ -66,7 +65,6 @@ app.post('/save-token', (req, res) => {
   res.json({ success: true });
 });
 
-
 // 🟢 Used by /request-login to fetch the token for an email
 const db = {
   getUserByEmail: async (email) => {
@@ -75,7 +73,6 @@ const db = {
     return { email, deviceToken: token };
   }
 };
-
 
 // 🔐 Request login → sends push to device
 app.post('/request-login', async (req, res) => {
@@ -131,7 +128,6 @@ app.post('/request-login', async (req, res) => {
   }
 });
 
-
 // ✅ App confirms login decision
 app.post('/confirm-login', (req, res) => {
 
@@ -149,7 +145,6 @@ app.post('/confirm-login', (req, res) => {
     res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
 });
 
-
 // 🟢 Frontend checks login status
 app.get('/check-login/:requestId', (req, res) => {
 
@@ -161,11 +156,9 @@ app.get('/check-login/:requestId', (req, res) => {
     res.json({ success: true, status: request.status, devicePublicKeyJwk: request.devicePublicKeyJwk || null });
 });
 
-
 app.get("/debug", (req, res) => {
     res.json({ success: true, message: "This is the real nft-login-server.js" });
 });
-
 
 app.post('/store-credentials', (req, res) => {
     const { email, deviceId, credentials } = req.body;
@@ -174,18 +167,55 @@ app.post('/store-credentials', (req, res) => {
       return res.status(400).json({ error: 'Missing or invalid fields' });
     }
   
-    // Check if device is registered
-    const user = userTokens[email];
-    if (!user) return res.status(403).json({ error: 'Unregistered device' });
+    // Require a registered mobile device (push token) to exist for this email
+    if (!userTokens[email]) {
+      return res.status(403).json({ error: 'Unregistered device' });
+    }
   
-    // For now we skip full NFT ownership verification here – assumed to be done in app
+    // Normalize: allow stringified items, ensure objects, keep unknown fields
+    const normIncoming = credentials
+      .map((it) => {
+        if (it && typeof it === 'object') return it;
+        if (typeof it === 'string') {
+          try { const obj = JSON.parse(it); return obj && typeof obj === 'object' ? obj : null; }
+          catch { return null; }
+        }
+        return null;
+      })
+      .filter(Boolean);
   
-    userCredentials[email] = credentials;
-    console.log(`Stored ${credentials.length} encrypted credentials for ${email}`);
-    res.json({ success: true });
+    // Existing list (in-memory)
+    const existing = Array.isArray(userCredentials[email]) ? userCredentials[email] : [];
+  
+    // If incoming is empty, DO NOT wipe. Just no-op and report success.
+    if (normIncoming.length === 0) {
+      console.log(`⚠️  /store-credentials: incoming empty for ${email} — ignoring to prevent wipe`);
+      return res.json({ success: true, merged: existing.length, incoming: 0 });
+    }
+  
+    // Merge by id (union): existing ∪ incoming (incoming replaces on same id)
+    const byId = new Map();
+  
+    // Keep all existing as-is (preserve fields like enc / wrapped_key_session / wrapped_key_device)
+    for (const item of existing) {
+      const id = (item && (item.id || item.id === 0)) ? String(item.id) : null;
+      if (id) byId.set(id, item);
+    }
+  
+    // Upsert incoming
+    for (const item of normIncoming) {
+      const id = (item && (item.id || item.id === 0)) ? String(item.id) : null;
+      if (!id) continue;                // ignore items without an id
+      byId.set(id, item);               // replace/insert
+    }
+  
+    const merged = Array.from(byId.values());
+    userCredentials[email] = merged;
+  
+    console.log(`✅ /store-credentials merged for ${email}: existing=${existing.length}, incoming=${normIncoming.length}, result=${merged.length}`);
+    res.json({ success: true, count: merged.length });
 });
-
-
+  
 app.post('/get-credentials', (req, res) => {
     const { email } = req.body;
   
@@ -203,7 +233,6 @@ app.post('/get-credentials', (req, res) => {
     console.log(`Returned ${creds.length} credentials for ${email}`);
     res.json({ success: true, credentials: creds });
 });
-
 
 app.post('/delete-credential', (req, res) => {
     const { email, deviceId, credentialId } = req.body;
@@ -227,7 +256,6 @@ app.post('/delete-credential', (req, res) => {
     console.log(`✅ Deleted credential ${credentialId} for ${email}`);
     res.json({ success: true });
 });
-
 
 app.post('/wipe-credentials', (req, res) => {
     const { email } = req.body;

@@ -79,6 +79,7 @@ const db = {
 
 // 🔐 Request login → sends push to device
 app.post('/request-login', async (req, res) => {
+
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email required' });
 
@@ -88,7 +89,8 @@ app.post('/request-login', async (req, res) => {
   pendingLogins[requestId] = {
     email,
     status: 'pending',
-    timestamp: Date.now()
+    timestamp: Date.now(),
+    devicePublicKeyJwk: null
   };
 
   const user = await db.getUserByEmail(email);
@@ -132,23 +134,31 @@ app.post('/request-login', async (req, res) => {
 
 // ✅ App confirms login decision
 app.post('/confirm-login', (req, res) => {
-  const { requestId, approved } = req.body;
-  const request = pendingLogins[requestId];
-  if (!request) return res.status(404).json({ success: false, error: 'Request not found' });
 
-  request.status = approved ? 'approved' : 'denied';
-  res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
+    const { requestId, approved, devicePublicKeyJwk } = req.body || {};
+    const request = pendingLogins[requestId];
+    if (!request) return res.status(404).json({ success: false, error: 'Request not found' });
+
+    request.status = approved ? 'approved' : 'denied';
+
+    // store the phone’s P-256 JWK when approved
+    if (approved && devicePublicKeyJwk) {
+        request.devicePublicKeyJwk = devicePublicKeyJwk;
+    }
+
+    res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
 });
 
 
 // 🟢 Frontend checks login status
 app.get('/check-login/:requestId', (req, res) => {
+
     console.log("📥 Incoming GET for", req.params.requestId);
     const request = pendingLogins[req.params.requestId];
     if (!request) return res.status(404).json({ success: false, error: 'Request not found' });
     
     res.setHeader('Content-Type', 'application/json');
-    res.json({ success: true, status: request.status });
+    res.json({ success: true, status: request.status, devicePublicKeyJwk: request.devicePublicKeyJwk || null });
 });
 
 

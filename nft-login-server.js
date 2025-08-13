@@ -226,13 +226,59 @@ app.post('/get-credentials', (req, res) => {
     const token = userTokens[email];
     if (!token) return res.status(403).json({ error: 'No registered device token' });
   
-    const creds = userCredentials[email] || [];
-    
-    console.log("Full credential map:", userCredentials);
-
+    const raw = Array.isArray(userCredentials[email]) ? userCredentials[email] : [];
+  
+    // --- normalize each credential so iOS sees proper objects (not stringified JSON) ---
+    const creds = raw
+      .map((it) => normalizeCred(it))
+      .filter(Boolean);
+  
     console.log(`Returned ${creds.length} credentials for ${email}`);
     res.json({ success: true, credentials: creds });
-});
+  });
+  
+  /**
+   * Normalize a credential record:
+   * - if the entire item is a JSON string, parse it
+   * - if nested fields like enc/wrapped_key_session/wrapped_key_device are JSON strings, parse them
+   * - keep unknown fields as-is; never drop anything
+   */
+  function normalizeCred(it) {
+    let obj = it;
+  
+    // Whole item may be stringified JSON
+    if (typeof obj === 'string') {
+      try { obj = JSON.parse(obj); } catch { return null; }
+    }
+    if (!obj || typeof obj !== 'object') return null;
+  
+    // Normalize nested enc
+    if (typeof obj.enc === 'string') {
+      try { obj.enc = JSON.parse(obj.enc); } catch {}
+    }
+  
+    // Normalize nested wrapped_key_session (can be object or base64 string; if base64 string, leave as-is)
+    if (typeof obj.wrapped_key_session === 'string') {
+      // If it's a JSON string, parse to object; if it's base64 (legacy), leave the string
+      try {
+        const maybe = JSON.parse(obj.wrapped_key_session);
+        if (maybe && typeof maybe === 'object') obj.wrapped_key_session = maybe;
+      } catch { /* keep as string (legacy session wrap) */ }
+    }
+  
+    // Normalize nested wrapped_key_device (MUST be object for iOS to decrypt)
+    if (typeof obj.wrapped_key_device === 'string') {
+      try { obj.wrapped_key_device = JSON.parse(obj.wrapped_key_device); } catch { /* leave as string if invalid */ }
+    }
+  
+    // Optionally coerce id to string for consistency (iOS is fine with either)
+    if (obj.id != null && typeof obj.id !== 'string') {
+      try { obj.id = String(obj.id); } catch {}
+    }
+  
+    return obj;
+  }
+  
 
 app.post('/delete-credential', (req, res) => {
     const { email, deviceId, credentialId } = req.body;

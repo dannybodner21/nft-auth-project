@@ -257,6 +257,37 @@ app.post('/wipe-credentials', (req, res) => {
     console.log(`🧹 Wiped all credentials for ${email}`);
     res.json({ success: true });
 });
+
+// In-memory: latest session key (wrapped for the device) per email
+let sessionKeyForDevice = {
+    // [email]: { keyId, wrapped: { alg, iv, ct, salt, eph } }
+};
+  
+// Publish extension's session key (encrypted to device pubkey)
+app.post('/publish-session-key-for-device', (req, res) => {
+    const { email, keyId, wrapped } = req.body || {};
+    if (!email || !keyId || !wrapped || !wrapped.iv || !wrapped.ct || !wrapped.salt || !wrapped.eph) {
+      return res.status(400).json({ success: false, error: 'missing fields' });
+    }
+    // Optional: only allow if device token exists (registered device)
+    if (!userTokens[email]) return res.status(403).json({ success: false, error: 'unregistered device' });
+  
+    sessionKeyForDevice[email] = { keyId, wrapped };
+    console.log(`🔑 published session key for ${email} (keyId ${keyId})`);
+    res.json({ success: true });
+});
+  
+// Phone fetches the latest session key (wrapped to its device key)
+app.post('/get-session-key-for-device', (req, res) => {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ success: false, error: 'missing email' });
+    if (!userTokens[email]) return res.status(403).json({ success: false, error: 'unregistered device' });
+  
+    const rec = sessionKeyForDevice[email] || null;
+    if (!rec) return res.json({ success: true, found: false });
+    res.json({ success: true, found: true, keyId: rec.keyId, wrapped: rec.wrapped });
+});
+  
   
 
 // Start server

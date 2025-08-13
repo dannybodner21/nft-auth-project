@@ -162,51 +162,30 @@ app.get("/debug", (req, res) => {
 
 app.post('/store-credentials', (req, res) => {
     const { email, deviceId, credentials } = req.body;
-  
     if (!email || !deviceId || !Array.isArray(credentials)) {
       return res.status(400).json({ error: 'Missing or invalid fields' });
     }
   
-    // Require a registered mobile device (push token) to exist for this email
-    if (!userTokens[email]) {
-      return res.status(403).json({ error: 'Unregistered device' });
-    }
+    // Normalize incoming items (string → object), keep unknown fields
+    const normIncoming = credentials.map(normalizeCred).filter(Boolean);
   
-    // Normalize: allow stringified items, ensure objects, keep unknown fields
-    const normIncoming = credentials
-      .map((it) => {
-        if (it && typeof it === 'object') return it;
-        if (typeof it === 'string') {
-          try { const obj = JSON.parse(it); return obj && typeof obj === 'object' ? obj : null; }
-          catch { return null; }
-        }
-        return null;
-      })
-      .filter(Boolean);
-  
-    // Existing list (in-memory)
-    const existing = Array.isArray(userCredentials[email]) ? userCredentials[email] : [];
-  
-    // If incoming is empty, DO NOT wipe. Just no-op and report success.
+    // If incoming empty, don’t wipe
     if (normIncoming.length === 0) {
       console.log(`⚠️  /store-credentials: incoming empty for ${email} — ignoring to prevent wipe`);
+      const existing = Array.isArray(userCredentials[email]) ? userCredentials[email] : [];
       return res.json({ success: true, merged: existing.length, incoming: 0 });
     }
   
-    // Merge by id (union): existing ∪ incoming (incoming replaces on same id)
+    const existing = Array.isArray(userCredentials[email]) ? userCredentials[email] : [];
     const byId = new Map();
   
-    // Keep all existing as-is (preserve fields like enc / wrapped_key_session / wrapped_key_device)
     for (const item of existing) {
-      const id = (item && (item.id || item.id === 0)) ? String(item.id) : null;
+      const id = item && item.id != null ? String(item.id) : null;
       if (id) byId.set(id, item);
     }
-  
-    // Upsert incoming
     for (const item of normIncoming) {
-      const id = (item && (item.id || item.id === 0)) ? String(item.id) : null;
-      if (!id) continue;                // ignore items without an id
-      byId.set(id, item);               // replace/insert
+      const id = item && item.id != null ? String(item.id) : null;
+      if (id) byId.set(id, item); // upsert
     }
   
     const merged = Array.from(byId.values());
@@ -214,68 +193,35 @@ app.post('/store-credentials', (req, res) => {
   
     console.log(`✅ /store-credentials merged for ${email}: existing=${existing.length}, incoming=${normIncoming.length}, result=${merged.length}`);
     res.json({ success: true, count: merged.length });
-});
+  });
+  
   
 app.post('/get-credentials', (req, res) => {
     const { email } = req.body;
-  
-    if (!email) {
-      return res.status(400).json({ error: 'Missing email' });
-    }
-  
-    const token = userTokens[email];
-    if (!token) return res.status(403).json({ error: 'No registered device token' });
+    if (!email) return res.status(400).json({ error: 'Missing email' });
   
     const raw = Array.isArray(userCredentials[email]) ? userCredentials[email] : [];
-  
-    // --- normalize each credential so iOS sees proper objects (not stringified JSON) ---
-    const creds = raw
-      .map((it) => normalizeCred(it))
-      .filter(Boolean);
+    const creds = raw.map(normalizeCred).filter(Boolean);
   
     console.log(`Returned ${creds.length} credentials for ${email}`);
     res.json({ success: true, credentials: creds });
   });
   
-  /**
-   * Normalize a credential record:
-   * - if the entire item is a JSON string, parse it
-   * - if nested fields like enc/wrapped_key_session/wrapped_key_device are JSON strings, parse them
-   * - keep unknown fields as-is; never drop anything
-   */
+  // Keep this helper:
   function normalizeCred(it) {
     let obj = it;
-  
-    // Whole item may be stringified JSON
-    if (typeof obj === 'string') {
-      try { obj = JSON.parse(obj); } catch { return null; }
-    }
+    if (typeof obj === 'string') { try { obj = JSON.parse(obj); } catch { return null; } }
     if (!obj || typeof obj !== 'object') return null;
   
-    // Normalize nested enc
-    if (typeof obj.enc === 'string') {
-      try { obj.enc = JSON.parse(obj.enc); } catch {}
-    }
+    if (typeof obj.enc === 'string') { try { obj.enc = JSON.parse(obj.enc); } catch {} }
   
-    // Normalize nested wrapped_key_session (can be object or base64 string; if base64 string, leave as-is)
+    // session wrap may be base64 string (legacy) or object; parse JSON strings only
     if (typeof obj.wrapped_key_session === 'string') {
-      // If it's a JSON string, parse to object; if it's base64 (legacy), leave the string
-      try {
-        const maybe = JSON.parse(obj.wrapped_key_session);
-        if (maybe && typeof maybe === 'object') obj.wrapped_key_session = maybe;
-      } catch { /* keep as string (legacy session wrap) */ }
+      try { const maybe = JSON.parse(obj.wrapped_key_session); if (maybe && typeof maybe === 'object') obj.wrapped_key_session = maybe; } catch {}
     }
+    if (typeof obj.wrapped_key_device === 'string') { try { obj.wrapped_key_device = JSON.parse(obj.wrapped_key_device); } catch {} }
   
-    // Normalize nested wrapped_key_device (MUST be object for iOS to decrypt)
-    if (typeof obj.wrapped_key_device === 'string') {
-      try { obj.wrapped_key_device = JSON.parse(obj.wrapped_key_device); } catch { /* leave as string if invalid */ }
-    }
-  
-    // Optionally coerce id to string for consistency (iOS is fine with either)
-    if (obj.id != null && typeof obj.id !== 'string') {
-      try { obj.id = String(obj.id); } catch {}
-    }
-  
+    if (obj.id != null && typeof obj.id !== 'string') { try { obj.id = String(obj.id); } catch {} }
     return obj;
   }
   

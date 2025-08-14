@@ -41,6 +41,14 @@ let userCredentials = {};   // { email: [ { id, name?, url?, enc, wrapped_key_se
 // { txId: { email, credentialId, status: 'pending'|'approved'|'denied', payload?: {username,password}, expiresAt?: ts, createdAt } }
 let pendingDecrypts = {};
 
+// Email verification (in-memory)
+const pendingEmailCodes = {};   // { email: { code, expiresAt } }
+const verifiedEmails     = {};   // { email: true }
+function makeCode6() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+
 // 🔐 Save device token from app
 app.post('/save-token', (req, res) => {
   const { email, deviceToken } = req.body;
@@ -125,6 +133,40 @@ app.get('/check-login/:requestId', (req, res) => {
   res.json({ success: true, status: request.status, devicePublicKeyJwk: request.devicePublicKeyJwk || null });
 });
 
+// Start email verification: returns { success: true } and logs code to server console
+app.post('/start-email-verify', (req, res) => {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ success: false, error: 'Missing email' });
+  
+    const code = makeCode6();
+    pendingEmailCodes[email] = { code, expiresAt: Date.now() + 10 * 60 * 1000 }; // 10 min TTL
+  
+    console.log(`📧 Email verify code for ${email}: ${code} (valid 10 min)`);
+    // TODO: send via real mail provider instead of console.log
+    return res.json({ success: true });
+});
+  
+// Confirm email verification
+app.post('/confirm-email-verify', (req, res) => {
+    const { email, code } = req.body || {};
+    if (!email || !code) return res.status(400).json({ success: false, error: 'Missing fields' });
+  
+    const rec = pendingEmailCodes[email];
+    if (!rec) return res.status(400).json({ success: false, error: 'No code pending' });
+    if (Date.now() > rec.expiresAt) {
+      delete pendingEmailCodes[email];
+      return res.status(400).json({ success: false, error: 'Code expired' });
+    }
+    if (String(code).trim() !== rec.code) {
+      return res.status(400).json({ success: false, error: 'Invalid code' });
+    }
+  
+    verifiedEmails[email] = true;
+    delete pendingEmailCodes[email];
+    console.log(`✅ Email verified: ${email}`);
+    return res.json({ success: true });
+});
+  
 app.get("/debug", (req, res) => {
   res.json({ success: true, message: "This is the real nft-login-server.js" });
 });
@@ -135,6 +177,10 @@ app.post('/store-credentials', (req, res) => {
   if (!email || !deviceId || !Array.isArray(credentials)) {
     return res.status(400).json({ error: 'Missing or invalid fields' });
   }
+
+  if (!verifiedEmails[email]) {
+    return res.status(403).json({ success: false, error: 'Email not verified' });
+  }  
 
   const user = userTokens[email];
   if (!user) return res.status(403).json({ error: 'Unregistered device' });
@@ -147,6 +193,10 @@ app.post('/store-credentials', (req, res) => {
 app.post('/get-credentials', (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Missing email' });
+
+  if (!verifiedEmails[email]) {
+    return res.status(403).json({ success: false, error: 'Email not verified' });
+  }  
 
   const token = userTokens[email];
   if (!token) return res.status(403).json({ error: 'No registered device token' });

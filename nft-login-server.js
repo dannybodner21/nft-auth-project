@@ -79,7 +79,8 @@ app.post('/request-login', async (req, res) => {
     email,
     status: 'pending',
     timestamp: Date.now(),
-    devicePublicKeyJwk: null
+    devicePublicKeyJwk: null,
+    extSession: null
   };
 
   const user = await db.getUserByEmail(email);
@@ -125,12 +126,17 @@ app.post('/confirm-login', (req, res) => {
 
 // 🟢 Frontend checks login status
 app.get('/check-login/:requestId', (req, res) => {
-  console.log("📥 Incoming GET for", req.params.requestId);
-  const request = pendingLogins[req.params.requestId];
-  if (!request) return res.status(404).json({ success: false, error: 'Request not found' });
-
-  res.setHeader('Content-Type', 'application/json');
-  res.json({ success: true, status: request.status, devicePublicKeyJwk: request.devicePublicKeyJwk || null });
+    console.log("📥 Incoming GET for", req.params.requestId);
+    const r = pendingLogins[req.params.requestId];
+    if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
+  
+    res.setHeader('Content-Type', 'application/json');
+    res.json({
+      success: true,
+      status: r.status,
+      devicePublicKeyJwk: r.devicePublicKeyJwk || null,
+      extSession: r.extSession || null   // ⬅️ NEW: extension's handshake (if posted)
+    });
 });
 
 // Start email verification: returns { success: true } and logs code to server console
@@ -322,6 +328,26 @@ app.get('/check-decrypt/:txId', (req, res) => {
 
   return res.json({ success: true, found: true, status: tx.status });
 });
+
+// Extension posts its per-session handshake so the phone can derive the same key
+// Body: { requestId, keyId, eph: {kty:"EC", crv:"P-256", x, y}, salt }
+app.post('/post-session-handshake', (req, res) => {
+    const { requestId, keyId, eph, salt } = req.body || {};
+    const r = pendingLogins[requestId];
+    if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
+    if (r.status !== 'approved') {
+      return res.status(409).json({ success: false, error: 'Login not approved yet' });
+    }
+  
+    // minimal validation
+    if (!keyId || !eph || typeof eph?.x !== 'string' || typeof eph?.y !== 'string' || typeof salt !== 'string') {
+      return res.status(400).json({ success: false, error: 'Invalid handshake payload' });
+    }
+  
+    r.extSession = { keyId, eph, salt };  // stored for the phone to pick up
+    console.log(`🔐 Stored session handshake for ${r.email} (keyId=${keyId})`);
+    res.json({ success: true });
+});  
 
 // Optional: periodic cleanup
 setInterval(() => {

@@ -198,12 +198,13 @@ app.post('/store-credentials', (req, res) => {
 
 app.post('/get-credentials', (req, res) => {
     const { email } = req.body;
+  
     if (!email) {
       return res.status(400).json({ error: 'Missing email' });
     }
   
-    // DEV-friendly fallback (same as db.getUserByEmail)
-    const token = userTokens[email] || process.env.TEST_PUSH_TOKEN;
+    // DEV fallback so extension works even if /save-token hasn’t run yet
+    const token = userTokens[email] || process.env.TEST_PUSH_TOKEN || null;
     if (!token) {
       return res.status(403).json({ error: 'No registered device token' });
     }
@@ -211,7 +212,7 @@ app.post('/get-credentials', (req, res) => {
     const creds = userCredentials[email] || [];
     console.log(`Returned ${creds.length} credentials for ${email}`);
     res.json({ success: true, credentials: creds });
-});
+});  
 
 app.post('/delete-credential', (req, res) => {
   const { email, deviceId, credentialId } = req.body;
@@ -348,6 +349,23 @@ app.post('/post-session-handshake', (req, res) => {
     console.log(`🔐 Stored session handshake for ${r.email} (keyId=${keyId})`);
     res.json({ success: true });
 });  
+
+
+
+
+// TEMP: debug what tokens the server has for each email -----------------------
+app.get('/debug-tokens', (req, res) => {
+    res.json({
+      success: true,
+      emails: Object.keys(userTokens),
+      tokens: userTokens,             // careful: shows full tokens (dev only)
+    });
+  });
+
+// --- DELETE THIS ROUTE -------------------------------------------------------
+
+
+
 
 // Optional: periodic cleanup
 setInterval(() => {

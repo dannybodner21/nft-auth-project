@@ -215,30 +215,33 @@ app.post('/get-credentials', (req, res) => {
 });  
 
 app.post('/delete-credential', (req, res) => {
-    const { email, deviceId, credentialId } = req.body;
-    const target = String(credentialId || '').trim();
-    console.log("🧠 Incoming DELETE request with:", { email, deviceId, credentialId: target });
-    
-    if (!email || !deviceId || !target) {
-        return res.status(400).json({ error: 'Missing fields' });
+    const { email, deviceId, credentialId } = req.body || {};
+    console.log("🧠 Incoming DELETE request with:", { email, deviceId, credentialId });
+  
+    if (!email || !deviceId || !credentialId) {
+      return res.status(400).json({ success: false, error: 'Missing fields' });
     }
-    const userCreds = userCredentials[email];
-    if (!userCreds) return res.status(404).json({ error: 'No credentials found' });
-    
-    // Normalize both sides to strings before compare
-    const before = userCreds.length;
-    const updatedCreds = userCreds.filter(c => String(c?.id ?? '') !== target);
-    userCredentials[email] = updatedCreds;
-    
-    if (updatedCreds.length < before) {
-        console.log(`✅ Deleted credential ${target} for ${email}`);
-        return res.json({ success: true, deleted: 1 });
-    } else {
-        console.log(`⚠️ No match for credential ${target} for ${email}`);
-        return res.status(404).json({ success: false, error: 'Credential not found' });
+  
+    const list = userCredentials[email];
+    if (!Array.isArray(list)) {
+      // Idempotent: nothing to delete, but don’t 404
+      return res.json({ success: true, removed: 0 });
     }
-});
-    
+  
+    const target = String(credentialId).trim().toLowerCase();
+  
+    // Log what we have for quick debugging
+    console.log("🧾 Existing IDs for", email, list.map(c => String(c?.id || '').toLowerCase()));
+  
+    const before = list.length;
+    const updated = list.filter(c => String(c?.id || '').trim().toLowerCase() !== target);
+    const removed = before - updated.length;
+  
+    userCredentials[email] = updated;
+  
+    console.log(`🗑️ Delete ${credentialId} for ${email} → removed=${removed} (before=${before}, after=${updated.length})`);
+    return res.json({ success: true, removed });
+});  
 
 app.post('/wipe-credentials', (req, res) => {
   const { email } = req.body;

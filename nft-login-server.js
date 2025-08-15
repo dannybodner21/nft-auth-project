@@ -215,21 +215,30 @@ app.post('/get-credentials', (req, res) => {
 });  
 
 app.post('/delete-credential', (req, res) => {
-  const { email, deviceId, credentialId } = req.body;
-  console.log("🧠 Incoming DELETE request with:", { email, deviceId, credentialId });
-
-  if (!email || !deviceId || !credentialId) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
-  const userCreds = userCredentials[email];
-  if (!userCreds) return res.status(404).json({ error: 'No credentials found' });
-
-  const updatedCreds = userCreds.filter(c => c.id !== credentialId);
-  userCredentials[email] = updatedCreds;
-
-  console.log(`✅ Deleted credential ${credentialId} for ${email}`);
-  res.json({ success: true });
+    const { email, deviceId, credentialId } = req.body;
+    const target = String(credentialId || '').trim();
+    console.log("🧠 Incoming DELETE request with:", { email, deviceId, credentialId: target });
+    
+    if (!email || !deviceId || !target) {
+        return res.status(400).json({ error: 'Missing fields' });
+    }
+    const userCreds = userCredentials[email];
+    if (!userCreds) return res.status(404).json({ error: 'No credentials found' });
+    
+    // Normalize both sides to strings before compare
+    const before = userCreds.length;
+    const updatedCreds = userCreds.filter(c => String(c?.id ?? '') !== target);
+    userCredentials[email] = updatedCreds;
+    
+    if (updatedCreds.length < before) {
+        console.log(`✅ Deleted credential ${target} for ${email}`);
+        return res.json({ success: true, deleted: 1 });
+    } else {
+        console.log(`⚠️ No match for credential ${target} for ${email}`);
+        return res.status(404).json({ success: false, error: 'Credential not found' });
+    }
 });
+    
 
 app.post('/wipe-credentials', (req, res) => {
   const { email } = req.body;

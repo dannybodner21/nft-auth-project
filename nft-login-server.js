@@ -14,32 +14,17 @@ app.use(express.json());
 const allowedOrigins = new Set([
     "https://nft-auth-two.webflow.io",
     "https://linear-template-48cfc7.webflow.io",
-  ]);
+]);
   
-  app.use((req, res, next) => {
-    const origin = req.headers.origin;
-  
-    // Allow chrome-extension://* and our known sites. Also allow requests with no Origin header.
-    if (!origin) {
-      // e.g., some extension/background or curl – allow for dev
-      res.setHeader("Access-Control-Allow-Origin", "*");
-    } else if (origin.startsWith("chrome-extension://") || allowedOrigins.has(origin)) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-      res.setHeader("Vary", "Origin");
-    }
-  
+app.use((req, res, next) => {
+    const origin = req.headers.origin || "*";
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    // Allow the headers we actually send
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Requested-With");
-    // (optional) if you ever use cookies/auth later:
-    // res.setHeader("Access-Control-Allow-Credentials", "true");
-  
-    if (req.method === "OPTIONS") {
-      // Important: return a 204 with the same CORS headers so the browser unblocks the real request
-      return res.status(204).end();
-    }
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") return res.sendStatus(200);
     next();
-});  
+});
 
 // 🔐 Firebase
 const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);

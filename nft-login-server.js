@@ -110,15 +110,19 @@ app.post('/request-login', async (req, res) => {
 
 // ✅ App confirms login decision (and provides phone public key)
 app.post('/confirm-login', (req, res) => {
-  const { requestId, approved, devicePublicKeyJwk } = req.body || {};
-  const r = pendingLogins[requestId];
-  if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
-
-  r.status = approved ? 'approved' : 'denied';
-  if (approved && devicePublicKeyJwk) r.devicePublicKeyJwk = devicePublicKeyJwk;
-
-  console.log(`📬 confirm-login ${requestId} → ${r.status}${approved ? ' (pubkey set)' : ''}`);
-  res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
+    const { requestId, approved, devicePublicKeyJwk } = req.body || {};
+    const request = pendingLogins[requestId];
+    if (!request) return res.status(404).json({ success: false, error: 'Request not found' });
+  
+    request.status = approved ? 'approved' : 'denied';
+    if (approved && devicePublicKeyJwk && devicePublicKeyJwk.x && devicePublicKeyJwk.y) {
+      request.devicePublicKeyJwk = devicePublicKeyJwk;
+      console.log(`📎 Stored devicePublicKeyJwk for ${requestId} (x.len=${devicePublicKeyJwk.x.length})`);
+    } else if (approved) {
+      console.warn(`⚠️ Approved but missing/invalid devicePublicKeyJwk for ${requestId}`);
+    }
+  
+    res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
 });
 
 // Frontend (extension or web) polls login status

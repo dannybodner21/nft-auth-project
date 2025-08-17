@@ -382,6 +382,31 @@ app.get('/debug-tokens', (req, res) => {
   });
 });
 
+// --- Beacon fallback for extension handshake (no CORS preflight) ---
+app.get('/beacon/session-handshake', (req, res) => {
+    const { requestId, keyId, x, y, salt } = req.query || {};
+    const r = pendingLogins[String(requestId || '')];
+    console.log("🛰️  beacon/session-handshake", { requestId, keyId, hasX: !!x, hasY: !!y, hasSalt: !!salt });
+  
+    if (!r) return res.status(404).end('nf');
+    if (r.status !== 'approved') return res.status(409).end('not-approved');
+    if (!keyId || !x || !y || !salt) return res.status(400).end('bad');
+  
+    r.extSession = {
+      keyId: String(keyId),
+      eph: { kty: "EC", crv: "P-256", x: String(x), y: String(y) },
+      salt: String(salt)
+    };
+  
+    console.log(`🔐 [beacon] Stored extSession for ${r.email} requestId=${requestId} keyId=${keyId}`);
+  
+    // tiny 1x1 gif so we can return image content for no-cors fetch
+    const buf = Buffer.from('R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==', 'base64');
+    res.setHeader('Content-Type', 'image/gif');
+    res.end(buf);
+});
+  
+
 // Cleanup
 setInterval(() => {
   const now = Date.now();

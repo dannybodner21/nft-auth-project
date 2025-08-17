@@ -10,21 +10,36 @@ const app = express();
 app.use(express.json());
 
 // CORS (web demos); extensions can still call without ACAO if host-permissioned
-const allowedOrigins = [
-  "https://nft-auth-two.webflow.io",
-  "https://linear-template-48cfc7.webflow.io"
-];
-app.use((req, res, next) => {
-  console.log(`➡️  ${req.method} ${req.url}`);
-  const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
+// CORS — allow Webflow, and also Chrome extensions + no-origin (service workers sometimes omit)
+const allowedOrigins = new Set([
+    "https://nft-auth-two.webflow.io",
+    "https://linear-template-48cfc7.webflow.io",
+  ]);
+  
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+  
+    // Allow chrome-extension://* and our known sites. Also allow requests with no Origin header.
+    if (!origin) {
+      // e.g., some extension/background or curl – allow for dev
+      res.setHeader("Access-Control-Allow-Origin", "*");
+    } else if (origin.startsWith("chrome-extension://") || allowedOrigins.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    }
+  
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    // Allow the headers we actually send
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Requested-With");
+    // (optional) if you ever use cookies/auth later:
+    // res.setHeader("Access-Control-Allow-Credentials", "true");
+  
+    if (req.method === "OPTIONS") {
+      // Important: return a 204 with the same CORS headers so the browser unblocks the real request
+      return res.status(204).end();
+    }
+    next();
+});  
 
 // 🔐 Firebase
 const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
@@ -338,19 +353,24 @@ app.get('/check-decrypt/:txId', (req, res) => {
 // Extension posts its per-session handshake so the phone can derive the same key
 // Body: { requestId, keyId, eph: {kty:"EC", crv:"P-256", x, y}, salt }
 app.post('/post-session-handshake', (req, res) => {
-  const { requestId, keyId, eph, salt } = req.body || {};
-  const r = pendingLogins[requestId];
-  if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
-  if (r.status !== 'approved') {
-    return res.status(409).json({ success: false, error: 'Login not approved yet' });
-  }
-  if (!keyId || !eph || typeof eph?.x !== 'string' || typeof eph?.y !== 'string' || typeof salt !== 'string') {
-    return res.status(400).json({ success: false, error: 'Invalid handshake payload' });
-  }
-
-  r.extSession = { keyId, eph, salt };
-  console.log(`🔐 Stored session handshake for ${r.email} (keyId=${keyId})`);
-  res.json({ success: true });
+    const { requestId, keyId, eph, salt } = req.body || {};
+    const r = pendingLogins[requestId];
+  
+    console.log("🛰️  /post-session-handshake origin:", req.headers.origin || "(none)");
+    console.log("🛰️  /post-session-handshake body keys:", Object.keys(req.body || {}));
+  
+    if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
+    if (r.status !== 'approved') {
+      return res.status(409).json({ success: false, error: 'Login not approved yet' });
+    }
+  
+    if (!keyId || !eph || !eph.x || !eph.y || !salt) {
+      return res.status(400).json({ success: false, error: 'Invalid handshake payload' });
+    }
+  
+    r.extSession = { keyId, eph, salt };
+    console.log(`🔐 Stored session handshake for ${r.email} requestId=${requestId} keyId=${keyId}`);
+    res.json({ success: true });
 });
 
 // Debug: what tokens we have

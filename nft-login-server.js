@@ -9,14 +9,13 @@ const path = require('path');
 const app = express();
 app.use(express.json());
 
+// CORS (web demos); extensions can still call without ACAO if host-permissioned
 const allowedOrigins = [
   "https://nft-auth-two.webflow.io",
   "https://linear-template-48cfc7.webflow.io"
 ];
-
 app.use((req, res, next) => {
   console.log(`➡️  ${req.method} ${req.url}`);
-
   const origin = req.headers.origin;
   if (allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -27,38 +26,32 @@ app.use((req, res, next) => {
   next();
 });
 
-// 🔐 Load Firebase service account
-// const serviceAccount = require(path.join(__dirname, 'service-account.json'));
+// 🔐 Firebase
 const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
-// In-memory storage
-let pendingLogins = {};     // { requestId: { email, status, timestamp, devicePublicKeyJwk? } }
+// In-memory stores (dev)
+let pendingLogins = {};     // { requestId: { email, websiteDomain?, status, timestamp, devicePublicKeyJwk?, extSession? } }
 let userTokens = {};        // { email: deviceToken }
 let userCredentials = {};   // { email: [ { id, name?, url?, enc, wrapped_key_session?, wrapped_key_device? } ] }
 
-// ✅ NEW: phone-assisted decrypt transactions (ephemeral)
-// { txId: { email, credentialId, status: 'pending'|'approved'|'denied', payload?: {username,password}, expiresAt?: ts, createdAt } }
-let pendingDecrypts = {};
+// Phone-assisted decrypt state
+let pendingDecrypts = {};   // { txId: { email, credentialId, status, payload?, expiresAt?, createdAt } }
 
-// Email verification (in-memory)
+// Email verification (dev)
 const pendingEmailCodes = {};   // { email: { code, expiresAt } }
 const verifiedEmails     = {};   // { email: true }
-function makeCode6() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
+const makeCode6 = () => String(Math.floor(100000 + Math.random() * 900000));
 
-
-// 🔐 Save device token from app
+// Save device token from the app
 app.post('/save-token', (req, res) => {
-  const { email, deviceToken } = req.body;
+  const { email, deviceToken } = req.body || {};
   if (!email || !deviceToken) return res.status(400).json({ error: 'Email and deviceToken required' });
   userTokens[email] = deviceToken;
   console.log(`💾 Saved token for ${email}`);
   res.json({ success: true });
 });
 
-// 🟢 Used by /request-login to fetch the token for an email
 const db = {
   getUserByEmail: async (email) => {
     const token = userTokens[email] || process.env.TEST_PUSH_TOKEN;
@@ -67,16 +60,18 @@ const db = {
   }
 };
 
+// at top-level
+const logins = new Map(); // (unused alias, keeping for compatibility comments)
+
 // 🔐 Request login → sends push to device
 app.post('/request-login', async (req, res) => {
-  const { email } = req.body;
+  const { email, websiteDomain } = req.body || {}; // ⭐ CHANGED: accept websiteDomain (optional)
   if (!email) return res.status(400).json({ error: 'Email required' });
-
-  console.log("📩 Received login request for:", email);
 
   const requestId = uuidv4();
   pendingLogins[requestId] = {
     email,
+    websiteDomain: websiteDomain || null, // ⭐ CHANGED: store for overlay text on phone
     status: 'pending',
     timestamp: Date.now(),
     devicePublicKeyJwk: null,
@@ -91,12 +86,13 @@ app.post('/request-login', async (req, res) => {
     token: deviceToken,
     notification: {
       title: 'NFT Login Request',
-      body: `Approve login for ${email}?`
+      body: websiteDomain ? `Approve sign-in: ${websiteDomain}` : `Approve login for ${email}?`
     },
     data: {
       type: 'login_request',
       email,
-      requestId
+      requestId,
+      ...(websiteDomain ? { websiteDomain } : {}) // ⭐ CHANGED: include for app UI
     },
     android: { priority: 'high' },
     apns: { payload: { aps: { sound: 'default', category: 'LOGIN_REQUEST' } } }
@@ -104,7 +100,7 @@ app.post('/request-login', async (req, res) => {
 
   try {
     await admin.messaging().send(message);
-    console.log(`✅ Push sent to ${email}`);
+    console.log(`✅ Push sent to ${email} (${requestId})`);
     res.json({ success: true, requestId });
   } catch (error) {
     console.error("❌ FCM error:", error);
@@ -112,139 +108,143 @@ app.post('/request-login', async (req, res) => {
   }
 });
 
-// ✅ App confirms login decision
+// ✅ App confirms login decision (and provides phone public key)
 app.post('/confirm-login', (req, res) => {
   const { requestId, approved, devicePublicKeyJwk } = req.body || {};
-  const request = pendingLogins[requestId];
-  if (!request) return res.status(404).json({ success: false, error: 'Request not found' });
+  const r = pendingLogins[requestId];
+  if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
 
-  request.status = approved ? 'approved' : 'denied';
-  if (approved && devicePublicKeyJwk) request.devicePublicKeyJwk = devicePublicKeyJwk;
+  r.status = approved ? 'approved' : 'denied';
+  if (approved && devicePublicKeyJwk) r.devicePublicKeyJwk = devicePublicKeyJwk;
 
+  console.log(`📬 confirm-login ${requestId} → ${r.status}${approved ? ' (pubkey set)' : ''}`);
   res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
 });
 
-// 🟢 Frontend checks login status
+// Frontend (extension or web) polls login status
 app.get('/check-login/:requestId', (req, res) => {
-    console.log("📥 Incoming GET for", req.params.requestId);
-    const r = pendingLogins[req.params.requestId];
-    if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
-  
-    res.setHeader('Content-Type', 'application/json');
-    res.json({
-      success: true,
-      status: r.status,
-      devicePublicKeyJwk: r.devicePublicKeyJwk || null,
-      extSession: r.extSession || null   // ⬅️ NEW: extension's handshake (if posted)
-    });
+  const r = pendingLogins[req.params.requestId];
+  if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
+  res.setHeader('Cache-Control', 'no-store'); // ⭐ CHANGED: avoid any intermediary caching
+  res.json({
+    success: true,
+    status: r.status,
+    devicePublicKeyJwk: r.devicePublicKeyJwk || null,
+    extSession: r.extSession || null
+  });
 });
 
-// Start email verification: returns { success: true } and logs code to server console
+// ⭐ NEW: Phone polls for the extension’s session handshake after approval
+app.get('/get-session-handshake/:requestId', (req, res) => {
+  const r = pendingLogins[req.params.requestId];
+  if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
+
+  res.setHeader('Cache-Control', 'no-store');
+  if (r.status !== 'approved') {
+    return res.json({ success: true, found: false, status: r.status });
+  }
+  if (!r.extSession) {
+    return res.json({ success: true, found: false, status: 'awaiting_handshake' });
+  }
+  const { keyId, eph, salt } = r.extSession || {};
+  return res.json({
+    success: true,
+    found: true,
+    email: r.email,
+    websiteDomain: r.websiteDomain || null,
+    keyId, eph, salt
+  });
+});
+
+// Email verification (dev: code is logged to server)
 app.post('/start-email-verify', (req, res) => {
-    const { email } = req.body || {};
-    if (!email) return res.status(400).json({ success: false, error: 'Missing email' });
-  
-    const code = makeCode6();
-    pendingEmailCodes[email] = { code, expiresAt: Date.now() + 10 * 60 * 1000 }; // 10 min TTL
-  
-    console.log(`📧 Email verify code for ${email}: ${code} (valid 10 min)`);
-    // TODO: send via real mail provider instead of console.log
-    return res.json({ success: true });
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ success: false, error: 'Missing email' });
+  const code = makeCode6();
+  pendingEmailCodes[email] = { code, expiresAt: Date.now() + 10 * 60 * 1000 };
+  console.log(`📧 Email verify code for ${email}: ${code} (valid 10 min)`);
+  return res.json({ success: true });
 });
-  
-// Confirm email verification
+
 app.post('/confirm-email-verify', (req, res) => {
-    const { email, code } = req.body || {};
-    if (!email || !code) return res.status(400).json({ success: false, error: 'Missing fields' });
-  
-    const rec = pendingEmailCodes[email];
-    if (!rec) return res.status(400).json({ success: false, error: 'No code pending' });
-    if (Date.now() > rec.expiresAt) {
-      delete pendingEmailCodes[email];
-      return res.status(400).json({ success: false, error: 'Code expired' });
-    }
-    if (String(code).trim() !== rec.code) {
-      return res.status(400).json({ success: false, error: 'Invalid code' });
-    }
-  
-    verifiedEmails[email] = true;
+  const { email, code } = req.body || {};
+  if (!email || !code) return res.status(400).json({ success: false, error: 'Missing fields' });
+  const rec = pendingEmailCodes[email];
+  if (!rec) return res.status(400).json({ success: false, error: 'No code pending' });
+  if (Date.now() > rec.expiresAt) {
     delete pendingEmailCodes[email];
-    console.log(`✅ Email verified: ${email}`);
-    return res.json({ success: true });
+    return res.status(400).json({ success: false, error: 'Code expired' });
+  }
+  if (String(code).trim() !== rec.code) {
+    return res.status(400).json({ success: false, error: 'Invalid code' });
+  }
+  verifiedEmails[email] = true;
+  delete pendingEmailCodes[email];
+  console.log(`✅ Email verified: ${email}`);
+  return res.json({ success: true });
 });
-  
+
 app.get("/debug", (req, res) => {
   res.json({ success: true, message: "This is the real nft-login-server.js" });
 });
 
 // ===== Credentials (encrypted blobs) =====
 app.post('/store-credentials', (req, res) => {
-  const { email, deviceId, credentials } = req.body;
+  const { email, deviceId, credentials } = req.body || {};
   if (!email || !deviceId || !Array.isArray(credentials)) {
     return res.status(400).json({ error: 'Missing or invalid fields' });
   }
-
   if (!verifiedEmails[email]) {
     return res.status(403).json({ success: false, error: 'Email not verified' });
-  }  
-
-  const user = userTokens[email];
-  if (!user) return res.status(403).json({ error: 'Unregistered device' });
+  }
+  const token = userTokens[email] || process.env.TEST_PUSH_TOKEN;
+  if (!token) return res.status(403).json({ error: 'Unregistered device' });
 
   userCredentials[email] = credentials;
-  console.log(`Stored ${credentials.length} encrypted credentials for ${email}`);
+  console.log(`💾 Stored ${credentials.length} encrypted credentials for ${email}`);
   res.json({ success: true });
 });
 
 app.post('/get-credentials', (req, res) => {
-    const { email } = req.body;
-  
-    if (!email) {
-      return res.status(400).json({ error: 'Missing email' });
-    }
-  
-    // DEV fallback so extension works even if /save-token hasn’t run yet
-    const token = userTokens[email] || process.env.TEST_PUSH_TOKEN || null;
-    if (!token) {
-      return res.status(403).json({ error: 'No registered device token' });
-    }
-  
-    const creds = userCredentials[email] || [];
-    console.log(`Returned ${creds.length} credentials for ${email}`);
-    res.json({ success: true, credentials: creds });
-});  
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+
+  const token = userTokens[email] || process.env.TEST_PUSH_TOKEN || null;
+  if (!token) return res.status(403).json({ error: 'No registered device token' });
+
+  const creds = userCredentials[email] || [];
+  console.log(`📤 Returned ${creds.length} credentials for ${email}`);
+  res.json({ success: true, credentials: creds });
+});
 
 app.post('/delete-credential', (req, res) => {
-    const { email, deviceId, credentialId } = req.body || {};
-    console.log("🧠 Incoming DELETE request with:", { email, deviceId, credentialId });
-  
-    if (!email || !deviceId || !credentialId) {
-      return res.status(400).json({ success: false, error: 'Missing fields' });
-    }
-  
-    const list = userCredentials[email];
-    if (!Array.isArray(list)) {
-      // Idempotent: nothing to delete, but don’t 404
-      return res.json({ success: true, removed: 0 });
-    }
-  
-    const target = String(credentialId).trim().toLowerCase();
-  
-    // Log what we have for quick debugging
-    console.log("🧾 Existing IDs for", email, list.map(c => String(c?.id || '').toLowerCase()));
-  
-    const before = list.length;
-    const updated = list.filter(c => String(c?.id || '').trim().toLowerCase() !== target);
-    const removed = before - updated.length;
-  
-    userCredentials[email] = updated;
-  
-    console.log(`🗑️ Delete ${credentialId} for ${email} → removed=${removed} (before=${before}, after=${updated.length})`);
-    return res.json({ success: true, removed });
-});  
+  const { email, deviceId, credentialId } = req.body || {};
+  console.log("🧠 Incoming DELETE request with:", { email, deviceId, credentialId });
+
+  if (!email || !deviceId || !credentialId) {
+    return res.status(400).json({ success: false, error: 'Missing fields' });
+  }
+
+  const list = userCredentials[email];
+  if (!Array.isArray(list)) {
+    return res.json({ success: true, removed: 0 }); // idempotent
+  }
+
+  const target = String(credentialId).trim().toLowerCase();
+  console.log("🧾 Existing IDs for", email, list.map(c => String(c?.id || '').toLowerCase()));
+
+  const before = list.length;
+  const updated = list.filter(c => String(c?.id || '').trim().toLowerCase() !== target);
+  const removed = before - updated.length;
+
+  userCredentials[email] = updated;
+
+  console.log(`🗑️ Delete ${credentialId} for ${email} → removed=${removed} (before=${before}, after=${updated.length})`);
+  return res.json({ success: true, removed });
+});
 
 app.post('/wipe-credentials', (req, res) => {
-  const { email } = req.body;
+  const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Missing email' });
   delete userCredentials[email];
   console.log(`🧹 Wiped all credentials for ${email}`);
@@ -252,16 +252,8 @@ app.post('/wipe-credentials', (req, res) => {
 });
 
 /* =======================================================
-   🔐 NEW: Phone-assisted decrypt (no secrets in extension)
-   -------------------------------------------------------
-   Flow:
-   - Extension POST /request-decrypt { email, credentialId, label? }
-     -> sends FCM "decrypt_request" to device
-   - App decrypts locally, POST /confirm-decrypt { txId, approved, data:{username,password} }
-   - Extension polls GET /check-decrypt/:txId until approved; then consumes once
-   Secrets live only in memory briefly and are deleted on first read or expiry.
+   🔐 Phone-assisted decrypt (no secrets in extension)
    ======================================================= */
-
 app.post('/request-decrypt', async (req, res) => {
   const { email, credentialId, label } = req.body || {};
   if (!email || !credentialId) return res.status(400).json({ success: false, error: 'email and credentialId required' });
@@ -312,7 +304,6 @@ app.post('/confirm-decrypt', (req, res) => {
 
   tx.status = approved ? 'approved' : 'denied';
   if (approved) {
-    // DO NOT log secrets
     if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') {
       return res.status(400).json({ success: false, error: 'Missing data' });
     }
@@ -326,16 +317,14 @@ app.get('/check-decrypt/:txId', (req, res) => {
   const tx = pendingDecrypts[req.params.txId];
   if (!tx) return res.json({ success: true, found: false });
 
-  // Expire old approved payloads
   if (tx.expiresAt && Date.now() > tx.expiresAt) {
     delete pendingDecrypts[req.params.txId];
     return res.json({ success: true, found: false, expired: true });
-  }
+    }
 
   if (tx.status === 'approved' && tx.payload) {
     const data = tx.payload;
-    // consume once
-    delete pendingDecrypts[req.params.txId];
+    delete pendingDecrypts[req.params.txId]; // consume once
     return res.json({ success: true, found: true, status: 'approved', data });
   }
 
@@ -345,41 +334,31 @@ app.get('/check-decrypt/:txId', (req, res) => {
 // Extension posts its per-session handshake so the phone can derive the same key
 // Body: { requestId, keyId, eph: {kty:"EC", crv:"P-256", x, y}, salt }
 app.post('/post-session-handshake', (req, res) => {
-    const { requestId, keyId, eph, salt } = req.body || {};
-    const r = pendingLogins[requestId];
-    if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
-    if (r.status !== 'approved') {
-      return res.status(409).json({ success: false, error: 'Login not approved yet' });
-    }
-  
-    // minimal validation
-    if (!keyId || !eph || typeof eph?.x !== 'string' || typeof eph?.y !== 'string' || typeof salt !== 'string') {
-      return res.status(400).json({ success: false, error: 'Invalid handshake payload' });
-    }
-  
-    r.extSession = { keyId, eph, salt };  // stored for the phone to pick up
-    console.log(`🔐 Stored session handshake for ${r.email} (keyId=${keyId})`);
-    res.json({ success: true });
-});  
+  const { requestId, keyId, eph, salt } = req.body || {};
+  const r = pendingLogins[requestId];
+  if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
+  if (r.status !== 'approved') {
+    return res.status(409).json({ success: false, error: 'Login not approved yet' });
+  }
+  if (!keyId || !eph || typeof eph?.x !== 'string' || typeof eph?.y !== 'string' || typeof salt !== 'string') {
+    return res.status(400).json({ success: false, error: 'Invalid handshake payload' });
+  }
 
+  r.extSession = { keyId, eph, salt };
+  console.log(`🔐 Stored session handshake for ${r.email} (keyId=${keyId})`);
+  res.json({ success: true });
+});
 
-
-
-// TEMP: debug what tokens the server has for each email -----------------------
+// Debug: what tokens we have
 app.get('/debug-tokens', (req, res) => {
-    res.json({
-      success: true,
-      emails: Object.keys(userTokens),
-      tokens: userTokens,             // careful: shows full tokens (dev only)
-    });
+  res.json({
+    success: true,
+    emails: Object.keys(userTokens),
+    tokens: userTokens,
   });
+});
 
-// --- DELETE THIS ROUTE -------------------------------------------------------
-
-
-
-
-// Optional: periodic cleanup
+// Cleanup
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of Object.entries(pendingDecrypts)) {
@@ -394,7 +373,7 @@ setInterval(() => {
   }
 }, 60_000);
 
-// Start server
+// Start
 const PORT = 8080;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`NFT Login server running on port ${PORT}`);

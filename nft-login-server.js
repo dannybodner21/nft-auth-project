@@ -38,6 +38,9 @@ let userCredentials = {};   // { email: [ { id, name?, url?, enc, wrapped_key_se
 // Phone-assisted decrypt state
 let pendingDecrypts = {};   // { txId: { email, credentialId, status, payload?, expiresAt?, createdAt } }
 
+let sessionApprovals = {}; 
+
+
 // Email verification (dev)
 const pendingEmailCodes = {};   // { email: { code, expiresAt } }
 const verifiedEmails     = {};   // { email: true }
@@ -194,20 +197,27 @@ app.get("/debug", (req, res) => {
 
 // ===== Credentials (encrypted blobs) =====
 app.post('/store-credentials', (req, res) => {
-  const { email, deviceId, credentials } = req.body || {};
-  if (!email || !deviceId || !Array.isArray(credentials)) {
-    return res.status(400).json({ error: 'Missing or invalid fields' });
-  }
-  if (!verifiedEmails[email]) {
-    return res.status(403).json({ success: false, error: 'Email not verified' });
-  }
-  const token = userTokens[email] || process.env.TEST_PUSH_TOKEN;
-  if (!token) return res.status(403).json({ error: 'Unregistered device' });
-
-  userCredentials[email] = credentials;
-  console.log(`💾 Stored ${credentials.length} encrypted credentials for ${email}`);
-  res.json({ success: true });
+    const { email, deviceId, credentials } = req.body || {};
+    if (!email || !deviceId || !Array.isArray(credentials)) {
+      return res.status(400).json({ success: false, error: 'Missing or invalid fields' });
+    }
+  
+    // Allow if (a) the old email verification is present OR (b) a push-approved session lease is active
+    const hasLiveSession = sessionApprovals[email] && Date.now() < sessionApprovals[email];
+    if (!verifiedEmails[email] && !hasLiveSession) {
+      return res.status(403).json({ success: false, error: 'Session locked or expired' });
+    }
+  
+    // Require a registered device token (phone owns the NFT)
+    const token = userTokens[email] || process.env.TEST_PUSH_TOKEN;
+    if (!token) return res.status(403).json({ success: false, error: 'Unregistered device' });
+  
+    // Persist encrypted blobs (source of truth is the phone; these are opaque to server/extension)
+    userCredentials[email] = credentials;
+    console.log(`💾 Stored ${credentials.length} encrypted credentials for ${email}`);
+    return res.json({ success: true });
 });
+  
 
 app.post('/get-credentials', (req, res) => {
   const { email } = req.body || {};
@@ -335,6 +345,7 @@ app.get('/check-decrypt/:txId', (req, res) => {
   return res.json({ success: true, found: true, status: tx.status });
 });
 
+
 // Extension posts its per-session handshake so the phone can derive the same key
 // Body: { requestId, keyId, eph: {kty:"EC", crv:"P-256", x, y}, salt }
 app.post('/post-session-handshake', (req, res) => {
@@ -348,15 +359,21 @@ app.post('/post-session-handshake', (req, res) => {
     if (r.status !== 'approved') {
       return res.status(409).json({ success: false, error: 'Login not approved yet' });
     }
-  
     if (!keyId || !eph || !eph.x || !eph.y || !salt) {
       return res.status(400).json({ success: false, error: 'Invalid handshake payload' });
     }
   
     r.extSession = { keyId, eph, salt };
     console.log(`🔐 Stored session handshake for ${r.email} requestId=${requestId} keyId=${keyId}`);
-    res.json({ success: true });
+  
+    // ✅ Grant a 2h session lease for this email (used to allow saves/reads from the extension)
+    const TTL_MS = 2 * 60 * 60 * 1000;
+    sessionApprovals[r.email] = Date.now() + TTL_MS;
+    console.log(`🔓 Session approved for ${r.email} until ${new Date(sessionApprovals[r.email]).toISOString()}`);
+  
+    return res.json({ success: true });
 });
+
 
 // Debug: what tokens we have
 app.get('/debug-tokens', (req, res) => {
@@ -404,6 +421,9 @@ setInterval(() => {
     if (now - (v.timestamp || 0) > 10 * 60_000) {
       delete pendingLogins[k];
     }
+  }
+  for (const [email, exp] of Object.entries(sessionApprovals)) {
+    if (Date.now() > exp) delete sessionApprovals[email];
   }
 }, 60_000);
 

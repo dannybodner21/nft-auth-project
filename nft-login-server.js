@@ -46,19 +46,21 @@ function normalizedHashTriplet(value) {
 const app = express();
 app.use(express.json());
 
-// CORS (web demos / extensions)
-const allowedOrigins = new Set([
-  "https://nft-auth-two.webflow.io",
-  "https://linear-template-48cfc7.webflow.io",
-]);
+// CORS — allow Chrome extensions; native apps / service workers send no Origin and don't need CORS
 app.use((req, res, next) => {
-  const origin = req.headers.origin || "*";
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
+    const origin = req.headers.origin;
+    const isExtension = typeof origin === 'string' && origin.startsWith('chrome-extension://');
+  
+    if (isExtension) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    }
+    // For requests with no Origin (iOS URLSession, extension service worker), do not set ACAO—CORS not applicable.
+  
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
 });
 
 // 🔐 Firebase Admin

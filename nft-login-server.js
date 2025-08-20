@@ -6,6 +6,38 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const path = require('path');
 
+// === Owner mint wiring (ethers v5) ===
+const { ethers } = require('ethers');
+
+const RPC_URL          = process.env.RPC_URL;             // e.g. https://polygon-mainnet.infura.io/v3/...
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;    // PersonaAuth contract
+const OWNER_PRIVATE_KEY= process.env.OWNER_PRIVATE_KEY;   // owner key that deployed PersonaAuth
+
+let provider, ownerSigner, personaAuth;
+if (RPC_URL && CONTRACT_ADDRESS && OWNER_PRIVATE_KEY) {
+  provider    = new ethers.providers.JsonRpcProvider(RPC_URL);
+  ownerSigner = new ethers.Wallet(OWNER_PRIVATE_KEY, provider);
+
+  const personaAuthAbi = [
+    "function safeMint(address to, bytes32[3] emailHashes, bytes32[3] deviceIdHashes) public"
+  ];
+  personaAuth = new ethers.Contract(CONTRACT_ADDRESS, personaAuthAbi, ownerSigner);
+} else {
+  console.warn("⚠️ Minting disabled: set RPC_URL, CONTRACT_ADDRESS, OWNER_PRIVATE_KEY in env");
+}
+
+// helpers
+const ZERO32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
+function keccakUtf8(s) {
+  return ethers.utils.keccak256(ethers.utils.toUtf8Bytes(String(s || "")));
+}
+function makeHashTriplet(value) {
+  // Minimal, explicit: first slot = keccak(value), rest zeroes (easy to change later)
+  const h = keccakUtf8(value);
+  return [h, ZERO32, ZERO32];
+}
+
+
 const app = express();
 app.use(express.json());
 
@@ -27,8 +59,22 @@ app.use((req, res, next) => {
 });
 
 // 🔐 Firebase
-const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
+const fs = require('fs');
+let serviceAccount;
+
+if (process.env.FIREBASE_CONFIG) {
+  // Option A: creds provided inline as JSON string env var
+  serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
+} else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  // Option B: path to JSON file (what your .env uses)
+  const p = path.resolve(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+  serviceAccount = JSON.parse(fs.readFileSync(p, 'utf8'));
+} else {
+  throw new Error('No Firebase credentials: set FIREBASE_CONFIG or GOOGLE_APPLICATION_CREDENTIALS');
+}
+
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+
 
 // In-memory stores (dev)
 let pendingLogins = {};     // { requestId: { email, websiteDomain?, status, timestamp, devicePublicKeyJwk?, extSession? } }
@@ -68,48 +114,50 @@ const logins = new Map(); // (unused alias, keeping for compatibility comments)
 
 // 🔐 Request login → sends push to device
 app.post('/request-login', async (req, res) => {
-  const { email, websiteDomain } = req.body || {}; // ⭐ CHANGED: accept websiteDomain (optional)
-  if (!email) return res.status(400).json({ error: 'Email required' });
-
-  const requestId = uuidv4();
-  pendingLogins[requestId] = {
-    email,
-    websiteDomain: websiteDomain || null, // ⭐ CHANGED: store for overlay text on phone
-    status: 'pending',
-    timestamp: Date.now(),
-    devicePublicKeyJwk: null,
-    extSession: null
-  };
-
-  const user = await db.getUserByEmail(email);
-  const deviceToken = user?.deviceToken;
-  if (!deviceToken) return res.status(404).json({ error: 'No device token registered' });
-
-  const message = {
-    token: deviceToken,
-    notification: {
-      title: 'NFT Login Request',
-      body: websiteDomain ? `Approve sign-in: ${websiteDomain}` : `Approve login for ${email}?`
-    },
-    data: {
-      type: 'login_request',
+    const { email, websiteDomain } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'Email required' });
+  
+    const requestId = uuidv4();
+    pendingLogins[requestId] = {
       email,
-      requestId,
-      ...(websiteDomain ? { websiteDomain } : {}) // ⭐ CHANGED: include for app UI
-    },
-    android: { priority: 'high' },
-    apns: { payload: { aps: { sound: 'default', category: 'LOGIN_REQUEST' } } }
-  };
-
-  try {
-    await admin.messaging().send(message);
-    console.log(`✅ Push sent to ${email} (${requestId})`);
-    res.json({ success: true, requestId });
-  } catch (error) {
-    console.error("❌ FCM error:", error);
-    res.status(500).json({ success: false, error: "Failed to send push notification" });
-  }
+      websiteDomain: websiteDomain || null,
+      status: 'pending',
+      timestamp: Date.now(),
+      devicePublicKeyJwk: null,
+      extSession: null
+    };
+  
+    const user = await db.getUserByEmail(email);
+    const deviceToken = user?.deviceToken;
+    if (!deviceToken) return res.status(404).json({ error: 'No device token registered' });
+  
+    const message = {
+      token: deviceToken,
+      notification: {
+        // ⬇️ Updated copy
+        title: 'NFT Auth Request',
+        body: 'Approve or deny request'
+      },
+      data: {
+        type: 'login_request',
+        email,
+        requestId,
+        ...(websiteDomain ? { websiteDomain } : {})
+      },
+      android: { priority: 'high' },
+      apns: { payload: { aps: { sound: 'default', category: 'LOGIN_REQUEST' } } }
+    };
+  
+    try {
+      await admin.messaging().send(message);
+      console.log(`✅ Push sent to ${email} (${requestId})`);
+      res.json({ success: true, requestId });
+    } catch (error) {
+      console.error("❌ FCM error:", error);
+      res.status(500).json({ success: false, error: "Failed to send push notification" });
+    }
 });
+  
 
 // ✅ App confirms login decision (and provides phone public key)
 app.post('/confirm-login', (req, res) => {
@@ -426,6 +474,52 @@ setInterval(() => {
     if (Date.now() > exp) delete sessionApprovals[email];
   }
 }, 60_000);
+
+
+// === Owner-signed mint endpoint ===
+// Body: { email, deviceId, to }  -> mints to `to`
+app.post('/mint-nft', async (req, res) => {
+    try {
+      if (!personaAuth || !ownerSigner) {
+        return res.status(503).json({ success: false, error: 'Minting not configured on server' });
+      }
+  
+      const { email, deviceId, to } = req.body || {};
+      if (!email || !to) {
+        return res.status(400).json({ success: false, error: 'email and to are required' });
+      }
+      if (!ethers.utils.isAddress(to)) {
+        return res.status(400).json({ success: false, error: 'Invalid recipient address' });
+      }
+  
+      // Basic gate: only allow if this email has a registered device token (your current trust anchor)
+      const token = userTokens[email] || process.env.TEST_PUSH_TOKEN || null;
+      if (!token) {
+        return res.status(403).json({ success: false, error: 'No registered device token for this email' });
+      }
+  
+      // Normalize inputs
+      const emailNorm   = String(email).trim().toLowerCase();
+      const deviceIdStr = String(deviceId || "").trim();
+  
+      // Build bytes32[3] arrays (first slot populated, others zero; revise later if needed)
+      const emailHashes    = makeHashTriplet(emailNorm);
+      const deviceIdHashes = deviceIdStr ? makeHashTriplet(deviceIdStr) : [ZERO32, ZERO32, ZERO32];
+  
+      console.log(`🪙 Mint request → to=${to}, email=${emailNorm}, deviceId=${deviceIdStr || '(none)'}`);
+  
+      const tx = await personaAuth.safeMint(to, emailHashes, deviceIdHashes);
+      console.log(`⛓️  Mint tx sent: ${tx.hash}`);
+  
+      // Do NOT await confirmations here (keep mobile UX snappy). Client can poll if needed.
+      return res.json({ success: true, txHash: tx.hash });
+  
+    } catch (err) {
+      console.error('❌ /mint-nft error:', err);
+      return res.status(500).json({ success: false, error: 'Mint failed', details: String(err.message || err) });
+    }
+  });
+  
 
 // Start
 const PORT = 8080;

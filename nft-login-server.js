@@ -47,6 +47,36 @@ function normalizedHashTriplet(value) {
   return [h, ZERO32, ZERO32];
 }
 
+
+
+// Read-only ABI for queries
+const readAbi = [
+    "function balanceOf(address owner) view returns (uint256)",
+    "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)",
+    "function tokenData(uint256 tokenId) view returns (bytes32[3] emailHashes, bytes32[3] deviceIdHashes, uint256 createdAt)"
+  ];
+  
+  const personaRead = (RPC_URL && CONTRACT_ADDRESS && provider)
+    ? new ethers.Contract(CONTRACT_ADDRESS, readAbi, provider)
+    : null;
+  
+  function normKeccak(input) {
+    const norm = String(input || "").trim().toLowerCase();
+    return ethers.utils.keccak256(ethers.utils.toUtf8Bytes(norm));
+  }
+  function anyEq(arr, val) {
+    const v = String(val).toLowerCase();
+    return Array.isArray(arr) && arr.some(x => String(x).toLowerCase() === v);
+  }
+  
+
+
+
+
+
+
+
+
 // ---------------------- App init ----------------------
 const app = express();
 app.use(express.json());
@@ -530,9 +560,70 @@ app.get('/has-nft/:address', async (req, res) => {
       console.error('❌ /has-nft error:', err);
       return res.status(500).json({ success: false, error: String(err.message || err) });
     }
-  });
+});
   
-
+// --- READ: does this address own at least 1 PNA? ---
+// GET /nft-owned?address=0x...
+app.get('/nft-owned', async (req, res) => {
+    try {
+      if (!personaRead) {
+        return res.status(503).json({ success: false, error: 'Read contract not configured' });
+      }
+      const addr = String(req.query.address || '').trim();
+      if (!addr || !ethers.utils.isAddress(addr)) {
+        return res.status(400).json({ success: false, error: 'Valid address required' });
+      }
+  
+      const bal = await personaRead.balanceOf(addr);
+      const owned = bal.gt(0);
+      return res.json({ success: true, owned, balance: bal.toString() });
+    } catch (e) {
+      console.error('❌ /nft-owned:', e);
+      return res.status(500).json({ success: false, error: 'query failed' });
+    }
+});
+  
+// --- READ+VERIFY: optional strict match on email/deviceId hashes ---
+// POST /nft-owned-verify  { address, email?, deviceId? }
+app.post('/nft-owned-verify', async (req, res) => {
+    try {
+      if (!personaRead) {
+        return res.status(503).json({ success: false, error: 'Read contract not configured' });
+      }
+      const { address, email, deviceId } = req.body || {};
+      if (!address || !ethers.utils.isAddress(address)) {
+        return res.status(400).json({ success: false, error: 'Valid address required' });
+      }
+      const bal = await personaRead.balanceOf(address);
+      const owned = bal.gt(0);
+      if (!owned) return res.json({ success: true, owned: false, matched: false });
+  
+      const wantEmail = email && String(email).trim();
+      const wantDevice = deviceId && String(deviceId).trim();
+      const hEmail  = wantEmail  ? normKeccak(wantEmail)  : null;
+      const hDevice = wantDevice ? normKeccak(wantDevice) : null;
+  
+      let matched = false;
+      const n = Math.min(bal.toNumber(), 8); // cap enumeration for safety
+      for (let i = 0; i < n; i++) {
+        const tokenId = await personaRead.tokenOfOwnerByIndex(address, i);
+        const td = await personaRead.tokenData(tokenId);
+        // td = [ emailHashes[3], deviceIdHashes[3], createdAt ]
+        const emailHashes   = td[0];
+        const deviceHashes  = td[1];
+  
+        const emailOk  = hEmail  ? anyEq(emailHashes,  hEmail)  : true;
+        const deviceOk = hDevice ? anyEq(deviceHashes, hDevice) : true;
+        if (emailOk && deviceOk) { matched = true; break; }
+      }
+  
+      return res.json({ success: true, owned: true, matched });
+    } catch (e) {
+      console.error('❌ /nft-owned-verify:', e);
+      return res.status(500).json({ success: false, error: 'verify failed' });
+    }
+});
+  
 // ---------------------- Start ----------------------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {

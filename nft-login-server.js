@@ -24,9 +24,14 @@ if (RPC_URL && CONTRACT_ADDRESS && OWNER_PRIVATE_KEY) {
   ownerSigner = new ethers.Wallet(OWNER_PRIVATE_KEY, provider);
 
   const personaAuthAbi = [
-    "function safeMint(address to, bytes32[3] emailHashes, bytes32[3] deviceIdHashes) public"
+    "function safeMint(address to, bytes32[3] emailHashes, bytes32[3] deviceIdHashes) public",
+    "function balanceOf(address owner) view returns (uint256)",
+    "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)"
   ];
+
+  // And make the instance with owner signer:
   personaAuth = new ethers.Contract(CONTRACT_ADDRESS, personaAuthAbi, ownerSigner);
+
 } else {
   console.warn("⚠️ Minting disabled: set RPC_URL, CONTRACT_ADDRESS, OWNER_PRIVATE_KEY in env");
 }
@@ -490,6 +495,43 @@ app.post('/mint-persona', async (req, res) => {
     return res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });
+
+// Read-only: does this address own a PersonaAuth NFT?
+app.get('/has-nft/:address', async (req, res) => {
+    try {
+      if (!personaAuth) {
+        return res.status(503).json({ success: false, error: 'Contract not configured' });
+      }
+      const address = String(req.params.address || '').trim();
+      if (!ethers.utils.isAddress(address)) {
+        return res.status(400).json({ success: false, error: 'Bad address' });
+      }
+  
+      const bal = await personaAuth.balanceOf(address);
+      const has = bal.gt(0);
+  
+      // Optional: enumerate tokenIds (since ERC721Enumerable)
+      let tokenIds = [];
+      if (has) {
+        const n = bal.toNumber();
+        for (let i = 0; i < n; i++) {
+          const id = await personaAuth.tokenOfOwnerByIndex(address, i);
+          tokenIds.push(id.toString());
+        }
+      }
+  
+      return res.json({
+        success: true,
+        hasNFT: has,
+        balance: bal.toString(),
+        tokenIds
+      });
+    } catch (err) {
+      console.error('❌ /has-nft error:', err);
+      return res.status(500).json({ success: false, error: String(err.message || err) });
+    }
+  });
+  
 
 // ---------------------- Start ----------------------
 const PORT = process.env.PORT || 8080;

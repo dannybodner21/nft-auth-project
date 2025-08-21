@@ -1,3 +1,5 @@
+
+
 // nft-login-server.js
 require('dotenv').config();
 const express = require('express');
@@ -45,6 +47,40 @@ function normalizedHashTriplet(value) {
   const norm = String(value || "").trim().toLowerCase();
   const h = keccakUtf8(norm);
   return [h, ZERO32, ZERO32];
+}
+
+
+// --- Aggressive EIP-1559 fees for Polygon mainnet (ethers v5/v6 compatible) ---
+const parseUnits = ethers.utils?.parseUnits || ethers.parseUnits;
+
+/**
+ * Returns { maxFeePerGas, maxPriorityFeePerGas } as BigNumber/bigint (matching ethers version)
+ * Policy:
+ *  - priority = max(suggestedPriority*3, 50 gwei)
+ *  - baseFeeCeil = max(suggestedBase*3, 30 gwei)
+ *  - maxFee = baseFeeCeil + priority
+ */
+async function getAggressiveFees(pvd) {
+  // v5: provider.getFeeData(); v6: provider.getFeeData()
+  const fd = await pvd.getFeeData();
+
+  // Normalize to string gwei then back to units to handle v5/v6
+  const suggestedPriorityGwei =
+    (fd.maxPriorityFeePerGas ?? fd.gasPrice ?? 0).toString(); // wei
+  const suggestedBaseGwei =
+    (fd.lastBaseFeePerGas ?? fd.gasPrice ?? 0).toString(); // wei
+
+  // Convert to gwei floats safely by dividing by 1e9, then clamp
+  const toGwei = (weiStr) => Number(ethers.utils?.formatUnits
+    ? ethers.utils.formatUnits(weiStr, "gwei")
+    : (Number(weiStr) / 1e9));
+
+  const prio = Math.max(toGwei(suggestedPriorityGwei) * 3, 50); // ≥ 50 gwei
+  const base = Math.max(toGwei(suggestedBaseGwei) * 3, 30);     // ≥ 30 gwei
+  const maxPriorityFeePerGas = parseUnits(String(Math.ceil(prio)), "gwei");
+  const maxFeePerGas         = parseUnits(String(Math.ceil(base + prio)), "gwei");
+
+  return { maxFeePerGas, maxPriorityFeePerGas };
 }
 
 
@@ -471,28 +507,53 @@ setInterval(() => {
 // Body: { email, deviceId, to }
 app.post('/mint-nft', async (req, res) => {
   try {
-    if (!personaAuth || !ownerSigner) {
-      return res.status(503).json({ success: false, error: 'Minting not configured on server' });
-    }
-    const { email, deviceId, to } = req.body || {};
-    if (!email || !to) return res.status(400).json({ success: false, error: 'email and to are required' });
-    if (!isAddress(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
 
-    // gate by “registered device token” (your current trust anchor)
-    const token = userTokens[email] || process.env.TEST_PUSH_TOKEN || null;
-    if (!token) return res.status(403).json({ success: false, error: 'No registered device token for this email' });
+        const { email, deviceId, to } = req.body || {};
+        if (!email || !to) return res.status(400).json({ success: false, error: 'email and to are required' });
+        if (!isAddress(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
 
-    const emailNorm   = String(email).trim().toLowerCase();
-    const deviceIdStr = String(deviceId || "").trim();
+        // gate by push token (as you already do)
+        const token = userTokens[email] || process.env.TEST_PUSH_TOKEN || null;
+        if (!token) return res.status(403).json({ success: false, error: 'No registered device token for this email' });
 
-    const emailHashes    = normalizedHashTriplet(emailNorm);
-    const deviceIdHashes = deviceIdStr ? normalizedHashTriplet(deviceIdStr) : [ZERO32, ZERO32, ZERO32];
+        const emailNorm   = String(email).trim().toLowerCase();
+        const deviceIdStr = String(deviceId || "").trim();
+        const emailHashes    = normalizedHashTriplet(emailNorm);
+        const deviceIdHashes = deviceIdStr ? normalizedHashTriplet(deviceIdStr) : [ZERO32, ZERO32, ZERO32];
 
-    console.log(`🪙 Mint request → to=${to}, email=${emailNorm}, deviceId=${deviceIdStr || '(none)'}`);
-    const tx = await personaAuth.safeMint(to, emailHashes, deviceIdHashes);
-    console.log(`⛓️  Mint tx sent: ${tx.hash}`);
+        const fee = await getAggressiveFees(provider);
+        console.log(`🪙 Mint request → to=${to}, email=${emailNorm}, deviceId=${deviceIdStr || '(none)'} | fees prio=${fee.maxPriorityFeePerGas.toString()} max=${fee.maxFeePerGas.toString()}`);
 
-    return res.json({ success: true, txHash: tx.hash });
+        const tx = await personaAuth.safeMint(to, emailHashes, deviceIdHashes, {
+        maxFeePerGas: fee.maxFeePerGas,
+        maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+        });
+        console.log(`⛓️  Mint tx sent: ${tx.hash}`);
+
+        // Wait 1 confirmation so balanceOf sees it
+        const receipt = (typeof tx.wait === 'function') ? await tx.wait(1) : await provider.waitForTransaction(tx.hash, 1);
+        let tokenId = null;
+        try {
+        const iface = new (ethers.utils?.Interface || ethers.Interface)([
+            "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
+        ]);
+        for (const log of receipt.logs || []) {
+            try {
+            const parsed = iface.parseLog(log);
+            if (parsed?.name === "Transfer"
+            && String(parsed.args?.from).toLowerCase() === "0x0000000000000000000000000000000000000000"
+            && String(parsed.args?.to).toLowerCase()   === String(to).toLowerCase()) {
+                tokenId = parsed.args?.tokenId?.toString?.() ?? String(parsed.args?.tokenId);
+                break;
+            }
+            } catch {}
+        }
+    } catch {}
+
+    return res.json({ success: true, txHash: tx.hash, confirmed: true, tokenId });
+
+
+
   } catch (err) {
     console.error('❌ /mint-nft error:', err);
     return res.status(500).json({ success: false, error: 'Mint failed', details: String(err.message || err) });
@@ -502,24 +563,54 @@ app.post('/mint-nft', async (req, res) => {
 // Admin-mint (same as above, kept for clients already hitting this route)
 app.post('/mint-persona', async (req, res) => {
   try {
-    if (!personaAuth || !ownerSigner) {
-      return res.status(503).json({ success: false, error: 'Minting not configured on server' });
-    }
-    const { to, email, deviceId } = req.body || {};
-    if (!to || !isAddress(to)) return res.status(400).json({ success: false, error: 'Valid "to" address required' });
-    if (!email || !deviceId) return res.status(400).json({ success: false, error: '"email" and "deviceId" required' });
 
-    // same gate as /mint-nft
+
+    const { email, deviceId, to } = req.body || {};
+    if (!email || !to) return res.status(400).json({ success: false, error: 'email and to are required' });
+    if (!isAddress(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
+
+    // gate by push token (as you already do)
     const token = userTokens[email] || process.env.TEST_PUSH_TOKEN || null;
     if (!token) return res.status(403).json({ success: false, error: 'No registered device token for this email' });
 
-    const emailHashes   = normalizedHashTriplet(email);
-    const deviceHashes  = normalizedHashTriplet(deviceId);
+    const emailNorm   = String(email).trim().toLowerCase();
+    const deviceIdStr = String(deviceId || "").trim();
+    const emailHashes    = normalizedHashTriplet(emailNorm);
+    const deviceIdHashes = deviceIdStr ? normalizedHashTriplet(deviceIdStr) : [ZERO32, ZERO32, ZERO32];
 
-    const tx = await personaAuth.safeMint(to, emailHashes, deviceHashes);
-    console.log(`🪙 Mint tx submitted: ${tx.hash} → to=${to}`);
+    const fee = await getAggressiveFees(provider);
+    console.log(`🪙 Mint request → to=${to}, email=${emailNorm}, deviceId=${deviceIdStr || '(none)'} | fees prio=${fee.maxPriorityFeePerGas.toString()} max=${fee.maxFeePerGas.toString()}`);
 
-    return res.json({ success: true, txHash: tx.hash });
+    const tx = await personaAuth.safeMint(to, emailHashes, deviceIdHashes, {
+    maxFeePerGas: fee.maxFeePerGas,
+    maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+    });
+    console.log(`⛓️  Mint tx sent: ${tx.hash}`);
+
+    // Wait 1 confirmation so balanceOf sees it
+    const receipt = (typeof tx.wait === 'function') ? await tx.wait(1) : await provider.waitForTransaction(tx.hash, 1);
+    let tokenId = null;
+    try {
+    const iface = new (ethers.utils?.Interface || ethers.Interface)([
+        "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
+    ]);
+    for (const log of receipt.logs || []) {
+        try {
+        const parsed = iface.parseLog(log);
+        if (parsed?.name === "Transfer"
+        && String(parsed.args?.from).toLowerCase() === "0x0000000000000000000000000000000000000000"
+        && String(parsed.args?.to).toLowerCase()   === String(to).toLowerCase()) {
+            tokenId = parsed.args?.tokenId?.toString?.() ?? String(parsed.args?.tokenId);
+            break;
+        }
+        } catch {}
+    }
+    } catch {}
+
+    return res.json({ success: true, txHash: tx.hash, confirmed: true, tokenId });
+
+
+
   } catch (err) {
     console.error('❌ /mint-persona error:', err);
     return res.status(500).json({ success: false, error: String(err.message || err) });

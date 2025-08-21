@@ -623,6 +623,29 @@ app.post('/nft-owned-verify', async (req, res) => {
       return res.status(500).json({ success: false, error: 'verify failed' });
     }
 });
+
+// GET /tx-receipt?hash=0x...
+app.get('/tx-receipt', async (req, res) => {
+    try {
+      if (!provider) return res.status(503).json({ success: false, error: 'provider not configured' });
+      const hash = String(req.query.hash || '').trim();
+      if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) {
+        return res.status(400).json({ success: false, error: 'bad hash' });
+      }
+      const r = await provider.getTransactionReceipt(hash);
+      if (!r) return res.json({ success: true, found: false });
+      return res.json({
+        success: true,
+        found: true,
+        status: typeof r.status === 'number' ? r.status : null,
+        blockNumber: r.blockNumber ?? null
+      });
+    } catch (e) {
+      console.error('❌ /tx-receipt:', e);
+      return res.status(500).json({ success: false, error: 'lookup failed' });
+    }
+});
+  
   
 // ---------------------- Start ----------------------
 const PORT = process.env.PORT || 8080;

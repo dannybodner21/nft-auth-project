@@ -158,6 +158,7 @@ let userTokens = {};        // { email: deviceToken }
 let userCredentials = {};   // { email: [ { id, name?, url?, enc, wrapped_key_session?, wrapped_key_device? } ] }
 let pendingDecrypts = {};   // { txId: { email, credentialId, status, payload?, expiresAt?, createdAt } }
 let sessionApprovals = {};  // { email: expiryMs }
+let pendingCardChallenges = {}; // { email: { challenge, expiresAt } }
 
 // Email verification (dev)
 const pendingEmailCodes = {};   // { email: { code, expiresAt } }
@@ -308,6 +309,40 @@ app.get("/debug", (req, res) => {
 app.get('/card-pubkey-fp', (req, res) => {
     if (!cardAuthKeyInfo) return res.status(503).json({ success: false, error: 'card key not loaded' });
     res.json({ success: true, ...cardAuthKeyInfo });
+});
+
+// --- Card challenge (to be signed by the card's Authentication key) ---
+// POST /card-challenge { email }
+// Returns { success, challenge, expiresAt, spec }
+app.post('/card-challenge', (req, res) => {
+    try {
+        if (!cardAuthKey) return res.status(503).json({ success: false, error: 'card key not loaded' });
+        const email = String(req.body?.email || '').trim().toLowerCase();
+        if (!email || !email.includes('@')) return res.status(400).json({ success: false, error: 'valid email required' });
+    
+        // Canonical message format the client MUST sign (UTF-8 bytes)
+        // Bind to email + timestamp + 16B nonce to prevent replay
+        const now = Math.floor(Date.now() / 1000);
+        const nonce = crypto.randomBytes(16).toString('hex');
+        const challenge = `nftvault:card-auth|email=${email}|ts=${now}|nonce=${nonce}`;
+        const ttlSec = 120; // 2 minutes
+    
+        pendingCardChallenges[email] = { challenge, expiresAt: Date.now() + ttlSec * 1000 };
+    
+        return res.json({
+          success: true,
+          challenge,
+          expiresAt: now + ttlSec,
+          spec: {
+            algo: 'RSA-PKCS1v1_5-SHA256',
+            encoding: 'UTF-8 bytes of challenge string',
+            fieldOrder: 'literal string as returned (no JSON canonicalization)'
+          }
+        });
+      } catch (e) {
+        console.error('❌ /card-challenge:', e);
+        return res.status(500).json({ success: false, error: 'challenge failed' });
+      }
 });
 
 
@@ -513,6 +548,12 @@ setInterval(() => {
   for (const [email, exp] of Object.entries(sessionApprovals)) {
     if (Date.now() > exp) delete sessionApprovals[email];
   }
+
+  // Cleanup stale card challenges
+  for (const [email, rec] of Object.entries(pendingCardChallenges)) {
+    if (!rec || now > (rec.expiresAt || 0)) delete pendingCardChallenges[email];
+  }
+
 }, 60_000);
 
 // ---------------------- Mint endpoints (EIP-712; no user on-chain) ----------------------

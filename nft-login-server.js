@@ -3,8 +3,13 @@ require('dotenv').config();
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const admin = require('firebase-admin');
+
+// const path = require('path');
+// const fs = require('fs');
+
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // === Ethers wiring (v5/v6 compatible) ===
 const { ethers } = require('ethers');
@@ -21,6 +26,8 @@ const DEPLOYER_PRIVATE_KEY    = process.env.DEPLOYER_PRIVATE_KEY;  // pays gas (
 const MINTER_PRIVATE_KEY     = process.env.MINTER_PRIVATE_KEY;   // signs EIP-712 MintAuth (must match MINTER_ROLE)
 const USER_PEPPER            = process.env.USER_COMMITMENT_PEPPER;   // server-side secret (do NOT leak)
 const DEVICE_PEPPER          = process.env.DEVICE_COMMITMENT_PEPPER; // server-side secret (do NOT leak)
+const CARD_AUTH_PUBKEY_PEM_PATH = process.env.CARD_AUTH_PUBKEY_PEM_PATH || ""; // file path to PEM
+
 
 let provider, relayerSigner, personaAuth;
 if (RPC_URL && CONTRACT_ADDRESS && DEPLOYER_PRIVATE_KEY && MINTER_PRIVATE_KEY && USER_PEPPER && DEVICE_PEPPER) {
@@ -116,7 +123,34 @@ if (process.env.FIREBASE_CONFIG) {
 } else {
   throw new Error('No Firebase credentials: set FIREBASE_CONFIG or GOOGLE_APPLICATION_CREDENTIALS');
 }
+
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+
+// ---------- Load OpenPGP card auth public key (PEM, SPKI) ----------
+let cardAuthKey = null;        // crypto.KeyObject
+let cardAuthKeyInfo = null;    // { alg, modulusBits, spkiSha256 }
+if (CARD_AUTH_PUBKEY_PEM_PATH) {
+  try {
+    const pem = fs.readFileSync(path.resolve(CARD_AUTH_PUBKEY_PEM_PATH), 'utf8');
+    const keyObj = crypto.createPublicKey(pem); // expects SPKI PEM
+    const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
+    const sha256 = crypto.createHash('sha256').update(spkiDer).digest('base64');
+    const details = keyObj.asymmetricKeyDetails || {};
+    const modulusBits = details.modulusLength || null;
+    cardAuthKey = keyObj;
+    cardAuthKeyInfo = { alg: keyObj.asymmetricKeyType, modulusBits, spkiSha256: sha256 };
+    console.log(`🔐 Card auth key loaded: alg=${cardAuthKeyInfo.alg}, bits=${modulusBits}, fp(SHA256)=${sha256}`);
+  } catch (e) {
+    console.warn(`⚠️ Failed to load CARD_AUTH_PUBKEY_PEM_PATH (${CARD_AUTH_PUBKEY_PEM_PATH}): ${e.message}`);
+  }
+} else {
+  console.warn('⚠️ CARD_AUTH_PUBKEY_PEM_PATH not set; card-based unlock disabled');
+}
+
+
+
+
+
 
 // ---------------------- In-memory stores (dev) ----------------------
 let pendingLogins = {};     // { requestId: { email, websiteDomain?, status, timestamp, devicePublicKeyJwk?, extSession? } }
@@ -268,6 +302,14 @@ app.post('/confirm-email-verify', (req, res) => {
 app.get("/debug", (req, res) => {
   res.json({ success: true, message: "This is the real nft-login-server.js" });
 });
+
+
+// Quick check: report loaded card key fingerprint
+app.get('/card-pubkey-fp', (req, res) => {
+    if (!cardAuthKeyInfo) return res.status(503).json({ success: false, error: 'card key not loaded' });
+    res.json({ success: true, ...cardAuthKeyInfo });
+});
+
 
 // ---------------------- Credentials storage ----------------------
 app.post('/store-credentials', (req, res) => {

@@ -813,6 +813,79 @@ app.get('/runtime', async (req, res) => {
       return res.status(500).json({ error: String(e.message || e) });
     }
 });
+
+// --- Card verify (RSA-PKCS1v1_5 + SHA-256) ---
+const { createPublicKey, createVerify } = require('crypto');
+const CARD_PUBKEY_PEM = process.env.CARD_PUBKEY_PEM;
+
+let CARD_PUBKEY_OBJ = null;
+if (CARD_PUBKEY_PEM) {
+  try {
+    CARD_PUBKEY_OBJ = createPublicKey(CARD_PUBKEY_PEM);
+  } catch (e) {
+    console.error("❌ Bad CARD_PUBKEY_PEM:", e.message);
+  }
+}
+
+app.post('/card-verify', (req, res) => {
+  try {
+    const { email, challenge, signatureB64 } = req.body || {};
+    if (!email || !challenge || !signatureB64) {
+      return res.status(400).json({ success: false, error: 'email, challenge, signatureB64 required' });
+    }
+    if (!challenge.startsWith('nftvault:card-auth|')) {
+      return res.status(400).json({ success: false, error: 'bad challenge prefix' });
+    }
+    if (!CARD_PUBKEY_OBJ) {
+      return res.status(503).json({ success: false, error: 'CARD_PUBKEY_PEM not configured' });
+    }
+
+    // Parse fields: nftvault:card-auth|email=...|ts=...|nonce=...
+    const fields = Object.fromEntries(
+      challenge.split('|').slice(1).map(kv => {
+        const i = kv.indexOf('=');
+        return i === -1 ? [kv, ''] : [kv.slice(0, i), kv.slice(i + 1)];
+      })
+    );
+
+    if (fields.email !== email) {
+      return res.status(400).json({ success: false, error: 'email mismatch' });
+    }
+
+    const ts = Number(fields.ts);
+    if (!Number.isFinite(ts)) {
+      return res.status(400).json({ success: false, error: 'bad ts' });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const MAX_SKEW = 5 * 60; // 5 minutes
+    if (Math.abs(now - ts) > MAX_SKEW) {
+      return res.status(400).json({ success: false, error: 'stale/future challenge', now, ts });
+    }
+
+    // Verify RSA-PKCS1v1_5 with SHA-256 over the UTF-8 challenge string
+    const verifier = createVerify('RSA-SHA256');
+    verifier.update(Buffer.from(challenge, 'utf8'));
+    verifier.end();
+
+    const sig = Buffer.from(signatureB64, 'base64');
+    const ok = verifier.verify(CARD_PUBKEY_OBJ, sig);
+
+    if (!ok) return res.status(400).json({ success: false, verified: false });
+
+    return res.json({
+      success: true,
+      verified: true,
+      email,
+      ts,
+      nonce: fields.nonce || null
+    });
+  } catch (e) {
+    console.error('❌ /card-verify error:', e);
+    return res.status(500).json({ success: false, error: 'verify failed' });
+  }
+});
+
   
 
 // ---------------------- Start ----------------------

@@ -1,5 +1,3 @@
-
-
 // nft-login-server.js
 require('dotenv').config();
 const express = require('express');
@@ -8,110 +6,86 @@ const admin = require('firebase-admin');
 const path = require('path');
 const fs = require('fs');
 
-// === Owner mint wiring (ethers v5/v6 safe) ===
+// === Ethers wiring (v5/v6 compatible) ===
 const { ethers } = require('ethers');
-// shims so this works on either ethers v5 or v6
-const isAddress        = ethers.utils?.isAddress      || ethers.isAddress;
-const keccak256        = ethers.utils?.keccak256      || ethers.keccak256;
-const toUtf8Bytes      = ethers.utils?.toUtf8Bytes    || ethers.toUtf8Bytes;
-const JsonRpcProvider  = ethers.providers?.JsonRpcProvider || ethers.JsonRpcProvider;
+const isAddress       = ethers.utils?.isAddress       || ethers.isAddress;
+const keccak256       = ethers.utils?.keccak256       || ethers.keccak256;
+const toUtf8Bytes     = ethers.utils?.toUtf8Bytes     || ethers.toUtf8Bytes;
+const JsonRpcProvider = ethers.providers?.JsonRpcProvider || ethers.JsonRpcProvider;
+const parseUnits      = ethers.utils?.parseUnits      || ethers.parseUnits;
+const solidityPack    = ethers.utils?.solidityPack    || ethers.solidityPack;
 
-const RPC_URL            = process.env.RPC_URL;           // e.g. https://polygon-mainnet.g.alchemy.com/v2/xxx
-const CONTRACT_ADDRESS   = process.env.CONTRACT_ADDRESS;  // PersonaAuth contract
-const OWNER_PRIVATE_KEY  = process.env.OWNER_PRIVATE_KEY; // owner key that deployed PersonaAuth
+const RPC_URL                = process.env.RPC_URL;              // e.g. https://polygon-mainnet.g.alchemy.com/v2/xxx
+const CONTRACT_ADDRESS       = process.env.CONTRACT_ADDRESS;     // PersonaAuth final contract (deployed)
+const DEPLOYER_PRIVATE_KEY    = process.env.DEPLOYER_PRIVATE_KEY;  // pays gas (separate from role keys)
+const MINTER_PRIVATE_KEY     = process.env.MINTER_PRIVATE_KEY;   // signs EIP-712 MintAuth (must match MINTER_ROLE)
+const USER_PEPPER            = process.env.USER_COMMITMENT_PEPPER;   // server-side secret (do NOT leak)
+const DEVICE_PEPPER          = process.env.DEVICE_COMMITMENT_PEPPER; // server-side secret (do NOT leak)
 
-let provider, ownerSigner, personaAuth;
-if (RPC_URL && CONTRACT_ADDRESS && OWNER_PRIVATE_KEY) {
-  provider    = new JsonRpcProvider(RPC_URL);
-  ownerSigner = new ethers.Wallet(OWNER_PRIVATE_KEY, provider);
+let provider, relayerSigner, personaAuth;
+if (RPC_URL && CONTRACT_ADDRESS && DEPLOYER_PRIVATE_KEY && MINTER_PRIVATE_KEY && USER_PEPPER && DEVICE_PEPPER) {
+  provider      = new JsonRpcProvider(RPC_URL);
+  relayerSigner = new ethers.Wallet(DEPLOYER_PRIVATE_KEY, provider); // gas payer
 
+  // PersonaAuth (final) ABI — only what we use
   const personaAuthAbi = [
-    "function safeMint(address to, bytes32[3] emailHashes, bytes32[3] deviceIdHashes) public",
+    "function mintWithSig(address to, bytes32 userIdHash, bytes32 deviceHash, bytes32 salt, uint256 deadline, bytes sig) external",
+    "function identityOf(uint256 tokenId) view returns (bytes32 userIdHash, bytes32 deviceHash, bool valid)",
+    "function tokenOf(address user) view returns (uint256)",
     "function balanceOf(address owner) view returns (uint256)",
-    "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)"
+    "function locked(uint256 tokenId) view returns (bool)"
   ];
 
-  // And make the instance with owner signer:
-  personaAuth = new ethers.Contract(CONTRACT_ADDRESS, personaAuthAbi, ownerSigner);
-
+  personaAuth = new ethers.Contract(CONTRACT_ADDRESS, personaAuthAbi, relayerSigner);
 } else {
-  console.warn("⚠️ Minting disabled: set RPC_URL, CONTRACT_ADDRESS, OWNER_PRIVATE_KEY in env");
+  console.warn("⚠️ Minting disabled: set RPC_URL, CONTRACT_ADDRESS, DEPLOYER_PRIVATE_KEY, MINTER_PRIVATE_KEY, USER_COMMITMENT_PEPPER, DEVICE_COMMITMENT_PEPPER in env");
 }
 
-// --- Hash helpers (consistent everywhere) ---
-const ZERO32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
-function keccakUtf8(s) { return keccak256(toUtf8Bytes(String(s || ""))); }
-
-// Normalized triplet: slot[0] = keccak(lowercased value), others zero (easy to evolve later)
-function normalizedHashTriplet(value) {
-  const norm = String(value || "").trim().toLowerCase();
-  const h = keccakUtf8(norm);
-  return [h, ZERO32, ZERO32];
+// --- Commitment helpers (peppered; no PII on-chain) ---
+function commitUserId(email) {
+  const norm = String(email || "").trim().toLowerCase();
+  const packed = solidityPack(["string","string"], [norm, USER_PEPPER || ""]);
+  return keccak256(packed);
+}
+function commitDevice(deviceFpr) {
+  const val = String(deviceFpr || "").trim();
+  const packed = solidityPack(["string","string"], [val, DEVICE_PEPPER || ""]);
+  return keccak256(packed);
 }
 
-
-// --- Aggressive EIP-1559 fees for Polygon mainnet (ethers v5/v6 compatible) ---
-const parseUnits = ethers.utils?.parseUnits || ethers.parseUnits;
-
+// --- Aggressive EIP-1559 fees for Polygon mainnet (v5/v6 compatible) ---
 /**
- * Returns { maxFeePerGas, maxPriorityFeePerGas } as BigNumber/bigint (matching ethers version)
+ * Returns { maxFeePerGas, maxPriorityFeePerGas }.
  * Policy:
  *  - priority = max(suggestedPriority*3, 50 gwei)
  *  - baseFeeCeil = max(suggestedBase*3, 30 gwei)
  *  - maxFee = baseFeeCeil + priority
  */
 async function getAggressiveFees(pvd) {
-  // v5: provider.getFeeData(); v6: provider.getFeeData()
   const fd = await pvd.getFeeData();
-
-  // Normalize to string gwei then back to units to handle v5/v6
-  const suggestedPriorityGwei =
-    (fd.maxPriorityFeePerGas ?? fd.gasPrice ?? 0).toString(); // wei
-  const suggestedBaseGwei =
-    (fd.lastBaseFeePerGas ?? fd.gasPrice ?? 0).toString(); // wei
-
-  // Convert to gwei floats safely by dividing by 1e9, then clamp
-  const toGwei = (weiStr) => Number(ethers.utils?.formatUnits
-    ? ethers.utils.formatUnits(weiStr, "gwei")
-    : (Number(weiStr) / 1e9));
-
-  const prio = Math.max(toGwei(suggestedPriorityGwei) * 3, 50); // ≥ 50 gwei
-  const base = Math.max(toGwei(suggestedBaseGwei) * 3, 30);     // ≥ 30 gwei
-  const maxPriorityFeePerGas = parseUnits(String(Math.ceil(prio)), "gwei");
-  const maxFeePerGas         = parseUnits(String(Math.ceil(base + prio)), "gwei");
-
+  const toGwei = (wei) => {
+    if (!wei) return 0;
+    const s = wei.toString();
+    return ethers.utils?.formatUnits ? Number(ethers.utils.formatUnits(s, "gwei")) : (Number(s) / 1e9);
+  };
+  const suggestedPrio = toGwei(fd.maxPriorityFeePerGas ?? fd.gasPrice ?? 0);
+  const suggestedBase = toGwei(fd.lastBaseFeePerGas ?? fd.gasPrice ?? 0);
+  const prio = Math.max(Math.ceil(suggestedPrio * 3), 50);
+  const base = Math.max(Math.ceil(suggestedBase * 3), 30);
+  const maxPriorityFeePerGas = parseUnits(String(prio), "gwei");
+  const maxFeePerGas         = parseUnits(String(base + prio), "gwei");
   return { maxFeePerGas, maxPriorityFeePerGas };
 }
 
-
-
-// Read-only ABI for queries
-const readAbi = [
-    "function balanceOf(address owner) view returns (uint256)",
-    "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)",
-    "function tokenData(uint256 tokenId) view returns (bytes32[3] emailHashes, bytes32[3] deviceIdHashes, uint256 createdAt)"
-  ];
-  
-  const personaRead = (RPC_URL && CONTRACT_ADDRESS && provider)
-    ? new ethers.Contract(CONTRACT_ADDRESS, readAbi, provider)
-    : null;
-  
-  function normKeccak(input) {
-    const norm = String(input || "").trim().toLowerCase();
-    return ethers.utils.keccak256(ethers.utils.toUtf8Bytes(norm));
-  }
-  function anyEq(arr, val) {
-    const v = String(val).toLowerCase();
-    return Array.isArray(arr) && arr.some(x => String(x).toLowerCase() === v);
-  }
-  
-
-
-
-
-
-
-
+// --- (Legacy helpers kept if needed elsewhere) ---
+function normKeccak(input) {
+  const norm = String(input || "").trim().toLowerCase();
+  return keccak256(toUtf8Bytes(norm));
+}
+function anyEq(arr, val) {
+  const v = String(val).toLowerCase();
+  return Array.isArray(arr) && arr.some(x => String(x).toLowerCase() === v);
+}
 
 // ---------------------- App init ----------------------
 const app = express();
@@ -119,28 +93,24 @@ app.use(express.json());
 
 // CORS — allow Chrome extensions; native apps / service workers send no Origin and don't need CORS
 app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    const isExtension = typeof origin === 'string' && origin.startsWith('chrome-extension://');
-  
-    if (isExtension) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Vary', 'Origin');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    }
-    // For requests with no Origin (iOS URLSession, extension service worker), do not set ACAO—CORS not applicable.
-  
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
-    next();
+  const origin = req.headers.origin;
+  const isExtension = typeof origin === 'string' && origin.startsWith('chrome-extension://');
+
+  if (isExtension) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
 });
 
 // 🔐 Firebase Admin
 let serviceAccount;
 if (process.env.FIREBASE_CONFIG) {
-  // inline JSON env
   serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
 } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-  // path to JSON file
   const p = path.resolve(process.env.GOOGLE_APPLICATION_CREDENTIALS);
   serviceAccount = JSON.parse(fs.readFileSync(p, 'utf8'));
 } else {
@@ -503,114 +473,111 @@ setInterval(() => {
   }
 }, 60_000);
 
-// ---------------------- Owner-signed mint endpoints ----------------------
-// Body: { email, deviceId, to }
+// ---------------------- Mint endpoints (EIP-712; no user on-chain) ----------------------
+// Body: { email, deviceFpr, to }
 app.post('/mint-nft', async (req, res) => {
   try {
+    if (!personaAuth) return res.status(503).json({ success: false, error: 'Contract not configured' });
 
-        const { email, deviceId, to } = req.body || {};
-        if (!email || !to) return res.status(400).json({ success: false, error: 'email and to are required' });
-        if (!isAddress(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
+    const { email, deviceFpr, to } = req.body || {};
+    if (!email || !deviceFpr || !to) return res.status(400).json({ success: false, error: 'email, deviceFpr, to required' });
+    if (!isAddress(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
 
-        // gate by push token (as you already do)
-        const token = userTokens[email] || process.env.TEST_PUSH_TOKEN || null;
-        if (!token) return res.status(403).json({ success: false, error: 'No registered device token for this email' });
+    // Gate by device push-registration (your existing policy)
+    const token = userTokens[email] || process.env.TEST_PUSH_TOKEN || null;
+    if (!token) return res.status(403).json({ success: false, error: 'No registered device token for this email' });
 
-        const emailNorm   = String(email).trim().toLowerCase();
-        const deviceIdStr = String(deviceId || "").trim();
-        const emailHashes    = normalizedHashTriplet(emailNorm);
-        const deviceIdHashes = deviceIdStr ? normalizedHashTriplet(deviceIdStr) : [ZERO32, ZERO32, ZERO32];
+    // Commitments
+    const userIdHash = commitUserId(email);
+    const deviceHash = commitDevice(deviceFpr);
 
-        const fee = await getAggressiveFees(provider);
-        console.log(`🪙 Mint request → to=${to}, email=${emailNorm}, deviceId=${deviceIdStr || '(none)'} | fees prio=${fee.maxPriorityFeePerGas.toString()} max=${fee.maxFeePerGas.toString()}`);
+    // EIP-712 domain/types (Polygon mainnet)
+    const domain = { name: "PersonaAuth", version: "1", chainId: 137, verifyingContract: CONTRACT_ADDRESS };
+    const types  = { MintAuth: [
+      { name: "to",          type: "address" },
+      { name: "userIdHash",  type: "bytes32" },
+      { name: "deviceHash",  type: "bytes32" },
+      { name: "salt",        type: "bytes32" },
+      { name: "deadline",    type: "uint256" },
+    ]};
 
-        const tx = await personaAuth.safeMint(to, emailHashes, deviceIdHashes, {
-        maxFeePerGas: fee.maxFeePerGas,
-        maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
-        });
-        console.log(`⛓️  Mint tx sent: ${tx.hash}`);
+    const salt     = ethers.utils.hexlify(ethers.utils.randomBytes(32));
+    const deadline = Math.floor(Date.now() / 1000) + 10 * 60;
 
-        // Wait 1 confirmation so balanceOf sees it
-        const receipt = (typeof tx.wait === 'function') ? await tx.wait(1) : await provider.waitForTransaction(tx.hash, 1);
-        let tokenId = null;
-        try {
-        const iface = new (ethers.utils?.Interface || ethers.Interface)([
-            "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
-        ]);
-        for (const log of receipt.logs || []) {
-            try {
-            const parsed = iface.parseLog(log);
-            if (parsed?.name === "Transfer"
-            && String(parsed.args?.from).toLowerCase() === "0x0000000000000000000000000000000000000000"
-            && String(parsed.args?.to).toLowerCase()   === String(to).toLowerCase()) {
-                tokenId = parsed.args?.tokenId?.toString?.() ?? String(parsed.args?.tokenId);
-                break;
-            }
-            } catch {}
-        }
+    // Sign with MINTER role key (offline)
+    const minter = new ethers.Wallet(MINTER_PRIVATE_KEY);
+    const signature = await minter._signTypedData(domain, types, { to, userIdHash, deviceHash, salt, deadline });
+
+    // Relay tx (gas payer)
+    const fee = await getAggressiveFees(provider);
+    const tx = await personaAuth.mintWithSig(to, userIdHash, deviceHash, salt, deadline, signature, {
+      maxFeePerGas:         fee.maxFeePerGas,
+      maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+    });
+    console.log(`⛓️  mintWithSig → ${tx.hash}`);
+
+    const rc = (typeof tx.wait === 'function') ? await tx.wait(1) : await provider.waitForTransaction(tx.hash, 1);
+
+    // Optional: fetch tokenId via mapping
+    let tokenId = null;
+    try {
+      const tid = await personaAuth.tokenOf(to);
+      tokenId = tid?.toString?.() || String(tid);
     } catch {}
 
     return res.json({ success: true, txHash: tx.hash, confirmed: true, tokenId });
-
-
-
   } catch (err) {
     console.error('❌ /mint-nft error:', err);
     return res.status(500).json({ success: false, error: 'Mint failed', details: String(err.message || err) });
   }
 });
 
-// Admin-mint (same as above, kept for clients already hitting this route)
+// Back-compat alias
 app.post('/mint-persona', async (req, res) => {
   try {
+    if (!personaAuth) return res.status(503).json({ success: false, error: 'Contract not configured' });
 
-
-    const { email, deviceId, to } = req.body || {};
-    if (!email || !to) return res.status(400).json({ success: false, error: 'email and to are required' });
+    const { email, deviceFpr, to } = req.body || {};
+    if (!email || !deviceFpr || !to) return res.status(400).json({ success: false, error: 'email, deviceFpr, to required' });
     if (!isAddress(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
 
-    // gate by push token (as you already do)
     const token = userTokens[email] || process.env.TEST_PUSH_TOKEN || null;
     if (!token) return res.status(403).json({ success: false, error: 'No registered device token for this email' });
 
-    const emailNorm   = String(email).trim().toLowerCase();
-    const deviceIdStr = String(deviceId || "").trim();
-    const emailHashes    = normalizedHashTriplet(emailNorm);
-    const deviceIdHashes = deviceIdStr ? normalizedHashTriplet(deviceIdStr) : [ZERO32, ZERO32, ZERO32];
+    const userIdHash = commitUserId(email);
+    const deviceHash = commitDevice(deviceFpr);
+
+    const domain = { name: "PersonaAuth", version: "1", chainId: 137, verifyingContract: CONTRACT_ADDRESS };
+    const types  = { MintAuth: [
+      { name: "to",          type: "address" },
+      { name: "userIdHash",  type: "bytes32" },
+      { name: "deviceHash",  type: "bytes32" },
+      { name: "salt",        type: "bytes32" },
+      { name: "deadline",    type: "uint256" },
+    ]};
+
+    const salt     = ethers.utils.hexlify(ethers.utils.randomBytes(32));
+    const deadline = Math.floor(Date.now() / 1000) + 10 * 60;
+
+    const minter = new ethers.Wallet(MINTER_PRIVATE_KEY);
+    const signature = await minter._signTypedData(domain, types, { to, userIdHash, deviceHash, salt, deadline });
 
     const fee = await getAggressiveFees(provider);
-    console.log(`🪙 Mint request → to=${to}, email=${emailNorm}, deviceId=${deviceIdStr || '(none)'} | fees prio=${fee.maxPriorityFeePerGas.toString()} max=${fee.maxFeePerGas.toString()}`);
-
-    const tx = await personaAuth.safeMint(to, emailHashes, deviceIdHashes, {
-    maxFeePerGas: fee.maxFeePerGas,
-    maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+    const tx = await personaAuth.mintWithSig(to, userIdHash, deviceHash, salt, deadline, signature, {
+      maxFeePerGas:         fee.maxFeePerGas,
+      maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
     });
-    console.log(`⛓️  Mint tx sent: ${tx.hash}`);
+    console.log(`⛓️  mintWithSig → ${tx.hash}`);
 
-    // Wait 1 confirmation so balanceOf sees it
-    const receipt = (typeof tx.wait === 'function') ? await tx.wait(1) : await provider.waitForTransaction(tx.hash, 1);
+    const rc = (typeof tx.wait === 'function') ? await tx.wait(1) : await provider.waitForTransaction(tx.hash, 1);
+
     let tokenId = null;
     try {
-    const iface = new (ethers.utils?.Interface || ethers.Interface)([
-        "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
-    ]);
-    for (const log of receipt.logs || []) {
-        try {
-        const parsed = iface.parseLog(log);
-        if (parsed?.name === "Transfer"
-        && String(parsed.args?.from).toLowerCase() === "0x0000000000000000000000000000000000000000"
-        && String(parsed.args?.to).toLowerCase()   === String(to).toLowerCase()) {
-            tokenId = parsed.args?.tokenId?.toString?.() ?? String(parsed.args?.tokenId);
-            break;
-        }
-        } catch {}
-    }
+      const tid = await personaAuth.tokenOf(to);
+      tokenId = tid?.toString?.() || String(tid);
     } catch {}
 
     return res.json({ success: true, txHash: tx.hash, confirmed: true, tokenId });
-
-
-
   } catch (err) {
     console.error('❌ /mint-persona error:', err);
     return res.status(500).json({ success: false, error: String(err.message || err) });
@@ -619,125 +586,152 @@ app.post('/mint-persona', async (req, res) => {
 
 // Read-only: does this address own a PersonaAuth NFT?
 app.get('/has-nft/:address', async (req, res) => {
-    try {
-      if (!personaAuth) {
-        return res.status(503).json({ success: false, error: 'Contract not configured' });
-      }
-      const address = String(req.params.address || '').trim();
-      if (!ethers.utils.isAddress(address)) {
-        return res.status(400).json({ success: false, error: 'Bad address' });
-      }
-  
-      const bal = await personaAuth.balanceOf(address);
-      const has = bal.gt(0);
-  
-      // Optional: enumerate tokenIds (since ERC721Enumerable)
-      let tokenIds = [];
-      if (has) {
-        const n = bal.toNumber();
-        for (let i = 0; i < n; i++) {
-          const id = await personaAuth.tokenOfOwnerByIndex(address, i);
-          tokenIds.push(id.toString());
-        }
-      }
-  
-      return res.json({
-        success: true,
-        hasNFT: has,
-        balance: bal.toString(),
-        tokenIds
-      });
-    } catch (err) {
-      console.error('❌ /has-nft error:', err);
-      return res.status(500).json({ success: false, error: String(err.message || err) });
+  try {
+    if (!personaAuth) {
+      return res.status(503).json({ success: false, error: 'Contract not configured' });
     }
+    const address = String(req.params.address || '').trim();
+    if (!ethers.utils.isAddress(address)) {
+      return res.status(400).json({ success: false, error: 'Bad address' });
+    }
+
+    const bal = await personaAuth.balanceOf(address);
+    const has = bal.gt ? bal.gt(0) : (BigInt(bal) > 0n);
+
+    // Optional: fetch tokenId via mapping (one-per-wallet)
+    let tokenIds = [];
+    if (has) {
+      try {
+        const tid = await personaAuth.tokenOf(address);
+        const s   = tid?.toString?.() || String(tid);
+        if (s && s !== "0") tokenIds.push(s);
+      } catch {}
+    }
+
+    return res.json({
+      success: true,
+      hasNFT: has,
+      balance: bal.toString(),
+      tokenIds
+    });
+  } catch (err) {
+    console.error('❌ /has-nft error:', err);
+    return res.status(500).json({ success: false, error: String(err.message || err) });
+  }
 });
-  
+
 // --- READ: does this address own at least 1 PNA? ---
-// GET /nft-owned?address=0x...
 app.get('/nft-owned', async (req, res) => {
-    try {
-      if (!personaRead) {
-        return res.status(503).json({ success: false, error: 'Read contract not configured' });
-      }
-      const addr = String(req.query.address || '').trim();
-      if (!addr || !ethers.utils.isAddress(addr)) {
-        return res.status(400).json({ success: false, error: 'Valid address required' });
-      }
-  
-      const bal = await personaRead.balanceOf(addr);
-      const owned = bal.gt(0);
-      return res.json({ success: true, owned, balance: bal.toString() });
-    } catch (e) {
-      console.error('❌ /nft-owned:', e);
-      return res.status(500).json({ success: false, error: 'query failed' });
+  try {
+    if (!provider || !CONTRACT_ADDRESS) {
+      return res.status(503).json({ success: false, error: 'Read contract not configured' });
     }
+    const addr = String(req.query.address || '').trim();
+    if (!addr || !ethers.utils.isAddress(addr)) {
+      return res.status(400).json({ success: false, error: 'Valid address required' });
+    }
+
+    const readAbi = [
+      "function balanceOf(address owner) view returns (uint256)",
+      "function tokenOf(address user) view returns (uint256)",
+      "function identityOf(uint256 tokenId) view returns (bytes32 userIdHash, bytes32 deviceHash, bool valid)"
+    ];
+    const personaRead = new ethers.Contract(CONTRACT_ADDRESS, readAbi, provider);
+
+    const bal = await personaRead.balanceOf(addr);
+    const owned = bal.gt ? bal.gt(0) : (BigInt(bal) > 0n);
+    return res.json({ success: true, owned, balance: bal.toString() });
+  } catch (e) {
+    console.error('❌ /nft-owned:', e);
+    return res.status(500).json({ success: false, error: 'query failed' });
+  }
 });
-  
-// --- READ+VERIFY: optional strict match on email/deviceId hashes ---
-// POST /nft-owned-verify  { address, email?, deviceId? }
+
+// --- READ+VERIFY: optional strict match on email/deviceFpr (commitments) ---
+// POST /nft-owned-verify  { address, email?, deviceFpr? }
 app.post('/nft-owned-verify', async (req, res) => {
-    try {
-      if (!personaRead) {
-        return res.status(503).json({ success: false, error: 'Read contract not configured' });
-      }
-      const { address, email, deviceId } = req.body || {};
-      if (!address || !ethers.utils.isAddress(address)) {
-        return res.status(400).json({ success: false, error: 'Valid address required' });
-      }
-      const bal = await personaRead.balanceOf(address);
-      const owned = bal.gt(0);
-      if (!owned) return res.json({ success: true, owned: false, matched: false });
-  
-      const wantEmail = email && String(email).trim();
-      const wantDevice = deviceId && String(deviceId).trim();
-      const hEmail  = wantEmail  ? normKeccak(wantEmail)  : null;
-      const hDevice = wantDevice ? normKeccak(wantDevice) : null;
-  
-      let matched = false;
-      const n = Math.min(bal.toNumber(), 8); // cap enumeration for safety
-      for (let i = 0; i < n; i++) {
-        const tokenId = await personaRead.tokenOfOwnerByIndex(address, i);
-        const td = await personaRead.tokenData(tokenId);
-        // td = [ emailHashes[3], deviceIdHashes[3], createdAt ]
-        const emailHashes   = td[0];
-        const deviceHashes  = td[1];
-  
-        const emailOk  = hEmail  ? anyEq(emailHashes,  hEmail)  : true;
-        const deviceOk = hDevice ? anyEq(deviceHashes, hDevice) : true;
-        if (emailOk && deviceOk) { matched = true; break; }
-      }
-  
-      return res.json({ success: true, owned: true, matched });
-    } catch (e) {
-      console.error('❌ /nft-owned-verify:', e);
-      return res.status(500).json({ success: false, error: 'verify failed' });
+  try {
+    if (!provider || !CONTRACT_ADDRESS) {
+      return res.status(503).json({ success: false, error: 'Read contract not configured' });
     }
+    const { address, email, deviceFpr } = req.body || {};
+    if (!address || !ethers.utils.isAddress(address)) {
+      return res.status(400).json({ success: false, error: 'Valid address required' });
+    }
+
+    const readAbi = [
+      "function balanceOf(address owner) view returns (uint256)",
+      "function tokenOf(address user) view returns (uint256)",
+      "function identityOf(uint256 tokenId) view returns (bytes32 userIdHash, bytes32 deviceHash, bool valid)"
+    ];
+    const personaRead = new ethers.Contract(CONTRACT_ADDRESS, readAbi, provider);
+
+    const bal = await personaRead.balanceOf(address);
+    const owned = bal.gt ? bal.gt(0) : (BigInt(bal) > 0n);
+    if (!owned) return res.json({ success: true, owned: false, matched: false });
+
+    const tokenId = await personaRead.tokenOf(address);
+    const tidStr  = tokenId?.toString?.() || String(tokenId || "0");
+    if (tidStr === "0") return res.json({ success: true, owned: true, matched: false });
+
+    const id = await personaRead.identityOf(tokenId);
+    const onUser   = id.userIdHash || id[0];
+    const onDevice = id.deviceHash || id[1];
+
+    const wantEmail   = email ? String(email).trim() : null;
+    const wantDevice  = deviceFpr ? String(deviceFpr).trim() : null;
+    const emailOk     = wantEmail  ? (commitUserId(wantEmail).toLowerCase()  === String(onUser).toLowerCase())   : true;
+    const deviceOk    = wantDevice ? (commitDevice(wantDevice).toLowerCase() === String(onDevice).toLowerCase()) : true;
+
+    return res.json({ success: true, owned: true, matched: !!(emailOk && deviceOk) });
+  } catch (e) {
+    console.error('❌ /nft-owned-verify:', e);
+    return res.status(500).json({ success: false, error: 'verify failed' });
+  }
 });
 
 // GET /tx-receipt?hash=0x...
 app.get('/tx-receipt', async (req, res) => {
+  try {
+    if (!provider) return res.status(503).json({ success: false, error: 'provider not configured' });
+    const hash = String(req.query.hash || '').trim();
+    if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) {
+      return res.status(400).json({ success: false, error: 'bad hash' });
+    }
+    const r = await provider.getTransactionReceipt(hash);
+    if (!r) return res.json({ success: true, found: false });
+    return res.json({
+      success: true,
+      found: true,
+      status: typeof r.status === 'number' ? r.status : null,
+      blockNumber: r.blockNumber ?? null
+    });
+  } catch (e) {
+    console.error('❌ /tx-receipt:', e);
+    return res.status(500).json({ success: false, error: 'lookup failed' });
+  }
+});
+
+// add near other routes
+app.get('/runtime', async (req, res) => {
     try {
-      if (!provider) return res.status(503).json({ success: false, error: 'provider not configured' });
-      const hash = String(req.query.hash || '').trim();
-      if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) {
-        return res.status(400).json({ success: false, error: 'bad hash' });
-      }
-      const r = await provider.getTransactionReceipt(hash);
-      if (!r) return res.json({ success: true, found: false });
+      const net = provider ? await provider.getNetwork() : null;
+      let minterAddr = null;
+      try { if (MINTER_PRIVATE_KEY) minterAddr = new ethers.Wallet(MINTER_PRIVATE_KEY).address; } catch {}
       return res.json({
-        success: true,
-        found: true,
-        status: typeof r.status === 'number' ? r.status : null,
-        blockNumber: r.blockNumber ?? null
+        configured: !!personaAuth,
+        contractAddress_env: CONTRACT_ADDRESS || null,
+        personaAuth_connected: personaAuth?.address || null,
+        relayerAddress: relayerSigner?.address || null,
+        minterAddress: minterAddr,
+        network: net ? { chainId: String(net.chainId), name: net.name } : null
       });
     } catch (e) {
-      console.error('❌ /tx-receipt:', e);
-      return res.status(500).json({ success: false, error: 'lookup failed' });
+      return res.status(500).json({ error: String(e.message || e) });
     }
 });
   
-  
+
 // ---------------------- Start ----------------------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {

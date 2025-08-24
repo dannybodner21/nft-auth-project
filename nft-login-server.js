@@ -155,6 +155,11 @@ if (RPC_URL && CONTRACT_ADDRESS && DEPLOYER_PRIVATE_KEY && MINTER_PRIVATE_KEY &&
   console.warn("⚠️ Minting disabled: set RPC_URL, CONTRACT_ADDRESS, DEPLOYER_PRIVATE_KEY, MINTER_PRIVATE_KEY, USER_COMMITMENT_PEPPER, DEVICE_COMMITMENT_PEPPER");
 }
 
+
+
+
+
+
 // ---------------------- In-memory stores (dev) ----------------------
 let pendingLogins = {};          // { requestId: { email, websiteDomain?, status, timestamp, devicePublicKeyJwk?, extSession? } }
 let userTokens = {};             // { email: deviceToken }
@@ -166,6 +171,175 @@ let pendingCardChallenges = {};  // { emailNorm: { challenge, expiresAt } }
 const pendingEmailCodes = {};
 const verifiedEmails = {};
 const makeCode6 = () => String(Math.floor(100000 + Math.random() * 900000));
+
+// === BEGIN: per-user card binding (production) ===
+
+// In-memory card key registry (replace with DB in prod):
+// cardKeys[emailNorm] = { keyObj, spkiSha256, pem }
+let cardKeys = {};
+
+function b64urlToStd(b64) {
+  return String(b64 || "").replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
+}
+
+function keyInfoFromKeyObject(keyObj) {
+  const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
+  const sha256  = crypto.createHash('sha256').update(spkiDer).digest('base64');
+  const details = keyObj.asymmetricKeyDetails || {};
+  return { alg: keyObj.asymmetricKeyType, modulusBits: details.modulusLength || null, spkiSha256: sha256 };
+}
+
+function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKCS1V15' }) {
+  const sigBuf = Buffer.from(b64urlToStd(signatureB64), 'base64');
+  if (scheme.toUpperCase() === 'PSS') {
+    const v = crypto.createVerify('sha256'); // hash only; padding specified below
+    v.update(Buffer.from(challenge, 'utf8'));
+    v.end();
+    return v.verify(
+      { key: publicKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 },
+      sigBuf
+    );
+  } else {
+    const v = crypto.createVerify('RSA-SHA256'); // PKCS#1 v1.5
+    v.update(Buffer.from(challenge, 'utf8'));
+    v.end();
+    return v.verify(publicKey, sigBuf);
+  }
+}
+
+// Inspect what key is bound for an email (debug)
+app.get('/card-key-fp/:email', (req, res) => {
+  const emailNorm = normalizeEmail(req.params.email || '');
+  const rec = cardKeys[emailNorm] || null;
+  if (!rec) return res.json({ success: true, bound: false });
+  return res.json({ success: true, bound: true, spkiSha256: rec.spkiSha256 });
+});
+
+// Register/bind a card to an email with proof-of-possession.
+// Body: { email, spkiPem, challenge, signatureB64, scheme? }
+// - spkiPem: the card's **public key PEM** (-----BEGIN PUBLIC KEY-----...)
+// - challenge/signatureB64: must be the exact challenge from /card-challenge and a signature from THIS key
+app.post('/card-register', (req, res) => {
+  try {
+    const emailNorm    = normalizeEmail(req.body?.email || '');
+    const spkiPem      = String(req.body?.spkiPem || '').trim();
+    const challenge    = String(req.body?.challenge || '');
+    const signatureB64 = String(req.body?.signatureB64 || '');
+    const scheme       = String(req.body?.scheme || 'PKCS1V15');
+
+    if (!emailNorm || !spkiPem || !challenge || !signatureB64) {
+      return res.status(400).json({ success: false, error: 'email, spkiPem, challenge, signatureB64 required' });
+    }
+
+    // Must be a valid pending challenge for this email
+    const rec = pendingCardChallenges[emailNorm];
+    if (!rec || rec.challenge !== challenge || Date.now() > rec.expiresAt) {
+      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
+    }
+
+    // Build key object from PEM and verify proof-of-possession
+    let keyObj;
+    try { keyObj = crypto.createPublicKey(spkiPem); }
+    catch (e) { return res.status(400).json({ success: false, error: 'bad spkiPem' }); }
+
+    const ok = verifyCardSignature({ publicKey: keyObj, challenge, signatureB64, scheme });
+    if (!ok) return res.status(400).json({ success: false, error: 'proof-of-possession failed' });
+
+    const info = keyInfoFromKeyObject(keyObj);
+    cardKeys[emailNorm] = { keyObj, spkiSha256: info.spkiSha256, pem: spkiPem };
+
+    // One-time use
+    delete pendingCardChallenges[emailNorm];
+
+    // Start a live session (same TTL as extension)
+    const TTL_MS = 2 * 60 * 60 * 1000;
+    sessionApprovals[emailNorm] = Date.now() + TTL_MS;
+
+    return res.json({ success: true, bound: true, spkiSha256: info.spkiSha256, sessionExpiresAt: sessionApprovals[emailNorm] });
+  } catch (e) {
+    console.error('❌ /card-register:', e);
+    return res.status(500).json({ success: false, error: 'register failed' });
+  }
+});
+
+// DROP-IN REPLACEMENT: /card-verify now prefers the **per-user** key if present; falls back to global env key for legacy.
+app.post('/card-verify', (req, res) => {
+  try {
+    const rawEmail     = String(req.body?.email || '');
+    const emailNorm    = normalizeEmail(rawEmail);
+    const challenge    = String(req.body?.challenge || '');
+    const signatureB64 = String(req.body?.signatureB64 || '');
+    const scheme       = String(req.body?.scheme || 'PKCS1V15');
+
+    if (!emailNorm || !challenge || !signatureB64) {
+      return res.status(400).json({ success: false, error: 'email, challenge, signatureB64 required' });
+    }
+    if (!challenge.startsWith('nftvault:card-auth|')) {
+      return res.status(400).json({ success: false, error: 'bad challenge prefix' });
+    }
+
+    // Must match issued challenge & be fresh
+    const rec = pendingCardChallenges[emailNorm];
+    if (!rec || rec.challenge !== challenge || Date.now() > rec.expiresAt) {
+      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
+    }
+
+    // Parse & check email + ts
+    const fields = Object.fromEntries(
+      challenge.split('|').slice(1).map(kv => {
+        const i = kv.indexOf('=');
+        return i === -1 ? [kv, ''] : [kv.slice(0, i), kv.slice(i + 1)];
+      })
+    );
+    if (normalizeEmail(fields.email || '') !== emailNorm) {
+      return res.status(400).json({ success: false, error: 'email mismatch' });
+    }
+    const ts = Number(fields.ts);
+    if (!Number.isFinite(ts)) return res.status(400).json({ success: false, error: 'bad ts' });
+    const now = Math.floor(Date.now() / 1000);
+    const MAX_SKEW = 5 * 60;
+    if (Math.abs(now - ts) > MAX_SKEW) {
+      return res.status(400).json({ success: false, error: 'stale/future challenge', now, ts });
+    }
+
+    // Pick the right key: per-user bound key first; else legacy env key
+    let verifyKey = null;
+    if (cardKeys[emailNorm]?.keyObj) {
+      verifyKey = cardKeys[emailNorm].keyObj;
+    } else if (cardAuthKey) {
+      verifyKey = cardAuthKey;
+    } else {
+      return res.status(503).json({ success: false, error: 'no verification key available' });
+    }
+
+    const ok = verifyCardSignature({ publicKey: verifyKey, challenge, signatureB64, scheme });
+    if (!ok) return res.status(400).json({ success: false, verified: false });
+
+    delete pendingCardChallenges[emailNorm];
+
+    // Start/refresh live session (2h)
+    const TTL_MS = 2 * 60 * 60 * 1000;
+    sessionApprovals[emailNorm] = Date.now() + TTL_MS;
+    console.log(`🔓 Card session approved for ${emailNorm} until ${new Date(sessionApprovals[emailNorm]).toISOString()}`);
+
+    return res.json({ success: true, verified: true, email: emailNorm, ts, nonce: fields.nonce || null, sessionExpiresAt: sessionApprovals[emailNorm] });
+  } catch (e) {
+    console.error('❌ /card-verify error:', e);
+    return res.status(500).json({ success: false, error: 'verify failed' });
+  }
+});
+
+// === END: per-user card binding ===
+
+
+
+
+
+
+
+
+
+
 
 // ---------------------- Token registration ----------------------
 app.post('/save-token', (req, res) => {
@@ -311,80 +485,10 @@ app.post('/card-challenge', (req, res) => {
   }
 });
 
-// --- Card verify (RSA-PKCS1v1_5 + SHA-256) ---
-app.post('/card-verify', (req, res) => {
-  try {
-    const rawEmail = String(req.body?.email || '');
-    const emailNorm = normalizeEmail(rawEmail);
-    const challenge = String(req.body?.challenge || '');
-    const signatureB64 = String(req.body?.signatureB64 || '');
 
-    if (!emailNorm || !challenge || !signatureB64) {
-      return res.status(400).json({ success: false, error: 'email, challenge, signatureB64 required' });
-    }
-    if (!challenge.startsWith('nftvault:card-auth|')) {
-      return res.status(400).json({ success: false, error: 'bad challenge prefix' });
-    }
-    if (!cardAuthKey) {
-      return res.status(503).json({ success: false, error: 'card key not loaded' });
-    }
 
-    // Must match the issued challenge and be fresh
-    const rec = pendingCardChallenges[emailNorm];
-    if (!rec || rec.challenge !== challenge || Date.now() > rec.expiresAt) {
-      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
-    }
 
-    // Parse fields and enforce email & ts
-    const fields = Object.fromEntries(
-      challenge.split('|').slice(1).map(kv => {
-        const i = kv.indexOf('=');
-        return i === -1 ? [kv, ''] : [kv.slice(0, i), kv.slice(i + 1)];
-      })
-    );
-    if (normalizeEmail(fields.email || '') !== emailNorm) {
-      return res.status(400).json({ success: false, error: 'email mismatch' });
-    }
-    const ts = Number(fields.ts);
-    if (!Number.isFinite(ts)) return res.status(400).json({ success: false, error: 'bad ts' });
-    const now = Math.floor(Date.now() / 1000);
-    const MAX_SKEW = 5 * 60;
-    if (Math.abs(now - ts) > MAX_SKEW) {
-      return res.status(400).json({ success: false, error: 'stale/future challenge', now, ts });
-    }
 
-    // Verify RSA-PKCS1v1_5 with SHA-256 over UTF-8 challenge
-    const verifier = crypto.createVerify('RSA-SHA256');
-    verifier.update(Buffer.from(challenge, 'utf8'));
-    verifier.end();
-    const sig = Buffer.from(signatureB64, 'base64');
-    const ok = verifier.verify(cardAuthKey, sig);
-
-    if (!ok) return res.status(400).json({ success: false, verified: false });
-
-    // One-time use
-    delete pendingCardChallenges[emailNorm];
-
-    // Start a live session after card verify (2h TTL, same policy as extension)
-    const TTL_MS = 2 * 60 * 60 * 1000;
-    sessionApprovals[emailNorm] = Date.now() + TTL_MS;
-    console.log(`🔓 Card session approved for ${emailNorm} until ${new Date(sessionApprovals[emailNorm]).toISOString()}`);
-
-    return res.json({
-        success: true,
-        verified: true,
-        email: emailNorm,
-        ts,
-        nonce: fields.nonce || null,
-        sessionExpiresAt: sessionApprovals[emailNorm]
-    });
-
-    return res.json({ success: true, verified: true, email: emailNorm, ts, nonce: fields.nonce || null });
-  } catch (e) {
-    console.error('❌ /card-verify error:', e);
-    return res.status(500).json({ success: false, error: 'verify failed' });
-  }
-});
 
 // ---------------------- Credentials storage ----------------------
 app.post('/store-credentials', (req, res) => {

@@ -3,32 +3,32 @@ require('dotenv').config();
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const admin = require('firebase-admin');
-
-// const path = require('path');
-// const fs = require('fs');
-
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
 // === Ethers wiring (v5/v6 compatible) ===
 const { ethers } = require('ethers');
-const isAddress       = ethers.utils?.isAddress       || ethers.isAddress;
-const keccak256       = ethers.utils?.keccak256       || ethers.keccak256;
-const toUtf8Bytes     = ethers.utils?.toUtf8Bytes     || ethers.toUtf8Bytes;
-const JsonRpcProvider = ethers.providers?.JsonRpcProvider || ethers.JsonRpcProvider;
-const parseUnits      = ethers.utils?.parseUnits      || ethers.parseUnits;
-const solidityPack    = ethers.utils?.solidityPack    || ethers.solidityPack;
+const isAddress         = ethers.utils?.isAddress         || ethers.isAddress;
+const keccak256         = ethers.utils?.keccak256         || ethers.keccak256;
+const toUtf8Bytes       = ethers.utils?.toUtf8Bytes       || ethers.toUtf8Bytes;
+const JsonRpcProvider   = ethers.providers?.JsonRpcProvider || ethers.JsonRpcProvider;
+const parseUnits        = ethers.utils?.parseUnits        || ethers.parseUnits;
+const solidityPack      = ethers.utils?.solidityPack      || ethers.solidityPack;
+const hexlify           = ethers.utils?.hexlify           || ethers.hexlify;
+const randomBytes       = ethers.utils?.randomBytes       || ethers.randomBytes;
+const formatUnits       = ethers.utils?.formatUnits       || ((bn, unit) => String(bn)); // used only for fee logging
 
-const RPC_URL                = process.env.RPC_URL;              // e.g. https://polygon-mainnet.g.alchemy.com/v2/xxx
-const CONTRACT_ADDRESS       = process.env.CONTRACT_ADDRESS;     // PersonaAuth final contract (deployed)
-const DEPLOYER_PRIVATE_KEY    = process.env.DEPLOYER_PRIVATE_KEY;  // pays gas (separate from role keys)
-const MINTER_PRIVATE_KEY     = process.env.MINTER_PRIVATE_KEY;   // signs EIP-712 MintAuth (must match MINTER_ROLE)
-const USER_PEPPER            = process.env.USER_COMMITMENT_PEPPER;   // server-side secret (do NOT leak)
-const DEVICE_PEPPER          = process.env.DEVICE_COMMITMENT_PEPPER; // server-side secret (do NOT leak)
-const CARD_AUTH_PUBKEY_PEM_PATH = process.env.CARD_AUTH_PUBKEY_PEM_PATH || ""; // file path to PEM
+const RPC_URL                    = process.env.RPC_URL;               // e.g. https://polygon-mainnet.g.alchemy.com/v2/xxx
+const CONTRACT_ADDRESS           = process.env.CONTRACT_ADDRESS;      // PersonaAuth final contract (deployed)
+const DEPLOYER_PRIVATE_KEY       = process.env.DEPLOYER_PRIVATE_KEY;  // pays gas (separate from role keys)
+const MINTER_PRIVATE_KEY         = process.env.MINTER_PRIVATE_KEY;    // signs EIP-712 MintAuth (must match MINTER_ROLE)
+const USER_PEPPER                = process.env.USER_COMMITMENT_PEPPER;   // server-side secret (do NOT leak)
+const DEVICE_PEPPER              = process.env.DEVICE_COMMITMENT_PEPPER; // server-side secret (do NOT leak)
+const CARD_PUBKEY_PEM_PATH       = process.env.CARD_AUTH_PUBKEY_PEM_PATH || process.env.CARD_PUBKEY_PEM_PATH || "";
+const CARD_PUBKEY_PEM_INLINE     = process.env.CARD_PUBKEY_PEM || "";
 
-
+// ---------------------- Provider / Contract ----------------------
 let provider, relayerSigner, personaAuth;
 if (RPC_URL && CONTRACT_ADDRESS && DEPLOYER_PRIVATE_KEY && MINTER_PRIVATE_KEY && USER_PEPPER && DEVICE_PEPPER) {
   provider      = new JsonRpcProvider(RPC_URL);
@@ -73,7 +73,7 @@ async function getAggressiveFees(pvd) {
   const toGwei = (wei) => {
     if (!wei) return 0;
     const s = wei.toString();
-    return ethers.utils?.formatUnits ? Number(ethers.utils.formatUnits(s, "gwei")) : (Number(s) / 1e9);
+    return ethers.utils?.formatUnits ? Number(formatUnits(s, "gwei")) : (Number(s) / 1e9);
   };
   const suggestedPrio = toGwei(fd.maxPriorityFeePerGas ?? fd.gasPrice ?? 0);
   const suggestedBase = toGwei(fd.lastBaseFeePerGas ?? fd.gasPrice ?? 0);
@@ -83,6 +83,13 @@ async function getAggressiveFees(pvd) {
   const maxFeePerGas         = parseUnits(String(base + prio), "gwei");
   return { maxFeePerGas, maxPriorityFeePerGas };
 }
+
+// v5/v6-safe typed data signing
+const signTypedData = async (wallet, domain, types, value) => {
+  if (typeof wallet._signTypedData === 'function') return wallet._signTypedData(domain, types, value);
+  if (typeof wallet.signTypedData === 'function')   return wallet.signTypedData(domain, types, value);
+  throw new Error('Wallet does not support EIP-712 signing');
+};
 
 // --- (Legacy helpers kept if needed elsewhere) ---
 function normKeccak(input) {
@@ -96,13 +103,12 @@ function anyEq(arr, val) {
 
 // ---------------------- App init ----------------------
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '64kb' }));
 
 // CORS — allow Chrome extensions; native apps / service workers send no Origin and don't need CORS
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   const isExtension = typeof origin === 'string' && origin.startsWith('chrome-extension://');
-
   if (isExtension) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
@@ -123,45 +129,60 @@ if (process.env.FIREBASE_CONFIG) {
 } else {
   throw new Error('No Firebase credentials: set FIREBASE_CONFIG or GOOGLE_APPLICATION_CREDENTIALS');
 }
-
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
-// ---------- Load OpenPGP card auth public key (PEM, SPKI) ----------
-let cardAuthKey = null;        // crypto.KeyObject
-let cardAuthKeyInfo = null;    // { alg, modulusBits, spkiSha256 }
-if (CARD_AUTH_PUBKEY_PEM_PATH) {
-  try {
-    const pem = fs.readFileSync(path.resolve(CARD_AUTH_PUBKEY_PEM_PATH), 'utf8');
-    const keyObj = crypto.createPublicKey(pem); // expects SPKI PEM
-    const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
-    const sha256 = crypto.createHash('sha256').update(spkiDer).digest('base64');
-    const details = keyObj.asymmetricKeyDetails || {};
-    const modulusBits = details.modulusLength || null;
-    cardAuthKey = keyObj;
-    cardAuthKeyInfo = { alg: keyObj.asymmetricKeyType, modulusBits, spkiSha256: sha256 };
-    console.log(`🔐 Card auth key loaded: alg=${cardAuthKeyInfo.alg}, bits=${modulusBits}, fp(SHA256)=${sha256}`);
-  } catch (e) {
-    console.warn(`⚠️ Failed to load CARD_AUTH_PUBKEY_PEM_PATH (${CARD_AUTH_PUBKEY_PEM_PATH}): ${e.message}`);
-  }
-} else {
-  console.warn('⚠️ CARD_AUTH_PUBKEY_PEM_PATH not set; card-based unlock disabled');
+// ---------- Load OpenPGP card auth public key (either env PEM or file PEM) ----------
+let cardKeyFromPath = null;     // crypto.KeyObject
+let cardKeyFromEnv  = null;     // crypto.KeyObject
+let cardPathInfo    = null;     // { alg, modulusBits, spkiSha256 }
+let cardEnvInfo     = null;     // { alg, modulusBits, spkiSha256 }
+
+function describeKey(keyObj) {
+  const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
+  const sha256  = crypto.createHash('sha256').update(spkiDer).digest('base64');
+  const details = keyObj.asymmetricKeyDetails || {};
+  const modulusBits = details.modulusLength || null;
+  return { alg: keyObj.asymmetricKeyType, modulusBits, spkiSha256: sha256 };
 }
 
+if (CARD_PUBKEY_PEM_PATH) {
+  try {
+    const pem = fs.readFileSync(path.resolve(CARD_PUBKEY_PEM_PATH), 'utf8');
+    cardKeyFromPath = crypto.createPublicKey(pem); // SPKI PEM
+    cardPathInfo    = describeKey(cardKeyFromPath);
+    console.log(`🔐 Card key (path) loaded: alg=${cardPathInfo.alg}, bits=${cardPathInfo.modulusBits}, fp=${cardPathInfo.spkiSha256}`);
+  } catch (e) {
+    console.warn(`⚠️ Failed to load CARD_PUBKEY_PEM_PATH (${CARD_PUBKEY_PEM_PATH}): ${e.message}`);
+  }
+}
+if (CARD_PUBKEY_PEM_INLINE) {
+  try {
+    cardKeyFromEnv = crypto.createPublicKey(CARD_PUBKEY_PEM_INLINE);
+    cardEnvInfo    = describeKey(cardKeyFromEnv);
+    console.log(`🔐 Card key (env)  loaded: alg=${cardEnvInfo.alg}, bits=${cardEnvInfo.modulusBits}, fp=${cardEnvInfo.spkiSha256}`);
+  } catch (e) {
+    console.error(`❌ Bad CARD_PUBKEY_PEM env: ${e.message}`);
+  }
+}
 
-
-
-
+function getCardVerifyKey() {
+  // Prefer explicit env string, then file path
+  return cardKeyFromEnv || cardKeyFromPath || null;
+}
+function getActiveCardInfo() {
+  return cardEnvInfo || cardPathInfo || null;
+}
 
 // ---------------------- In-memory stores (dev) ----------------------
-let pendingLogins = {};     // { requestId: { email, websiteDomain?, status, timestamp, devicePublicKeyJwk?, extSession? } }
-let userTokens = {};        // { email: deviceToken }
-let userCredentials = {};   // { email: [ { id, name?, url?, enc, wrapped_key_session?, wrapped_key_device? } ] }
-let pendingDecrypts = {};   // { txId: { email, credentialId, status, payload?, expiresAt?, createdAt } }
-let sessionApprovals = {};  // { email: expiryMs }
-let pendingCardChallenges = {}; // { email: { challenge, expiresAt } }
+let pendingLogins = {};          // { requestId: { email, websiteDomain?, status, timestamp, devicePublicKeyJwk?, extSession? } }
+let userTokens = {};             // { email: deviceToken }
+let userCredentials = {};        // { email: [ { id, name?, url?, enc, wrapped_key_session?, wrapped_key_device? } ] }
+let pendingDecrypts = {};        // { txId: { email, credentialId, status, payload?, expiresAt?, createdAt } }
+let sessionApprovals = {};       // { email: expiryMs }
+let pendingCardChallenges = {};  // { email: { challenge, expiresAt } }
 
 // Email verification (dev)
-const pendingEmailCodes = {};   // { email: { code, expiresAt } }
+const pendingEmailCodes = {};    // { email: { code, expiresAt } }
 const verifiedEmails     = {};   // { email: true }
 const makeCode6 = () => String(Math.floor(100000 + Math.random() * 900000));
 
@@ -279,7 +300,9 @@ app.post('/start-email-verify', (req, res) => {
   if (!email) return res.status(400).json({ success: false, error: 'Missing email' });
   const code = makeCode6();
   pendingEmailCodes[email] = { code, expiresAt: Date.now() + 10 * 60 * 1000 };
-  console.log(`📧 Email verify code for ${email}: ${code} (valid 10 min)`);
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(`📧 Email verify code for ${email}: ${code} (valid 10 min)`);
+  }
   return res.json({ success: true });
 });
 
@@ -304,47 +327,52 @@ app.get("/debug", (req, res) => {
   res.json({ success: true, message: "This is the real nft-login-server.js" });
 });
 
-
-// Quick check: report loaded card key fingerprint
+// Card key introspection
 app.get('/card-pubkey-fp', (req, res) => {
-    if (!cardAuthKeyInfo) return res.status(503).json({ success: false, error: 'card key not loaded' });
-    res.json({ success: true, ...cardAuthKeyInfo });
+  const active = getActiveCardInfo();
+  if (!active) return res.status(503).json({ success: false, error: 'card key not loaded' });
+  res.json({
+    success: true,
+    active,
+    pathKey: cardPathInfo || null,
+    envKey: cardEnvInfo || null,
+    same: !!(cardPathInfo && cardEnvInfo && cardPathInfo.spkiSha256 === cardEnvInfo.spkiSha256)
+  });
 });
 
 // --- Card challenge (to be signed by the card's Authentication key) ---
 // POST /card-challenge { email }
 // Returns { success, challenge, expiresAt, spec }
 app.post('/card-challenge', (req, res) => {
-    try {
-        if (!cardAuthKey) return res.status(503).json({ success: false, error: 'card key not loaded' });
-        const email = String(req.body?.email || '').trim().toLowerCase();
-        if (!email || !email.includes('@')) return res.status(400).json({ success: false, error: 'valid email required' });
-    
-        // Canonical message format the client MUST sign (UTF-8 bytes)
-        // Bind to email + timestamp + 16B nonce to prevent replay
-        const now = Math.floor(Date.now() / 1000);
-        const nonce = crypto.randomBytes(16).toString('hex');
-        const challenge = `nftvault:card-auth|email=${email}|ts=${now}|nonce=${nonce}`;
-        const ttlSec = 120; // 2 minutes
-    
-        pendingCardChallenges[email] = { challenge, expiresAt: Date.now() + ttlSec * 1000 };
-    
-        return res.json({
-          success: true,
-          challenge,
-          expiresAt: now + ttlSec,
-          spec: {
-            algo: 'RSA-PKCS1v1_5-SHA256',
-            encoding: 'UTF-8 bytes of challenge string',
-            fieldOrder: 'literal string as returned (no JSON canonicalization)'
-          }
-        });
-      } catch (e) {
-        console.error('❌ /card-challenge:', e);
-        return res.status(500).json({ success: false, error: 'challenge failed' });
-      }
-});
+  try {
+    if (!getCardVerifyKey()) return res.status(503).json({ success: false, error: 'card key not loaded' });
 
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email || !email.includes('@')) return res.status(400).json({ success: false, error: 'valid email required' });
+
+    // Canonical message the client MUST sign (UTF-8 bytes)
+    const now   = Math.floor(Date.now() / 1000);
+    const nonce = crypto.randomBytes(16).toString('hex'); // 32 hex chars
+    const challenge = `nftvault:card-auth|email=${email}|ts=${now}|nonce=${nonce}`;
+    const ttlSec = 120; // 2 minutes
+
+    pendingCardChallenges[email] = { challenge, expiresAt: Date.now() + ttlSec * 1000 };
+
+    return res.json({
+      success: true,
+      challenge,
+      expiresAt: now + ttlSec,
+      spec: {
+        algo: 'RSA-PKCS1v1_5-SHA256',
+        encoding: 'UTF-8 bytes of challenge string',
+        fieldOrder: 'literal string as returned (no JSON canonicalization)'
+      }
+    });
+  } catch (e) {
+    console.error('❌ /card-challenge:', e);
+    return res.status(500).json({ success: false, error: 'challenge failed' });
+  }
+});
 
 // ---------------------- Credentials storage ----------------------
 app.post('/store-credentials', (req, res) => {
@@ -548,15 +576,34 @@ setInterval(() => {
   for (const [email, exp] of Object.entries(sessionApprovals)) {
     if (Date.now() > exp) delete sessionApprovals[email];
   }
-
   // Cleanup stale card challenges
   for (const [email, rec] of Object.entries(pendingCardChallenges)) {
     if (!rec || now > (rec.expiresAt || 0)) delete pendingCardChallenges[email];
   }
-
 }, 60_000);
 
 // ---------------------- Mint endpoints (EIP-712; no user on-chain) ----------------------
+async function relayMintWithFallback(to, userIdHash, deviceHash, salt, deadline, signature) {
+  const fee = await getAggressiveFees(provider);
+  try {
+    return await personaAuth.mintWithSig(to, userIdHash, deviceHash, salt, deadline, signature, {
+      maxFeePerGas:         fee.maxFeePerGas,
+      maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+    });
+  } catch (e) {
+    // Some RPCs refuse to estimate; retry with a conservative gasLimit
+    if (String(e.code || '').includes('UNPREDICTABLE_GAS_LIMIT')) {
+      console.warn('⚠️ estimateGas failed; retrying with manual gasLimit=250k');
+      return await personaAuth.mintWithSig(to, userIdHash, deviceHash, salt, deadline, signature, {
+        maxFeePerGas:         fee.maxFeePerGas,
+        maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+        gasLimit: 250_000
+      });
+    }
+    throw e;
+  }
+}
+
 // Body: { email, deviceFpr, to }
 app.post('/mint-nft', async (req, res) => {
   try {
@@ -584,19 +631,15 @@ app.post('/mint-nft', async (req, res) => {
       { name: "deadline",    type: "uint256" },
     ]};
 
-    const salt     = ethers.utils.hexlify(ethers.utils.randomBytes(32));
+    const salt     = hexlify(randomBytes(32));
     const deadline = Math.floor(Date.now() / 1000) + 10 * 60;
 
     // Sign with MINTER role key (offline)
     const minter = new ethers.Wallet(MINTER_PRIVATE_KEY);
-    const signature = await minter._signTypedData(domain, types, { to, userIdHash, deviceHash, salt, deadline });
+    const signature = await signTypedData(minter, domain, types, { to, userIdHash, deviceHash, salt, deadline });
 
-    // Relay tx (gas payer)
-    const fee = await getAggressiveFees(provider);
-    const tx = await personaAuth.mintWithSig(to, userIdHash, deviceHash, salt, deadline, signature, {
-      maxFeePerGas:         fee.maxFeePerGas,
-      maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
-    });
+    // Relay tx (gas payer) with fallback
+    const tx = await relayMintWithFallback(to, userIdHash, deviceHash, salt, deadline, signature);
     console.log(`⛓️  mintWithSig → ${tx.hash}`);
 
     const rc = (typeof tx.wait === 'function') ? await tx.wait(1) : await provider.waitForTransaction(tx.hash, 1);
@@ -639,17 +682,13 @@ app.post('/mint-persona', async (req, res) => {
       { name: "deadline",    type: "uint256" },
     ]};
 
-    const salt     = ethers.utils.hexlify(ethers.utils.randomBytes(32));
+    const salt     = hexlify(randomBytes(32));
     const deadline = Math.floor(Date.now() / 1000) + 10 * 60;
 
     const minter = new ethers.Wallet(MINTER_PRIVATE_KEY);
-    const signature = await minter._signTypedData(domain, types, { to, userIdHash, deviceHash, salt, deadline });
+    const signature = await signTypedData(minter, domain, types, { to, userIdHash, deviceHash, salt, deadline });
 
-    const fee = await getAggressiveFees(provider);
-    const tx = await personaAuth.mintWithSig(to, userIdHash, deviceHash, salt, deadline, signature, {
-      maxFeePerGas:         fee.maxFeePerGas,
-      maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
-    });
+    const tx = await relayMintWithFallback(to, userIdHash, deviceHash, salt, deadline, signature);
     console.log(`⛓️  mintWithSig → ${tx.hash}`);
 
     const rc = (typeof tx.wait === 'function') ? await tx.wait(1) : await provider.waitForTransaction(tx.hash, 1);
@@ -674,7 +713,7 @@ app.get('/has-nft/:address', async (req, res) => {
       return res.status(503).json({ success: false, error: 'Contract not configured' });
     }
     const address = String(req.params.address || '').trim();
-    if (!ethers.utils.isAddress(address)) {
+    if (!isAddress(address)) {
       return res.status(400).json({ success: false, error: 'Bad address' });
     }
 
@@ -710,7 +749,7 @@ app.get('/nft-owned', async (req, res) => {
       return res.status(503).json({ success: false, error: 'Read contract not configured' });
     }
     const addr = String(req.query.address || '').trim();
-    if (!addr || !ethers.utils.isAddress(addr)) {
+    if (!addr || !isAddress(addr)) {
       return res.status(400).json({ success: false, error: 'Valid address required' });
     }
 
@@ -731,14 +770,13 @@ app.get('/nft-owned', async (req, res) => {
 });
 
 // --- READ+VERIFY: optional strict match on email/deviceFpr (commitments) ---
-// POST /nft-owned-verify  { address, email?, deviceFpr? }
 app.post('/nft-owned-verify', async (req, res) => {
   try {
     if (!provider || !CONTRACT_ADDRESS) {
       return res.status(503).json({ success: false, error: 'Read contract not configured' });
     }
     const { address, email, deviceFpr } = req.body || {};
-    if (!address || !ethers.utils.isAddress(address)) {
+    if (!address || !isAddress(address)) {
       return res.status(400).json({ success: false, error: 'Valid address required' });
     }
 
@@ -766,7 +804,7 @@ app.post('/nft-owned-verify', async (req, res) => {
     const emailOk     = wantEmail  ? (commitUserId(wantEmail).toLowerCase()  === String(onUser).toLowerCase())   : true;
     const deviceOk    = wantDevice ? (commitDevice(wantDevice).toLowerCase() === String(onDevice).toLowerCase()) : true;
 
-    return res.json({ success: true, owned: true, matched: !!(emailOk && deviceOk) });
+    return res.json({ success: true, owned: true, matched: !!(emailOk && deviceOk), tokenId: tidStr });
   } catch (e) {
     console.error('❌ /nft-owned-verify:', e);
     return res.status(500).json({ success: false, error: 'verify failed' });
@@ -795,27 +833,26 @@ app.get('/tx-receipt', async (req, res) => {
   }
 });
 
-// add near other routes
+// Runtime status
 app.get('/runtime', async (req, res) => {
-    try {
-      const net = provider ? await provider.getNetwork() : null;
-      let minterAddr = null;
-      try { if (MINTER_PRIVATE_KEY) minterAddr = new ethers.Wallet(MINTER_PRIVATE_KEY).address; } catch {}
-      return res.json({
-        configured: !!personaAuth,
-        contractAddress_env: CONTRACT_ADDRESS || null,
-        personaAuth_connected: personaAuth?.address || null,
-        relayerAddress: relayerSigner?.address || null,
-        minterAddress: minterAddr,
-        network: net ? { chainId: String(net.chainId), name: net.name } : null
-      });
-    } catch (e) {
-      return res.status(500).json({ error: String(e.message || e) });
-    }
+  try {
+    const net = provider ? await provider.getNetwork() : null;
+    let minterAddr = null;
+    try { if (MINTER_PRIVATE_KEY) minterAddr = new ethers.Wallet(MINTER_PRIVATE_KEY).address; } catch {}
+    return res.json({
+      configured: !!personaAuth,
+      contractAddress_env: CONTRACT_ADDRESS || null,
+      personaAuth_connected: personaAuth?.address || null,
+      relayerAddress: relayerSigner?.address || null,
+      minterAddress: minterAddr,
+      network: net ? { chainId: String(net.chainId), name: net.name } : null
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
-
-
+// --- Card verify (RSA-PKCS1v1_5 + SHA-256) ---
 app.post('/card-verify', (req, res) => {
   try {
     const { email, challenge, signatureB64 } = req.body || {};
@@ -825,12 +862,13 @@ app.post('/card-verify', (req, res) => {
     if (!challenge.startsWith('nftvault:card-auth|')) {
       return res.status(400).json({ success: false, error: 'bad challenge prefix' });
     }
-    // Use the key you already loaded from CARD_AUTH_PUBKEY_PEM_PATH
-    if (!cardAuthKey) {
-        return res.status(503).json({ success: false, error: 'card key not loaded' });
+
+    const verifierKey = getCardVerifyKey();
+    if (!verifierKey) {
+      return res.status(503).json({ success: false, error: 'card key not loaded' });
     }
 
-    // Parse fields: nftvault:card-auth|email=...|ts=...|nonce=...
+    // Parse fields
     const fields = Object.fromEntries(
       challenge.split('|').slice(1).map(kv => {
         const i = kv.indexOf('=');
@@ -838,43 +876,45 @@ app.post('/card-verify', (req, res) => {
       })
     );
 
-    if (fields.email !== email) {
+    const emailNorm = String(email).trim().toLowerCase();
+    if (fields.email !== emailNorm) {
       return res.status(400).json({ success: false, error: 'email mismatch' });
     }
 
-    const ts = Number(fields.ts);
-    if (!Number.isFinite(ts)) {
-      return res.status(400).json({ success: false, error: 'bad ts' });
+    // Require the challenge we issued (one-time, not expired)
+    const rec = pendingCardChallenges[emailNorm];
+    if (!rec || rec.challenge !== challenge || Date.now() > rec.expiresAt) {
+      return res.status(400).json({ success: false, error: 'challenge not issued or expired' });
     }
 
+    // Timestamp skew check
+    const ts = Number(fields.ts);
+    if (!Number.isFinite(ts)) return res.status(400).json({ success: false, error: 'bad ts' });
     const now = Math.floor(Date.now() / 1000);
-    const MAX_SKEW = 5 * 60; // 5 minutes
-    if (Math.abs(now - ts) > MAX_SKEW) {
+    if (Math.abs(now - ts) > 5 * 60) {
       return res.status(400).json({ success: false, error: 'stale/future challenge', now, ts });
     }
-    
-    // Require the challenge we issued (prevents replay)
-    const rec = pendingCardChallenges[email];
-    if (!rec || rec.challenge !== challenge || Date.now() > rec.expiresAt) {
-      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
+
+    // Nonce sanity (16 bytes hex)
+    if (!/^[0-9a-f]{32}$/i.test(String(fields.nonce || ''))) {
+      return res.status(400).json({ success: false, error: 'bad nonce' });
     }
 
-    // Verify RSA-PKCS1v1_5 with SHA-256 over the UTF-8 challenge string
+    // Verify RSA-PKCS1v1_5 + SHA-256 over UTF-8 challenge string
     const verifier = crypto.createVerify('RSA-SHA256');
     verifier.update(Buffer.from(challenge, 'utf8'));
     verifier.end();
 
     const sig = Buffer.from(signatureB64, 'base64');
-    const ok = verifier.verify(cardAuthKey, sig);
-
+    const ok = verifier.verify(verifierKey, sig);
     if (!ok) return res.status(400).json({ success: false, verified: false });
 
-    delete pendingCardChallenges[email]; // one-time use
+    delete pendingCardChallenges[emailNorm]; // one-time use
 
     return res.json({
       success: true,
       verified: true,
-      email,
+      email: emailNorm,
       ts,
       nonce: fields.nonce || null
     });
@@ -883,8 +923,6 @@ app.post('/card-verify', (req, res) => {
     return res.status(500).json({ success: false, error: 'verify failed' });
   }
 });
-
-  
 
 // ---------------------- Start ----------------------
 const PORT = process.env.PORT || 8080;

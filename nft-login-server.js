@@ -365,6 +365,20 @@ app.post('/card-verify', (req, res) => {
     // One-time use
     delete pendingCardChallenges[emailNorm];
 
+    // Start a live session after card verify (2h TTL, same policy as extension)
+    const TTL_MS = 2 * 60 * 60 * 1000;
+    sessionApprovals[emailNorm] = Date.now() + TTL_MS;
+    console.log(`🔓 Card session approved for ${emailNorm} until ${new Date(sessionApprovals[emailNorm]).toISOString()}`);
+
+    return res.json({
+        success: true,
+        verified: true,
+        email: emailNorm,
+        ts,
+        nonce: fields.nonce || null,
+        sessionExpiresAt: sessionApprovals[emailNorm]
+    });
+
     return res.json({ success: true, verified: true, email: emailNorm, ts, nonce: fields.nonce || null });
   } catch (e) {
     console.error('❌ /card-verify error:', e);

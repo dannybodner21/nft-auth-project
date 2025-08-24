@@ -900,6 +900,7 @@ app.post('/card-verify', (req, res) => {
       return res.status(400).json({ success: false, error: 'bad nonce' });
     }
 
+    
     // Verify RSA-PKCS1v1_5 + SHA-256 over UTF-8 challenge string
     const verifier = crypto.createVerify('RSA-SHA256');
     verifier.update(Buffer.from(challenge, 'utf8'));

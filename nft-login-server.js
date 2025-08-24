@@ -814,18 +814,7 @@ app.get('/runtime', async (req, res) => {
     }
 });
 
-// --- Card verify (RSA-PKCS1v1_5 + SHA-256) ---
-const { createPublicKey, createVerify } = require('crypto');
-const CARD_PUBKEY_PEM = process.env.CARD_PUBKEY_PEM;
 
-let CARD_PUBKEY_OBJ = null;
-if (CARD_PUBKEY_PEM) {
-  try {
-    CARD_PUBKEY_OBJ = createPublicKey(CARD_PUBKEY_PEM);
-  } catch (e) {
-    console.error("❌ Bad CARD_PUBKEY_PEM:", e.message);
-  }
-}
 
 app.post('/card-verify', (req, res) => {
   try {
@@ -836,8 +825,9 @@ app.post('/card-verify', (req, res) => {
     if (!challenge.startsWith('nftvault:card-auth|')) {
       return res.status(400).json({ success: false, error: 'bad challenge prefix' });
     }
-    if (!CARD_PUBKEY_OBJ) {
-      return res.status(503).json({ success: false, error: 'CARD_PUBKEY_PEM not configured' });
+    // Use the key you already loaded from CARD_AUTH_PUBKEY_PEM_PATH
+    if (!cardAuthKey) {
+        return res.status(503).json({ success: false, error: 'card key not loaded' });
     }
 
     // Parse fields: nftvault:card-auth|email=...|ts=...|nonce=...
@@ -862,16 +852,24 @@ app.post('/card-verify', (req, res) => {
     if (Math.abs(now - ts) > MAX_SKEW) {
       return res.status(400).json({ success: false, error: 'stale/future challenge', now, ts });
     }
+    
+    // Require the challenge we issued (prevents replay)
+    const rec = pendingCardChallenges[email];
+    if (!rec || rec.challenge !== challenge || Date.now() > rec.expiresAt) {
+      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
+    }
 
     // Verify RSA-PKCS1v1_5 with SHA-256 over the UTF-8 challenge string
-    const verifier = createVerify('RSA-SHA256');
+    const verifier = crypto.createVerify('RSA-SHA256');
     verifier.update(Buffer.from(challenge, 'utf8'));
     verifier.end();
 
     const sig = Buffer.from(signatureB64, 'base64');
-    const ok = verifier.verify(CARD_PUBKEY_OBJ, sig);
+    const ok = verifier.verify(cardAuthKey, sig);
 
     if (!ok) return res.status(400).json({ success: false, verified: false });
+
+    delete pendingCardChallenges[email]; // one-time use
 
     return res.json({
       success: true,

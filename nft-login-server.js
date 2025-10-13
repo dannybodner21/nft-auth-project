@@ -43,6 +43,39 @@ function commitDevice(deviceFpr) {
   return keccak256(packed);
 }
 
+// Verify the email doesn't have a registered account before attempting to register
+async function probeIdentityRegistered(emailNorm) {
+  if (!personaAuth) throw new Error('Contract not configured');
+  // fabricate a safe probe: no state change via callStatic
+  const toProbe = relayerSigner.address;           // any valid address is fine for static call
+  const userIdHash = commitUserId(emailNorm);
+  const deviceHash = commitDevice('probe-device'); // arbitrary probe fingerprint
+  const domain = { name: "PersonaAuth", version: "1", chainId: 137, verifyingContract: CONTRACT_ADDRESS };
+  const types  = { MintAuth: [
+    { name: "to",          type: "address" },
+    { name: "userIdHash",  type: "bytes32" },
+    { name: "deviceHash",  type: "bytes32" },
+    { name: "salt",        type: "bytes32" },
+    { name: "deadline",    type: "uint256" },
+  ]};
+  const salt     = ethers.utils.hexlify(ethers.utils.randomBytes(32));
+  const deadline = Math.floor(Date.now() / 1000) + 120; // short-lived, irrelevant for static
+
+  const minter = new ethers.Wallet(MINTER_PRIVATE_KEY);
+  const sig = await minter._signTypedData(domain, types, { to: toProbe, userIdHash, deviceHash, salt, deadline });
+
+  try {
+    // static “dry run”. If email is unused, this SHOULD NOT revert.
+    await personaAuth.callStatic.mintWithSig(toProbe, userIdHash, deviceHash, salt, deadline, sig);
+    return { registered: false };
+  } catch (e) {
+    const msg = (e?.reason || e?.error?.message || String(e)).toLowerCase();
+    if (msg.includes('identity already issued')) return { registered: true };
+    // any other revert means something else (ABI mismatch, paused, etc.)
+    throw e;
+  }
+}
+
 // Aggressive EIP-1559 fees for Polygon
 async function getAggressiveFees(pvd) {
   const fd = await pvd.getFeeData();
@@ -428,6 +461,22 @@ app.get('/get-session-handshake/:requestId', (req, res) => {
   return res.json({ success: true, found: true, email: r.email, websiteDomain: r.websiteDomain || null, keyId, eph, salt });
 });
 
+// Pre-registration check - make sure email is not already registered
+app.get('/identity-status', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.query?.email || '');
+    if (!emailNorm || !emailNorm.includes('@')) {
+      return res.status(400).json({ success:false, error:'valid email required' });
+    }
+    const out = await probeIdentityRegistered(emailNorm);
+    return res.json({ success:true, registered: out.registered });
+  } catch (err) {
+    console.error('❌ /identity-status:', err);
+    return res.status(500).json({ success:false, error:'identity_status_failed' });
+  }
+});
+
+
 // ---------------------- Email verify (dev) ----------------------
 app.post('/start-email-verify', (req, res) => {
   const emailNorm = normalizeEmail(req.body?.email || '');
@@ -733,6 +782,10 @@ app.post('/mint-nft', async (req, res) => {
     return res.json({ success: true, txHash: tx.hash, confirmed: true, tokenId });
   } catch (err) {
     console.error('❌ /mint-nft error:', err);
+    const msg = (err?.reason || err?.error?.message || String(err)).toLowerCase();
+    if (msg.includes('identity already issued')) {
+      return res.status(200).json({ success: true, minted: false, alreadyRegistered: true });
+    }
     return res.status(500).json({ success: false, error: 'Mint failed', details: String(err.message || err) });
   }
 });
@@ -788,6 +841,10 @@ app.post('/mint-persona', async (req, res) => {
     return res.json({ success: true, txHash: tx.hash, confirmed: true, tokenId });
   } catch (err) {
     console.error('❌ /mint-persona error:', err);
+    const msg = (err?.reason || err?.error?.message || String(err)).toLowerCase();
+    if (msg.includes('identity already issued')) {
+      return res.status(200).json({ success: true, minted: false, alreadyRegistered: true });
+    }
     return res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });

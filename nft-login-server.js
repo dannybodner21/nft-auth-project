@@ -254,6 +254,8 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       0x00, 0x04, 0x20
     ]);
     const expectedDigestInfo = Buffer.concat([diPrefix, hash]);
+    console.log('🔍 Expected DigestInfo (hex):', digestInfo.toString('hex'));
+    console.log('🔍 Expected DigestInfo length:', digestInfo.length);
 
     console.log('🔍 Raw signature B64 (first 50):', signatureB64.substring(0, 50));
     console.log('🔍 After b64urlToStd:', b64urlToStd(signatureB64).substring(0, 50));
@@ -270,15 +272,25 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
         sigBuf
       );
       
-      console.log('🔍 Decrypted length:', decrypted.length, 'Expected:', expectedDigestInfo.length);
-      console.log('🔍 Decrypted (hex):', decrypted.toString('hex').substring(0, 100));
-      console.log('🔍 Expected (hex):', expectedDigestInfo.toString('hex').substring(0, 100));
+      console.log('🔍 Decrypted signature (hex):', decrypted.toString('hex'));
+      console.log('🔍 Decrypted length:', decrypted.length);
       
-      return decrypted.equals(expectedDigestInfo);
+      return decrypted.equals(digestInfo);
     } catch (e) {
       console.error('❌ Decryption error:', e.message);
+      
+      // Try without PKCS1 padding to see raw data
+      try {
+        const raw = crypto.publicDecrypt({ key: publicKey, padding: crypto.constants.RSA_NO_PADDING }, sigBuf);
+        console.log('🔍 Raw decrypted (no padding, first 100 hex):', raw.toString('hex').substring(0, 100));
+      } catch (e2) {
+        console.log('🔍 Even raw decrypt failed');
+      }
+      
       return false;
     }
+
+
   }
 }
 

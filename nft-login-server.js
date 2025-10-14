@@ -234,11 +234,11 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       sigBuf
     );
   } else {
-    // PKCS#1 v1.5 - iOS sends DigestInfo-wrapped signature
-    // We need to verify the raw signature against the pre-hashed DigestInfo
+    // PKCS#1 v1.5 - iOS sends signature over DigestInfo(SHA-256(challenge))
+    // Use 'sha256' (not 'RSA-SHA256') and verify against the raw DigestInfo
     const hash = crypto.createHash('sha256').update(Buffer.from(challenge, 'utf8')).digest();
     
-    // DigestInfo prefix for SHA-256
+    // DigestInfo for SHA-256
     const diPrefix = Buffer.from([
       0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
       0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
@@ -246,11 +246,18 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
     ]);
     const digestInfo = Buffer.concat([diPrefix, hash]);
     
-    // Verify using raw RSA without additional hashing
-    return crypto.publicDecrypt(
-      { key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
-      sigBuf
-    ).equals(digestInfo);
+    // Verify using sign/verify with null algorithm (raw PKCS#1 v1.5 padding only)
+    try {
+      return crypto.verify(
+        null, // no additional hashing
+        digestInfo,
+        { key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+        sigBuf
+      );
+    } catch (e) {
+      console.error('Verification error:', e.message);
+      return false;
+    }
   }
 }
 

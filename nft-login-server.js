@@ -235,7 +235,6 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
     );
   } else {
     // PKCS#1 v1.5 - iOS sends signature over DigestInfo(SHA-256(challenge))
-    // Use 'sha256' (not 'RSA-SHA256') and verify against the raw DigestInfo
     const hash = crypto.createHash('sha256').update(Buffer.from(challenge, 'utf8')).digest();
     
     // DigestInfo for SHA-256
@@ -244,18 +243,25 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
       0x00, 0x04, 0x20
     ]);
-    const digestInfo = Buffer.concat([diPrefix, hash]);
+    const expectedDigestInfo = Buffer.concat([diPrefix, hash]);
     
-    // Verify using sign/verify with null algorithm (raw PKCS#1 v1.5 padding only)
+    // Decrypt the signature and compare
     try {
-      return crypto.verify(
-        null, // no additional hashing
-        digestInfo,
-        { key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+      const decrypted = crypto.publicDecrypt(
+        {
+          key: publicKey,
+          padding: crypto.constants.RSA_PKCS1_PADDING
+        },
         sigBuf
       );
+      
+      console.log('🔍 Decrypted length:', decrypted.length, 'Expected:', expectedDigestInfo.length);
+      console.log('🔍 Decrypted (hex):', decrypted.toString('hex').substring(0, 100));
+      console.log('🔍 Expected (hex):', expectedDigestInfo.toString('hex').substring(0, 100));
+      
+      return decrypted.equals(expectedDigestInfo);
     } catch (e) {
-      console.error('Verification error:', e.message);
+      console.error('❌ Decryption error:', e.message);
       return false;
     }
   }

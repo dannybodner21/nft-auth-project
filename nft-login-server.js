@@ -243,6 +243,10 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
     // PKCS#1 v1.5 - iOS sends signature over DigestInfo(SHA-256(challenge))
     const hash = crypto.createHash('sha256').update(Buffer.from(challenge, 'utf8')).digest();
     
+    console.log('🔍 Hash input challenge length:', challenge.length);
+    console.log('🔍 Hash input challenge full:', challenge);
+    console.log('🔍 Hash output (hex):', hash.toString('hex'));
+
     // DigestInfo for SHA-256
     const diPrefix = Buffer.from([
       0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,

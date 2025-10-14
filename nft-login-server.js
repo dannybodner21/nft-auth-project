@@ -224,8 +224,9 @@ function keyInfoFromKeyObject(keyObj) {
 
 function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKCS1V15' }) {
   const sigBuf = Buffer.from(b64urlToStd(signatureB64), 'base64');
+  
   if (scheme.toUpperCase() === 'PSS') {
-    const v = crypto.createVerify('sha256'); // hash only; padding specified below
+    const v = crypto.createVerify('sha256');
     v.update(Buffer.from(challenge, 'utf8'));
     v.end();
     return v.verify(
@@ -233,10 +234,23 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       sigBuf
     );
   } else {
-    const v = crypto.createVerify('RSA-SHA256'); // PKCS#1 v1.5
-    v.update(Buffer.from(challenge, 'utf8'));
-    v.end();
-    return v.verify(publicKey, sigBuf);
+    // PKCS#1 v1.5 - iOS sends DigestInfo-wrapped signature
+    // We need to verify the raw signature against the pre-hashed DigestInfo
+    const hash = crypto.createHash('sha256').update(Buffer.from(challenge, 'utf8')).digest();
+    
+    // DigestInfo prefix for SHA-256
+    const diPrefix = Buffer.from([
+      0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+      0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+      0x00, 0x04, 0x20
+    ]);
+    const digestInfo = Buffer.concat([diPrefix, hash]);
+    
+    // Verify using raw RSA without additional hashing
+    return crypto.publicDecrypt(
+      { key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+      sigBuf
+    ).equals(digestInfo);
   }
 }
 

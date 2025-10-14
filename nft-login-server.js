@@ -254,8 +254,8 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       0x00, 0x04, 0x20
     ]);
     const expectedDigestInfo = Buffer.concat([diPrefix, hash]);
-    console.log('🔍 Expected DigestInfo (hex):', digestInfo.toString('hex'));
-    console.log('🔍 Expected DigestInfo length:', digestInfo.length);
+    console.log('🔍 Expected DigestInfo (hex):', expectedDigestInfo.toString('hex'));
+    console.log('🔍 Expected DigestInfo length:', expectedDigestInfo.length);
 
     console.log('🔍 Raw signature B64 (first 50):', signatureB64.substring(0, 50));
     console.log('🔍 After b64urlToStd:', b64urlToStd(signatureB64).substring(0, 50));
@@ -275,7 +275,7 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       console.log('🔍 Decrypted signature (hex):', decrypted.toString('hex'));
       console.log('🔍 Decrypted length:', decrypted.length);
       
-      return decrypted.equals(digestInfo);
+      return decrypted.equals(expectedDigestInfo);
     } catch (e) {
       console.error('❌ Decryption error:', e.message);
       

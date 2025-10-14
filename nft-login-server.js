@@ -338,11 +338,13 @@ app.post('/card-verify', (req, res) => {
 
   console.log('📥 RAW req.body.challenge:', req.body.challenge);
   console.log('📥 Challenge length:', String(req.body.challenge || '').length);
-  
+
   try {
     const rawEmail     = String(req.body?.email || '');
     const emailNorm    = normalizeEmail(rawEmail);
-    const challenge    = String(req.body?.challenge || '');
+    const challenge = String(req.body?.challenge || '');
+    console.log('🔍 After String conversion, challenge length:', challenge.length);
+    console.log('🔍 After String conversion, full challenge:', challenge);
     const signatureB64 = String(req.body?.signatureB64 || '');
     const scheme       = String(req.body?.scheme || 'PKCS1V15');
 

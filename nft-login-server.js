@@ -240,19 +240,29 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       sigBuf
     );
   } else {
-    // PKCS#1 v1.5 - Card signs RAW HASH (no DigestInfo wrapper)
+    // PKCS#1 v1.5 - iOS sends signature over DigestInfo(SHA-256(challenge))
     const hash = crypto.createHash('sha256').update(Buffer.from(challenge, 'utf8')).digest();
     
     console.log('🔍 Hash input challenge length:', challenge.length);
     console.log('🔍 Hash input challenge full:', challenge);
-    console.log('🔍 Expected hash (hex):', hash.toString('hex'));
+    console.log('🔍 Hash output (hex):', hash.toString('hex'));
+
+    // DigestInfo for SHA-256
+    const diPrefix = Buffer.from([
+      0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+      0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+      0x00, 0x04, 0x20
+    ]);
+    const expectedDigestInfo = Buffer.concat([diPrefix, hash]);
+    console.log('🔍 Expected DigestInfo (hex):', expectedDigestInfo.toString('hex'));
+    console.log('🔍 Expected DigestInfo length:', expectedDigestInfo.length);
 
     console.log('🔍 Raw signature B64 (first 50):', signatureB64.substring(0, 50));
     console.log('🔍 After b64urlToStd:', b64urlToStd(signatureB64).substring(0, 50));
     console.log('🔍 Signature buffer length:', sigBuf.length);
     console.log('🔍 Expected sig length for 2048-bit RSA: 256 bytes');
     
-    // Decrypt the signature and compare to raw hash
+    // Decrypt the signature and compare
     try {
       const decrypted = crypto.publicDecrypt(
         {
@@ -264,9 +274,8 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       
       console.log('🔍 Decrypted signature (hex):', decrypted.toString('hex'));
       console.log('🔍 Decrypted length:', decrypted.length);
-      console.log('🔍 Hashes match:', decrypted.equals(hash));
       
-      return decrypted.equals(hash);
+      return decrypted.equals(expectedDigestInfo);
     } catch (e) {
       console.error('❌ Decryption error:', e.message);
       
@@ -280,6 +289,8 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       
       return false;
     }
+
+
   }
 }
 

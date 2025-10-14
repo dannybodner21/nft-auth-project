@@ -335,6 +335,10 @@ app.post('/card-register', (req, res) => {
 
 // DROP-IN REPLACEMENT: /card-verify now prefers the **per-user** key if present; falls back to global env key for legacy.
 app.post('/card-verify', (req, res) => {
+
+  console.log('📥 RAW req.body.challenge:', req.body.challenge);
+  console.log('📥 Challenge length:', String(req.body.challenge || '').length);
+  
   try {
     const rawEmail     = String(req.body?.email || '');
     const emailNorm    = normalizeEmail(rawEmail);

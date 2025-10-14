@@ -261,6 +261,20 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
     console.log('🔍 After b64urlToStd:', b64urlToStd(signatureB64).substring(0, 50));
     console.log('🔍 Signature buffer length:', sigBuf.length);
     console.log('🔍 Expected sig length for 2048-bit RSA: 256 bytes');
+
+    // Try to parse as DER-encoded signature first
+    try {
+      const parsed = crypto.createVerify('SHA256');
+      parsed.update(Buffer.from(challenge, 'utf8'));
+      parsed.end();
+      const verified = parsed.verify(publicKey, sigBuf);
+      if (verified) {
+        console.log('✅ Verified using createVerify!');
+        return true;
+      }
+    } catch (e) {
+      console.log('createVerify failed, trying manual decrypt');
+    }
     
     // Decrypt the signature and compare
     try {

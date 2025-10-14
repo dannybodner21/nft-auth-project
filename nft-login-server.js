@@ -304,16 +304,29 @@ app.post('/card-verify', (req, res) => {
     const signatureB64 = String(req.body?.signatureB64 || '');
     const scheme       = String(req.body?.scheme || 'PKCS1V15');
 
+    console.log('🔐 /card-verify request:', { emailNorm, challenge: challenge.substring(0, 50), sigLen: signatureB64.length });
+
     if (!emailNorm || !challenge || !signatureB64) {
+      console.log('❌ Missing fields');
       return res.status(400).json({ success: false, error: 'email, challenge, signatureB64 required' });
     }
     if (!challenge.startsWith('nftvault:card-auth|')) {
+      console.log('❌ Bad challenge prefix');
       return res.status(400).json({ success: false, error: 'bad challenge prefix' });
     }
 
     // Must match issued challenge & be fresh
     const rec = pendingCardChallenges[emailNorm];
-    if (!rec || rec.challenge !== challenge || Date.now() > rec.expiresAt) {
+    if (!rec) {
+      console.log('❌ No pending challenge for', emailNorm);
+      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
+    }
+    if (rec.challenge !== challenge) {
+      console.log('❌ Challenge mismatch');
+      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
+    }
+    if (Date.now() > rec.expiresAt) {
+      console.log('❌ Challenge expired');
       return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
     }
 
@@ -346,6 +359,9 @@ app.post('/card-verify', (req, res) => {
     }
 
     const ok = verifyCardSignature({ publicKey: verifyKey, challenge, signatureB64, scheme });
+    
+    console.log('🔐 Signature verification result:', ok);
+
     if (!ok) return res.status(400).json({ success: false, verified: false });
 
     delete pendingCardChallenges[emailNorm];

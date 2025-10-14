@@ -402,6 +402,9 @@ app.post('/card-verify', (req, res) => {
       return res.status(503).json({ success: false, error: 'no verification key available' });
     }
 
+    console.log('🔍 RIGHT BEFORE verifyCardSignature call, challenge:', challenge);
+    console.log('🔍 RIGHT BEFORE verifyCardSignature call, challenge.length:', challenge.length);
+
     const ok = verifyCardSignature({ publicKey: verifyKey, challenge, signatureB64, scheme });
     
     console.log('🔐 Signature verification result:', ok);

@@ -223,7 +223,13 @@ function keyInfoFromKeyObject(keyObj) {
 }
 
 function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKCS1V15' }) {
+  
+  console.log('🔍 SERVER: Challenge bytes (hex, first 100):', Buffer.from(challenge, 'utf8').toString('hex').substring(0, 100));
+  console.log('🔍 SERVER: Signature B64 (first 50):', signatureB64.substring(0, 50));
+  
   const sigBuf = Buffer.from(b64urlToStd(signatureB64), 'base64');
+  console.log('🔍 SERVER: Signature buffer length:', sigBuf.length);
+  console.log('🔍 SERVER: Signature buffer (hex, first 50):', sigBuf.toString('hex').substring(0, 50));
   
   if (scheme.toUpperCase() === 'PSS') {
     const v = crypto.createVerify('sha256');

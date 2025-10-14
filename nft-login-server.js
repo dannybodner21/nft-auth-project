@@ -244,6 +244,11 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       0x00, 0x04, 0x20
     ]);
     const expectedDigestInfo = Buffer.concat([diPrefix, hash]);
+
+    console.log('🔍 Raw signature B64 (first 50):', signatureB64.substring(0, 50));
+    console.log('🔍 After b64urlToStd:', b64urlToStd(signatureB64).substring(0, 50));
+    console.log('🔍 Signature buffer length:', sigBuf.length);
+    console.log('🔍 Expected sig length for 2048-bit RSA: 256 bytes');
     
     // Decrypt the signature and compare
     try {

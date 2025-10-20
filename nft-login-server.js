@@ -97,6 +97,21 @@ async function getAggressiveFees(pvd) {
 const app = express();
 app.use(express.json());
 
+const cors = require('cors');
+
+// Allow website logins
+app.use(cors({
+  origin: [
+    'https://linear-template-48cfc7.webflow.io',
+    'https://www.nft-auth-two.webflow.io',
+    'http://localhost:3000',
+    'http://localhost:8080',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:5500'  // for Live Server or local testing
+  ],
+  credentials: true
+}));
+
 // CORS — allow Chrome extensions; native apps / SW send no Origin
 app.use((req, res, next) => {
   const origin = req.headers.origin;

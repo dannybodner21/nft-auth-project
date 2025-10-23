@@ -347,7 +347,6 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
     ]);
     const expectedDigestInfo = Buffer.concat([diPrefix, hash]);
 
-    // Try NO_PADDING and manually strip/verify
     try {
       const raw = crypto.publicDecrypt(
         { key: publicKey, padding: crypto.constants.RSA_NO_PADDING },
@@ -355,36 +354,34 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       );
       
       console.log('🔍 Raw decrypted (full hex):', raw.toString('hex'));
+      console.log('🔍 Expected DigestInfo (hex):', expectedDigestInfo.toString('hex'));
       
-      // PKCS#1 v1.5 padding: 0x00 0x01 [FF padding] 0x00 [DigestInfo]
-      // Find the 0x00 separator after the FF padding
-      let separatorIndex = -1;
-      for (let i = 2; i < raw.length; i++) {
-        if (raw[i] === 0x00) {
-          separatorIndex = i;
-          break;
-        }
-      }
+      // Search for DigestInfo prefix (0x3031300d...) anywhere in the decrypted data
+      const prefixHex = diPrefix.toString('hex');
+      const rawHex = raw.toString('hex');
+      const prefixIndex = rawHex.indexOf(prefixHex);
       
-      if (separatorIndex === -1) {
-        console.log('❌ No separator found in padded signature');
+      if (prefixIndex === -1) {
+        console.log('❌ DigestInfo prefix not found in signature');
         return false;
       }
       
-      const payload = raw.slice(separatorIndex + 1);
-      console.log('🔍 Extracted payload (hex):', payload.toString('hex'));
-      console.log('🔍 Expected DigestInfo (hex):', expectedDigestInfo.toString('hex'));
+      // Extract the DigestInfo (prefix + hash = 51 bytes = 102 hex chars)
+      const extractedHex = rawHex.substring(prefixIndex, prefixIndex + 102);
+      const extracted = Buffer.from(extractedHex, 'hex');
       
-      const match = payload.equals(expectedDigestInfo);
+      console.log('🔍 Found DigestInfo at position:', prefixIndex / 2, 'bytes');
+      console.log('🔍 Extracted DigestInfo (hex):', extracted.toString('hex'));
+      
+      const match = extracted.equals(expectedDigestInfo);
       console.log('🔐 Signature verification result:', match);
       return match;
     } catch (e) {
-      console.error('❌ NO_PADDING decrypt error:', e.message);
+      console.error('❌ Verification error:', e.message);
       return false;
     }
   }
 }
-
 
 // Inspect what key is bound for an email (debug)
 app.get('/card-key-fp/:email', (req, res) => {

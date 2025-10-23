@@ -101,8 +101,8 @@ const cors = require('cors');
 // CORS for website logins - MUST come before express.json()
 app.use(cors({
   origin: [
-    'https://nft-auth-two.webflow.io',
-    'https://linear-template-48cfc7.webflow.io',
+    'https://nftauthproject-two.webflow.io',
+    'https://nftauthproject-one.webflow.io',
     'http://localhost:3000',
     'http://localhost:8080',
     'http://127.0.0.1:3000',

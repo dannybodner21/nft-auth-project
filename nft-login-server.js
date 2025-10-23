@@ -328,11 +328,7 @@ function keyInfoFromKeyObject(keyObj) {
 
 function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKCS1V15' }) {
   
-  console.log('🔍 SERVER: Challenge bytes (hex, first 100):', Buffer.from(challenge, 'utf8').toString('hex').substring(0, 100));
-  console.log('🔍 SERVER: Signature B64 (first 50):', signatureB64.substring(0, 50));
-  
   const sigBuf = Buffer.from(b64urlToStd(signatureB64), 'base64');
-  console.log('🔍 SERVER: Signature buffer length:', sigBuf.length);
   
   if (scheme.toUpperCase() === 'PSS') {
     const v = crypto.createVerify('sha256');
@@ -343,46 +339,48 @@ function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKC
       sigBuf
     );
   } else {
-    // INTERNAL AUTH sends signature over DigestInfo, not raw challenge
     const hash = crypto.createHash('sha256').update(Buffer.from(challenge, 'utf8')).digest();
-    
     const diPrefix = Buffer.from([
       0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
       0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
       0x00, 0x04, 0x20
     ]);
-    const digestInfo = Buffer.concat([diPrefix, hash]);
-    console.log('🔍 Expected DigestInfo (hex):', digestInfo.toString('hex'));
+    const expectedDigestInfo = Buffer.concat([diPrefix, hash]);
 
-    // For INTERNAL AUTH: verify the signature by decrypting and comparing to DigestInfo
+    // Try NO_PADDING and manually strip/verify
     try {
-      const decrypted = crypto.publicDecrypt(
-        {
-          key: publicKey,
-          padding: crypto.constants.RSA_PKCS1_PADDING
-        },
+      const raw = crypto.publicDecrypt(
+        { key: publicKey, padding: crypto.constants.RSA_NO_PADDING },
         sigBuf
       );
       
-      console.log('🔍 Decrypted signature (hex):', decrypted.toString('hex'));
-      const match = decrypted.equals(digestInfo);
+      console.log('🔍 Raw decrypted (full hex):', raw.toString('hex'));
+      
+      // PKCS#1 v1.5 padding: 0x00 0x01 [FF padding] 0x00 [DigestInfo]
+      // Find the 0x00 separator after the FF padding
+      let separatorIndex = -1;
+      for (let i = 2; i < raw.length; i++) {
+        if (raw[i] === 0x00) {
+          separatorIndex = i;
+          break;
+        }
+      }
+      
+      if (separatorIndex === -1) {
+        console.log('❌ No separator found in padded signature');
+        return false;
+      }
+      
+      const payload = raw.slice(separatorIndex + 1);
+      console.log('🔍 Extracted payload (hex):', payload.toString('hex'));
+      console.log('🔍 Expected DigestInfo (hex):', expectedDigestInfo.toString('hex'));
+      
+      const match = payload.equals(expectedDigestInfo);
       console.log('🔐 Signature verification result:', match);
       return match;
     } catch (e) {
-      console.error('❌ Decryption error:', e.message);
-      
-      // Fallback: try verifying as standard signature
-      try {
-        const verify = crypto.createVerify('SHA256');
-        verify.update(Buffer.from(challenge, 'utf8'));
-        verify.end();
-        const verified = verify.verify(publicKey, sigBuf);
-        console.log('🔐 Fallback verification result:', verified);
-        return verified;
-      } catch (e2) {
-        console.error('❌ Fallback verification also failed:', e2.message);
-        return false;
-      }
+      console.error('❌ NO_PADDING decrypt error:', e.message);
+      return false;
     }
   }
 }

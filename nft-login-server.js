@@ -240,91 +240,138 @@ function keyInfoFromKeyObject(keyObj) {
   return { alg: keyObj.asymmetricKeyType, modulusBits: details.modulusLength || null, spkiSha256: sha256 };
 }
 
-function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKCS1V15' }) {
-  
-  console.log('🔍 SERVER: Challenge bytes (hex, first 100):', Buffer.from(challenge, 'utf8').toString('hex').substring(0, 100));
-  console.log('🔍 SERVER: Signature B64 (first 50):', signatureB64.substring(0, 50));
-  
-  const sigBuf = Buffer.from(b64urlToStd(signatureB64), 'base64');
-  console.log('🔍 SERVER: Signature buffer length:', sigBuf.length);
-  console.log('🔍 SERVER: Signature buffer (hex, first 50):', sigBuf.toString('hex').substring(0, 50));
-  
-  if (scheme.toUpperCase() === 'PSS') {
-    const v = crypto.createVerify('sha256');
-    v.update(Buffer.from(challenge, 'utf8'));
-    v.end();
-    return v.verify(
-      { key: publicKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 },
-      sigBuf
-    );
-  } else {
-    // PKCS#1 v1.5 - iOS sends signature over DigestInfo(SHA-256(challenge))
-    const hash = crypto.createHash('sha256').update(Buffer.from(challenge, 'utf8')).digest();
-    
-    console.log('🔍 Hash input challenge length:', challenge.length);
-    console.log('🔍 Hash input challenge full:', challenge);
-    console.log('🔍 Hash output (hex):', hash.toString('hex'));
 
-    // DigestInfo for SHA-256
-    const diPrefix = Buffer.from([
-      0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
-      0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
-      0x00, 0x04, 0x20
-    ]);
-    const expectedDigestInfo = Buffer.concat([diPrefix, hash]);
-    console.log('🔍 Expected DigestInfo (hex):', expectedDigestInfo.toString('hex'));
-    console.log('🔍 Expected DigestInfo length:', expectedDigestInfo.length);
+// function b64urlToStd(b64url) {
+//   return b64url.replace(/-/g, '+').replace(/_/g, '/').replace(/(?<![=])$/,'').padEnd(Math.ceil(b64url.length/4)*4, '=');
+// }
 
-    console.log('🔍 Raw signature B64 (first 50):', signatureB64.substring(0, 50));
-    console.log('🔍 After b64urlToStd:', b64urlToStd(signatureB64).substring(0, 50));
-    console.log('🔍 Signature buffer length:', sigBuf.length);
-    console.log('🔍 Expected sig length for 2048-bit RSA: 256 bytes');
+function verifyCardSignature({ publicKey, challenge, signatureB64 }) {
+  const msg = Buffer.from(challenge, 'utf8');
+  const sig = Buffer.from(b64urlToStd(signatureB64), 'base64');
 
-    // Try to parse as DER-encoded signature first
-    try {
-      const parsed = crypto.createVerify('SHA256');
-      parsed.update(Buffer.from(challenge, 'utf8'));
-      parsed.end();
-      const verified = parsed.verify(publicKey, sigBuf);
-      if (verified) {
-        console.log('✅ Verified using createVerify!');
-        return true;
-      }
-    } catch (e) {
-      console.log('createVerify failed, trying manual decrypt');
+  // 1) Try PKCS#1 v1.5 + SHA-256
+  try {
+    const ok = crypto.verify('RSA-SHA256', msg, publicKey, sig);
+    if (ok) {
+      console.log('✅ Verified (PKCS1v1_5 + SHA-256)');
+      return true;
     }
-    
-    // Decrypt the signature and compare
-    try {
-      const decrypted = crypto.publicDecrypt(
-        {
-          key: publicKey,
-          padding: crypto.constants.RSA_PKCS1_PADDING
-        },
-        sigBuf
-      );
-      
-      console.log('🔍 Decrypted signature (hex):', decrypted.toString('hex'));
-      console.log('🔍 Decrypted length:', decrypted.length);
-      
-      return decrypted.equals(expectedDigestInfo);
-    } catch (e) {
-      console.error('❌ Decryption error:', e.message);
-      
-      // Try without PKCS1 padding to see raw data
-      try {
-        const raw = crypto.publicDecrypt({ key: publicKey, padding: crypto.constants.RSA_NO_PADDING }, sigBuf);
-        console.log('🔍 Raw decrypted (no padding, first 100 hex):', raw.toString('hex').substring(0, 100));
-      } catch (e2) {
-        console.log('🔍 Even raw decrypt failed');
-      }
-      
-      return false;
-    }
-
-
+  } catch (e) {
+    // ignore and fall through to PSS
   }
+
+  // 2) Try RSA-PSS + SHA-256 (saltLength = 32)
+  try {
+    const ok = crypto.verify(
+      'RSA-SHA256',
+      msg,
+      { key: publicKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 },
+      sig
+    );
+    if (ok) {
+      console.log('✅ Verified (RSA-PSS + SHA-256, saltLength=32)');
+      return true;
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  console.log('❌ Signature did not verify with PKCS1v1_5 or PSS');
+  return false;
 }
+
+module.exports = { verifyCardSignature };
+
+
+
+
+
+
+// function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKCS1V15' }) {
+  
+//   console.log('🔍 SERVER: Challenge bytes (hex, first 100):', Buffer.from(challenge, 'utf8').toString('hex').substring(0, 100));
+//   console.log('🔍 SERVER: Signature B64 (first 50):', signatureB64.substring(0, 50));
+  
+//   const sigBuf = Buffer.from(b64urlToStd(signatureB64), 'base64');
+//   console.log('🔍 SERVER: Signature buffer length:', sigBuf.length);
+//   console.log('🔍 SERVER: Signature buffer (hex, first 50):', sigBuf.toString('hex').substring(0, 50));
+  
+//   if (scheme.toUpperCase() === 'PSS') {
+//     const v = crypto.createVerify('sha256');
+//     v.update(Buffer.from(challenge, 'utf8'));
+//     v.end();
+//     return v.verify(
+//       { key: publicKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 },
+//       sigBuf
+//     );
+//   } else {
+//     // PKCS#1 v1.5 - iOS sends signature over DigestInfo(SHA-256(challenge))
+//     const hash = crypto.createHash('sha256').update(Buffer.from(challenge, 'utf8')).digest();
+    
+//     console.log('🔍 Hash input challenge length:', challenge.length);
+//     console.log('🔍 Hash input challenge full:', challenge);
+//     console.log('🔍 Hash output (hex):', hash.toString('hex'));
+
+//     // DigestInfo for SHA-256
+//     const diPrefix = Buffer.from([
+//       0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+//       0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+//       0x00, 0x04, 0x20
+//     ]);
+//     const expectedDigestInfo = Buffer.concat([diPrefix, hash]);
+//     console.log('🔍 Expected DigestInfo (hex):', expectedDigestInfo.toString('hex'));
+//     console.log('🔍 Expected DigestInfo length:', expectedDigestInfo.length);
+
+//     console.log('🔍 Raw signature B64 (first 50):', signatureB64.substring(0, 50));
+//     console.log('🔍 After b64urlToStd:', b64urlToStd(signatureB64).substring(0, 50));
+//     console.log('🔍 Signature buffer length:', sigBuf.length);
+//     console.log('🔍 Expected sig length for 2048-bit RSA: 256 bytes');
+
+//     // Try to parse as DER-encoded signature first
+//     try {
+//       const parsed = crypto.createVerify('SHA256');
+//       parsed.update(Buffer.from(challenge, 'utf8'));
+//       parsed.end();
+//       const verified = parsed.verify(publicKey, sigBuf);
+//       if (verified) {
+//         console.log('✅ Verified using createVerify!');
+//         return true;
+//       }
+//     } catch (e) {
+//       console.log('createVerify failed, trying manual decrypt');
+//     }
+    
+//     // Decrypt the signature and compare
+//     try {
+//       const decrypted = crypto.publicDecrypt(
+//         {
+//           key: publicKey,
+//           padding: crypto.constants.RSA_PKCS1_PADDING
+//         },
+//         sigBuf
+//       );
+      
+//       console.log('🔍 Decrypted signature (hex):', decrypted.toString('hex'));
+//       console.log('🔍 Decrypted length:', decrypted.length);
+      
+//       return decrypted.equals(expectedDigestInfo);
+//     } catch (e) {
+//       console.error('❌ Decryption error:', e.message);
+      
+//       // Try without PKCS1 padding to see raw data
+//       try {
+//         const raw = crypto.publicDecrypt({ key: publicKey, padding: crypto.constants.RSA_NO_PADDING }, sigBuf);
+//         console.log('🔍 Raw decrypted (no padding, first 100 hex):', raw.toString('hex').substring(0, 100));
+//       } catch (e2) {
+//         console.log('🔍 Even raw decrypt failed');
+//       }
+      
+//       return false;
+//     }
+
+
+//   }
+// }
 
 // function verifyCardSignature({ publicKey, challenge, signatureB64, scheme = 'PKCS1V15' }) {
   

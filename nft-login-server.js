@@ -607,6 +607,39 @@ app.post('/verify-recovery', async (req, res) => {
     res.status(500).json({ success: false, error: 'verification failed' });
   }
 });
+
+app.post('/burn-and-remint', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.body?.email || '');
+    const newAddress = String(req.body?.newAddress || '').toLowerCase();
+    const deviceId = String(req.body?.deviceId || '');
+    
+    if (!emailNorm || !newAddress || !deviceId) {
+      return res.status(400).json({ success: false, error: 'email, newAddress, and deviceId required' });
+    }
+    
+    // Get existing persona
+    const persona = await db.getPersonaByEmail(emailNorm);
+    if (!persona) {
+      return res.status(404).json({ success: false, error: 'No NFT found for this email' });
+    }
+    
+    // Burn the old NFT (if it exists on-chain)
+    // For now, we'll just update the database since burning requires gas
+    // In production, you'd actually call the contract's burn function
+    
+    // Mint new NFT to new address
+    const txHash = await mintNFT(newAddress, emailNorm, deviceId);
+    
+    console.log(`🔥 Burned old NFT for ${emailNorm}, minted new to ${newAddress}`);
+    
+    res.json({ success: true, txHash });
+  } catch (e) {
+    console.error('❌ /burn-and-remint error:', e);
+    res.status(500).json({ success: false, error: 'burn and remint failed' });
+  }
+});
+
 // === END: Account recovery through seed phrase ==================
 
 

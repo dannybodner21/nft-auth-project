@@ -581,7 +581,33 @@ app.post('/card-verify', (req, res) => {
 
 
 
-
+// -------------- Recovery account with seed phrase ---------------
+app.post('/verify-recovery', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.body?.email || '');
+    const address = String(req.body?.address || '').toLowerCase();
+    
+    if (!emailNorm || !address) {
+      return res.status(400).json({ success: false, error: 'email and address required' });
+    }
+    
+    // Check if this email+address combo exists in personas
+    const persona = await db.getPersonaByEmail(emailNorm);
+    
+    if (!persona) {
+      return res.json({ success: true, valid: false });
+    }
+    
+    // Check if the address matches
+    const valid = persona.owner_address.toLowerCase() === address;
+    
+    res.json({ success: true, valid });
+  } catch (e) {
+    console.error('❌ /verify-recovery error:', e);
+    res.status(500).json({ success: false, error: 'verification failed' });
+  }
+});
+// === END: Account recovery through seed phrase ==================
 
 
 

@@ -198,9 +198,10 @@ if (RPC_URL && CONTRACT_ADDRESS && DEPLOYER_PRIVATE_KEY && MINTER_PRIVATE_KEY &&
     "function mintWithSig(address to, bytes32 userIdHash, bytes32 deviceHash, bytes32 salt, uint256 deadline, bytes sig) external",
     "function identityOf(uint256 tokenId) view returns (bytes32 userIdHash, bytes32 deviceHash, bool valid)",
     "function tokenOf(address user) view returns (uint256)",
+    "function tokenByUser(bytes32 userIdHash) view returns (uint256)",  // ← ADD THIS LINE
     "function balanceOf(address owner) view returns (uint256)",
     "function locked(uint256 tokenId) view returns (bool)"
-  ];
+];
   personaAuth = new ethers.Contract(CONTRACT_ADDRESS, personaAuthAbi, relayerSigner);
 } else {
   console.warn("⚠️ Minting disabled: set RPC_URL, CONTRACT_ADDRESS, DEPLOYER_PRIVATE_KEY, MINTER_PRIVATE_KEY, USER_COMMITMENT_PEPPER, DEVICE_COMMITMENT_PEPPER");

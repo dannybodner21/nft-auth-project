@@ -584,6 +584,8 @@ app.post('/card-verify', (req, res) => {
 // -------------- Recovery account with seed phrase ---------------
 app.post('/verify-recovery', async (req, res) => {
   try {
+    if (!personaAuth) return res.status(503).json({ success: false, error: 'Contract not configured' });
+    
     const emailNorm = normalizeEmail(req.body?.email || '');
     const address = String(req.body?.address || '').toLowerCase();
     
@@ -591,15 +593,23 @@ app.post('/verify-recovery', async (req, res) => {
       return res.status(400).json({ success: false, error: 'email and address required' });
     }
     
-    // Check if this email+address combo exists in personas
-    const persona = await db.getPersonaByEmail(emailNorm);
+    // Get the commitment hash for this email
+    const userIdHash = commitUserId(emailNorm);
     
-    if (!persona) {
+    // Query the contract to see if this email hash has a token
+    const tokenId = await personaAuth.tokenByUser(userIdHash);
+    const tokenIdNum = tokenId?.toString?.() || String(tokenId);
+    
+    // If no token, email is not registered
+    if (tokenIdNum === "0") {
       return res.json({ success: true, valid: false });
     }
     
-    // Check if the address matches
-    const valid = persona.owner_address.toLowerCase() === address;
+    // Get the owner of this token
+    const owner = await personaAuth.ownerOf(tokenId);
+    
+    // Check if the derived address matches the owner
+    const valid = owner.toLowerCase() === address.toLowerCase();
     
     res.json({ success: true, valid });
   } catch (e) {
@@ -618,24 +628,50 @@ app.post('/burn-and-remint', async (req, res) => {
       return res.status(400).json({ success: false, error: 'email, newAddress, and deviceId required' });
     }
     
-    // Get existing persona
-    const persona = await db.getPersonaByEmail(emailNorm);
-    if (!persona) {
-      return res.status(404).json({ success: false, error: 'No NFT found for this email' });
+    if (!isAddress(newAddress)) {
+      return res.status(400).json({ success: false, error: 'Invalid new address' });
     }
     
-    // Burn the old NFT (if it exists on-chain)
-    // For now, we'll just update the database since burning requires gas
-    // In production, you'd actually call the contract's burn function
+    // Just mint new NFT to new address
+    // The old NFT will still exist but user won't have access to old device
+    // In production, you'd call the reissue function on the contract
+    const userIdHash = commitUserId(emailNorm);
+    const deviceHash = commitDevice(deviceId);
+
+    const domain = { name: "PersonaAuth", version: "1", chainId: 137, verifyingContract: CONTRACT_ADDRESS };
+    const types  = { MintAuth: [
+      { name: "to",          type: "address" },
+      { name: "userIdHash",  type: "bytes32" },
+      { name: "deviceHash",  type: "bytes32" },
+      { name: "salt",        type: "bytes32" },
+      { name: "deadline",    type: "uint256" },
+    ]};
+
+    const salt     = ethers.utils.hexlify(ethers.utils.randomBytes(32));
+    const deadline = Math.floor(Date.now() / 1000) + 10 * 60;
+
+    const minter = new ethers.Wallet(MINTER_PRIVATE_KEY);
+    const signature = await minter._signTypedData(domain, types, { to: newAddress, userIdHash, deviceHash, salt, deadline });
+
+    const fee = await getAggressiveFees(provider);
+    const tx = await personaAuth.mintWithSig(newAddress, userIdHash, deviceHash, salt, deadline, signature, {
+      maxFeePerGas:         fee.maxFeePerGas,
+      maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+    });
     
-    // Mint new NFT to new address
-    const txHash = await mintNFT(newAddress, emailNorm, deviceId);
+    console.log(`🔥 Recovery: minted new NFT for ${emailNorm} to ${newAddress}, tx: ${tx.hash}`);
     
-    console.log(`🔥 Burned old NFT for ${emailNorm}, minted new to ${newAddress}`);
+    if (typeof tx.wait === 'function') await tx.wait(1);
+    else await provider.waitForTransaction(tx.hash, 1);
     
-    res.json({ success: true, txHash });
+    res.json({ success: true, txHash: tx.hash });
   } catch (e) {
     console.error('❌ /burn-and-remint error:', e);
+    const msg = (e?.reason || e?.error?.message || String(e)).toLowerCase();
+    if (msg.includes('identity already issued')) {
+      // Old NFT still exists - need to use reissue instead
+      return res.status(400).json({ success: false, error: 'Identity already exists, old NFT must be revoked first' });
+    }
     res.status(500).json({ success: false, error: 'burn and remint failed' });
   }
 });

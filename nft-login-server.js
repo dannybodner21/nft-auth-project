@@ -848,6 +848,10 @@ app.post('/card-challenge', (req, res) => {
 
 
 
+// ---------------------- Messaging (in-memory store) ----------------------
+
+// messagesByRecipient: { recipientMessagingIdBase64: [ envelope, envelope, ... ] }
+let messagesByRecipient = {}; 
 
 
 
@@ -914,6 +918,71 @@ app.post('/wipe-credentials', (req, res) => {
   console.log(`🧹 Wiped all credentials for ${emailNorm}`);
   res.json({ success: true });
 });
+
+// ---------------------- Messaging endpoints ----------------------
+
+// Send an encrypted envelope to a recipient
+app.post('/messages/send', (req, res) => {
+  try {
+    const {
+      id,
+      timestamp,
+      senderMessagingId,
+      recipientMessagingId,
+      ciphertextB64,
+      fromMe
+    } = req.body || {};
+
+    if (
+      !id || !timestamp ||
+      !senderMessagingId || !recipientMessagingId ||
+      !ciphertextB64
+    ) {
+      return res.status(400).json({ success: false, error: "Missing fields" });
+    }
+
+    if (!messagesByRecipient[recipientMessagingId]) {
+      messagesByRecipient[recipientMessagingId] = [];
+    }
+
+    messagesByRecipient[recipientMessagingId].push({
+      id,
+      timestamp,
+      senderMessagingId,
+      recipientMessagingId,
+      ciphertextB64,
+      fromMe: !!fromMe
+    });
+
+    console.log(`📥 Stored message for ${recipientMessagingId.substring(0,24)}…`);
+    return res.json({ success: true });
+
+  } catch (e) {
+    console.error("❌ /messages/send error:", e);
+    return res.status(500).json({ success: false, error: "Send failed" });
+  }
+});
+
+// Device polls for new encrypted messages
+app.get('/messages/sync/:messagingId', (req, res) => {
+  try {
+    const id = String(req.params.messagingId || '').trim();
+    if (!id) return res.status(400).json({ success: false, error: "missing id" });
+
+    const list = messagesByRecipient[id] || [];
+    messagesByRecipient[id] = []; // clear after delivering
+
+    console.log(`📤 Sync to ${id.substring(0,24)}… → ${list.length} messages`);
+    res.setHeader("Cache-Control", "no-store");
+
+    return res.json({ success: true, messages: list });
+
+  } catch (e) {
+    console.error("❌ /messages/sync error:", e);
+    return res.status(500).json({ success: false, error: "sync failed" });
+  }
+});
+
 
 // ---------------------- Phone-assisted decrypt ----------------------
 app.post('/request-decrypt', async (req, res) => {

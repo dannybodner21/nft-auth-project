@@ -221,6 +221,10 @@ let pendingDecrypts = {};        // { txId: { ... } }
 let sessionApprovals = {};       // { email: expiryMs }
 let pendingCardChallenges = {};  // { emailNorm: { challenge, expiresAt } }
 
+// E2EE messaging: in-memory, deliver-once queues keyed by recipient messaging ID
+// messagesByRecipient[recipientMessagingId] = [ { id, ts, senderMessagingId, ciphertextB64 } ]
+let messagesByRecipient = {};
+
 const pendingEmailCodes = {};
 const verifiedEmails = {};
 const makeCode6 = () => String(Math.floor(100000 + Math.random() * 900000));
@@ -848,10 +852,6 @@ app.post('/card-challenge', (req, res) => {
 
 
 
-// ---------------------- Messaging (in-memory store) ----------------------
-
-// messagesByRecipient: { recipientMessagingIdBase64: [ envelope, envelope, ... ] }
-let messagesByRecipient = {}; 
 
 
 
@@ -921,66 +921,71 @@ app.post('/wipe-credentials', (req, res) => {
 
 // ---------------------- Messaging endpoints ----------------------
 
-// Send an encrypted envelope to a recipient
+// ---------------------- E2EE Messaging relay (no plaintext stored) ----------------------
+
+// POST /messages/send
+// Body: { senderMessagingId, recipientMessagingId, messageId, timestamp, ciphertextB64 }
 app.post('/messages/send', (req, res) => {
-  try {
-    const {
-      id,
-      timestamp,
-      senderMessagingId,
-      recipientMessagingId,
-      ciphertextB64,
-      fromMe
-    } = req.body || {};
+  const senderMessagingId    = String(req.body?.senderMessagingId || '').trim();
+  const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
+  const messageId            = String(req.body?.messageId || '').trim();
+  const tsRaw                = req.body?.timestamp;
 
-    if (
-      !id || !timestamp ||
-      !senderMessagingId || !recipientMessagingId ||
-      !ciphertextB64
-    ) {
-      return res.status(400).json({ success: false, error: "Missing fields" });
-    }
+  const ciphertextB64        = String(req.body?.ciphertextB64 || '').trim();
 
-    if (!messagesByRecipient[recipientMessagingId]) {
-      messagesByRecipient[recipientMessagingId] = [];
-    }
-
-    messagesByRecipient[recipientMessagingId].push({
-      id,
-      timestamp,
-      senderMessagingId,
-      recipientMessagingId,
-      ciphertextB64,
-      fromMe: !!fromMe
-    });
-
-    console.log(`📥 Stored message for ${recipientMessagingId.substring(0,24)}…`);
-    return res.json({ success: true });
-
-  } catch (e) {
-    console.error("❌ /messages/send error:", e);
-    return res.status(500).json({ success: false, error: "Send failed" });
+  if (!senderMessagingId || !recipientMessagingId || !messageId || !ciphertextB64) {
+    return res.status(400).json({ success: false, error: 'Missing fields' });
   }
+
+  // Basic length sanity checks to avoid garbage
+  if (senderMessagingId.length > 256 || recipientMessagingId.length > 256 || messageId.length > 128) {
+    return res.status(400).json({ success: false, error: 'Bad id length' });
+  }
+
+  const ts = Number(tsRaw) > 0 ? Number(tsRaw) : Date.now();
+
+  const msg = {
+    id: messageId,
+    ts,
+    senderMessagingId,
+    ciphertextB64
+    // NO plaintext, NO alias, NO fromMe flag – clients infer everything
+  };
+
+  if (!messagesByRecipient[recipientMessagingId]) {
+    messagesByRecipient[recipientMessagingId] = [];
+  }
+
+  // Append, but cap queue size per recipient to avoid unbounded growth
+  messagesByRecipient[recipientMessagingId].push(msg);
+  if (messagesByRecipient[recipientMessagingId].length > 200) {
+    messagesByRecipient[recipientMessagingId].shift(); // drop oldest
+  }
+
+  // Don't log ciphertext
+  console.log(`📨 Stored message for recipient ${recipientMessagingId.slice(0, 12)}… (queue size=${messagesByRecipient[recipientMessagingId].length})`);
+
+  return res.json({ success: true });
 });
 
-// Device polls for new encrypted messages
-app.get('/messages/sync/:messagingId', (req, res) => {
-  try {
-    const id = String(req.params.messagingId || '').trim();
-    if (!id) return res.status(400).json({ success: false, error: "missing id" });
-
-    const list = messagesByRecipient[id] || [];
-    messagesByRecipient[id] = []; // clear after delivering
-
-    console.log(`📤 Sync to ${id.substring(0,24)}… → ${list.length} messages`);
-    res.setHeader("Cache-Control", "no-store");
-
-    return res.json({ success: true, messages: list });
-
-  } catch (e) {
-    console.error("❌ /messages/sync error:", e);
-    return res.status(500).json({ success: false, error: "sync failed" });
+// POST /messages/sync
+// Body: { recipientMessagingId }
+// Returns and *clears* all queued messages for that recipient
+app.post('/messages/sync', (req, res) => {
+  const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
+  if (!recipientMessagingId) {
+    return res.status(400).json({ success: false, error: 'recipientMessagingId required' });
   }
+
+  const list = messagesByRecipient[recipientMessagingId] || [];
+  // Deliver-once: wipe after read
+  delete messagesByRecipient[recipientMessagingId];
+
+  // We do NOT log message contents
+  console.log(`📤 Sync for recipient ${recipientMessagingId.slice(0, 12)}… returned=${list.length}`);
+
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ success: true, messages: list });
 });
 
 
@@ -1110,7 +1115,19 @@ setInterval(() => {
   for (const [email, rec] of Object.entries(pendingCardChallenges)) {
     if (!rec || now > (rec.expiresAt || 0)) delete pendingCardChallenges[email];
   }
+
+  // Cleanup old messages (hard cap ~10 minutes in relay)
+  const TTL = 10 * 60_000;
+  for (const [recipientId, list] of Object.entries(messagesByRecipient)) {
+    const fresh = list.filter(m => now - (m.ts || 0) <= TTL);
+    if (fresh.length > 0) {
+      messagesByRecipient[recipientId] = fresh;
+    } else {
+      delete messagesByRecipient[recipientId];
+    }
+  }
 }, 60_000);
+
 
 // ---------------------- Mint endpoints (EIP-712) ----------------------
 app.post('/mint-nft', async (req, res) => {

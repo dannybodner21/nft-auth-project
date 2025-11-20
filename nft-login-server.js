@@ -225,6 +225,9 @@ let pendingCardChallenges = {};  // { emailNorm: { challenge, expiresAt } }
 // messagesByRecipient[recipientMessagingId] = [ { id, ts, senderMessagingId, ciphertextB64 } ]
 let messagesByRecipient = {};
 
+// messagingRouting[messagingId] = { email, deviceToken }
+let messagingRouting = {};
+
 const pendingEmailCodes = {};
 const verifiedEmails = {};
 const makeCode6 = () => String(Math.floor(100000 + Math.random() * 900000));
@@ -693,11 +696,28 @@ app.post('/burn-and-remint', async (req, res) => {
 // ---------------------- Token registration ----------------------
 app.post('/save-token', (req, res) => {
   const { email, deviceToken } = req.body || {};
-  if (!email || !deviceToken) return res.status(400).json({ error: 'Email and deviceToken required' });
-  userTokens[normalizeEmail(email)] = deviceToken;
-  console.log(`💾 Saved token for ${normalizeEmail(email)}`);
+  const messagingId = String(req.body?.messagingId || '').trim();
+
+  if (!email || !deviceToken) {
+    return res.status(400).json({ error: 'Email and deviceToken required' });
+  }
+
+  const emailNorm = normalizeEmail(email);
+  userTokens[emailNorm] = deviceToken;
+
+  // If the client passes a messagingId (Curve25519 pubkey), map it to this device token.
+  if (messagingId.length > 0) {
+    messagingRouting[messagingId] = {
+      email: emailNorm,
+      deviceToken
+    };
+    console.log(`💬 Registered messagingId for ${emailNorm} (len=${messagingId.length})`);
+  }
+
+  console.log(`💾 Saved token for ${emailNorm}`);
   res.json({ success: true });
 });
+
 
 const db = {
   getUserByEmail: async (email) => {

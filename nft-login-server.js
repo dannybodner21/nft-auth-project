@@ -151,11 +151,6 @@ if (process.env.FIREBASE_CONFIG) {
   throw new Error('No Firebase credentials: set FIREBASE_CONFIG or GOOGLE_APPLICATION_CREDENTIALS');
 }
 
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-}
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 

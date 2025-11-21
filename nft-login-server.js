@@ -1022,8 +1022,8 @@ app.post('/messages/send', (req, res) => {
 
       const baseMsg = {
         notification: {
-          title: 'New message',
-          body: 'You received a new encrypted message'
+          title: 'NFTAuth Messenger',
+          body: 'New encrypted message'
         },
         data: {
           type: 'message',

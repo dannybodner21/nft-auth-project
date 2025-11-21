@@ -953,65 +953,103 @@ app.post('/wipe-credentials', (req, res) => {
 
 // ---------------------- Messaging endpoints ----------------------
 
+// In-memory mapping from messagingId (Curve25519 pubkey base64) -> Set of FCM tokens
+const messagingTokensById = Object.create(null);
 
 // ---------------------- E2EE Messaging relay (no plaintext stored) ----------------------
 
 // POST /messages/send
 // Body: { senderMessagingId, recipientMessagingId, messageId, timestamp, ciphertextB64 }
 app.post('/messages/send', (req, res) => {
-  const senderMessagingId    = String(req.body?.senderMessagingId || '').trim();
-  const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
-  const messageId            = String(req.body?.messageId || '').trim();
-  const tsRaw                = req.body?.timestamp;
-  const ciphertextB64        = String(req.body?.ciphertextB64 || '').trim();
+  try {
+    const senderMessagingId    = String(req.body?.senderMessagingId || '').trim();
+    const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
+    const messageId            = String(req.body?.messageId || '').trim();
+    const tsRaw                = req.body?.timestamp;
+    const ciphertextB64        = String(req.body?.ciphertextB64 || '').trim();
 
-  if (!senderMessagingId || !recipientMessagingId || !messageId || !ciphertextB64) {
-    return res.status(400).json({ success: false, error: 'Missing fields' });
+    if (!senderMessagingId || !recipientMessagingId || !messageId || !ciphertextB64) {
+      return res.status(400).json({ success: false, error: 'Missing fields' });
+    }
+
+    // Basic length sanity checks to avoid garbage
+    if (
+      senderMessagingId.length > 256 ||
+      recipientMessagingId.length > 256 ||
+      messageId.length > 128
+    ) {
+      return res.status(400).json({ success: false, error: 'Bad id length' });
+    }
+
+    const ts = Number(tsRaw) > 0 ? Number(tsRaw) : Date.now();
+
+    const msg = {
+      id: messageId,
+      ts,
+      senderMessagingId,
+      ciphertextB64
+      // NO plaintext, NO alias, NO fromMe flag – clients infer everything
+    };
+
+    if (!messagesByRecipient[recipientMessagingId]) {
+      messagesByRecipient[recipientMessagingId] = [];
+    }
+
+    // Append, but cap queue size per recipient to avoid unbounded growth
+    messagesByRecipient[recipientMessagingId].push(msg);
+    if (messagesByRecipient[recipientMessagingId].length > 200) {
+      messagesByRecipient[recipientMessagingId].shift(); // drop oldest
+    }
+
+    console.log(
+      `📨 Stored message for recipient ${recipientMessagingId.slice(
+        0,
+        12
+      )}… (queue size=${messagesByRecipient[recipientMessagingId].length})`
+    );
+
+    // ==== NEW: fire-and-forget push notification for chat ====
+    const tokenSet = messagingTokensById[recipientMessagingId];
+    if (tokenSet && tokenSet.size > 0) {
+      const tokens = Array.from(tokenSet);
+
+      const baseMsg = {
+        notification: {
+          title: 'New message',
+          body: 'You received a new encrypted message'
+        },
+        data: {
+          type: 'chat',
+          senderMessagingId,
+          messageId
+        }
+      };
+
+      tokens.forEach((token) => {
+        admin
+          .messaging()
+          .send({ token, ...baseMsg })
+          .then((id) => {
+            console.log(`📨 FCM push sent to chat recipient (${token.slice(0, 12)}…): ${id}`);
+          })
+          .catch((err) => {
+            console.warn('⚠️ FCM push for chat failed:', err.message || err);
+          });
+      });
+    } else {
+      console.log(
+        `ℹ️ No registered messaging tokens for ${recipientMessagingId.slice(0, 12)}…`
+      );
+    }
+    // =========================================================
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /messages/send crashed:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
   }
-
-  // Basic length sanity checks to avoid garbage
-  if (senderMessagingId.length > 256 || recipientMessagingId.length > 256 || messageId.length > 128) {
-    return res.status(400).json({ success: false, error: 'Bad id length' });
-  }
-
-  const ts = Number(tsRaw) > 0 ? Number(tsRaw) : Date.now();
-
-  const msg = {
-    id: messageId,
-    ts,
-    senderMessagingId,
-    ciphertextB64
-    // NO plaintext, NO alias, NO fromMe flag – clients infer everything
-  };
-
-  if (!messagesByRecipient[recipientMessagingId]) {
-    messagesByRecipient[recipientMessagingId] = [];
-  }
-
-  // Append, but cap queue size per recipient to avoid unbounded growth
-  messagesByRecipient[recipientMessagingId].push(msg);
-  if (messagesByRecipient[recipientMessagingId].length > 200) {
-    messagesByRecipient[recipientMessagingId].shift(); // drop oldest
-  }
-
-  // Don't log ciphertext
-  console.log(
-    `📨 Stored message for recipient ${recipientMessagingId.slice(0, 12)}… ` +
-    `(queue size=${messagesByRecipient[recipientMessagingId].length})`
-  );
-
-  // Fire-and-forget: push notification to recipient’s devices
-  sendPushNotificationForMessage({
-    recipientMessagingId,
-    senderMessagingId,
-    messageId,
-    timestamp: ts
-  }).catch(err => {
-    console.error('❌ Failed to send FCM push for message', messageId, err);
-  });
-
-  return res.json({ success: true });
 });
+
 
 // POST /messages/sync
 // Body: { recipientMessagingId }
@@ -1027,67 +1065,47 @@ app.post('/messages/sync', (req, res) => {
   delete messagesByRecipient[recipientMessagingId];
 
   // We do NOT log message contents
-  console.log(
-    `📤 Sync for recipient ${recipientMessagingId.slice(0, 12)}… returned=${list.length}`
-  );
+  console.log(`📤 Sync for recipient ${recipientMessagingId.slice(0, 12)}… returned=${list.length}`);
 
   res.setHeader('Cache-Control', 'no-store');
   return res.json({ success: true, messages: list });
 });
 
+// POST /messaging/register-device
+// Body: { messagingId, deviceToken }
+app.post('/messaging/register-device', (req, res) => {
+  try {
+    const messagingIdRaw = req.body && req.body.messagingId;
+    const deviceTokenRaw = req.body && req.body.deviceToken;
 
-// =============================
-// FCM push for new messages
-// =============================
+    const messagingId = String(messagingIdRaw || '').trim();
+    const deviceToken = String(deviceTokenRaw || '').trim();
 
-async function sendPushNotificationForMessage({ recipientMessagingId, senderMessagingId, messageId, timestamp }) {
-  // TODO: Implement this so it returns all FCM tokens for the recipient device(s)
-  // e.g. lookup user by messagingId, then fetch tokens from your /save-token store.
-  const tokens = await getFcmTokensForRecipient(recipientMessagingId);
-
-  if (!tokens || tokens.length === 0) {
-    // No devices registered for this recipient; nothing to push.
-    return;
-  }
-
-  const payload = {
-    tokens,
-    notification: {
-      title: 'New message',
-      body: 'You have a new message'
-    },
-    data: {
-      type: 'message',
-      senderMessagingId,
-      messageId,
-      timestamp: String(timestamp)
-      // DO NOT put ciphertext here; app will pull via /messages/sync
+    if (!messagingId || !deviceToken) {
+      console.warn('⚠️ /messaging/register-device missing fields', req.body);
+      return res
+        .status(400)
+        .json({ success: false, error: 'messagingId and deviceToken required' });
     }
-  };
 
-  const resp = await admin.messaging().sendEachForMulticast(payload);
-  console.log(
-    `📲 FCM push for message ${messageId.slice(0, 8)}… ` +
-    `success=${resp.successCount}, failure=${resp.failureCount}`
-  );
-}
+    if (!messagingTokensById[messagingId]) {
+      messagingTokensById[messagingId] = new Set();
+    }
+    messagingTokensById[messagingId].add(deviceToken);
 
-// Stub – wire this to your actual token store.
-// It must return an array of FCM tokens (strings) for this recipientMessagingId.
-async function getFcmTokensForRecipient(recipientMessagingId) {
-  // Example pattern (you must adapt to your DB / in-memory structure):
-  //
-  // 1) Look up user by messagingId:
-  //    const user = await db.users.findOne({ messagingId: recipientMessagingId });
-  //    if (!user) return [];
-  //
-  // 2) Get all tokens for that user:
-  //    const rows = await db.deviceTokens.find({ userId: user.id, appType: 'messenger' });
-  //    return rows.map(r => r.deviceToken);
-  //
-  // For now, return [] so this is a no-op until you wire it.
-  return [];
-}
+    console.log(
+      `💾 /messaging/register-device stored token for ${messagingId.slice(
+        0,
+        12
+      )}… (count=${messagingTokensById[messagingId].size})`
+    );
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /messaging/register-device crashed:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
 
 
 

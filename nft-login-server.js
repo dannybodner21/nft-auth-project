@@ -1026,7 +1026,7 @@ app.post('/messages/send', (req, res) => {
           body: 'You received a new encrypted message'
         },
         data: {
-          type: 'chat',
+          type: 'message',
           senderMessagingId,
           messageId
         }

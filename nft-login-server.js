@@ -7,6 +7,17 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
+
+process.on('uncaughtException', err => {
+  console.error("🔥 Uncaught Exception:", err);
+});
+process.on('unhandledRejection', err => {
+  console.error("🔥 Unhandled Promise Rejection:", err);
+});
+
+
+
+
 // === Ethers wiring (v5/v6 compatible) ===
 const { ethers } = require('ethers');
 const isAddress       = ethers.utils?.isAddress       || ethers.isAddress;
@@ -230,6 +241,7 @@ let messagingRouting = {};
 
 const pendingEmailCodes = {};
 const verifiedEmails = {};
+
 const makeCode6 = () => String(Math.floor(100000 + Math.random() * 900000));
 
 // === BEGIN: per-user card binding (production) ===
@@ -941,6 +953,7 @@ app.post('/wipe-credentials', (req, res) => {
 
 // ---------------------- Messaging endpoints ----------------------
 
+
 // ---------------------- E2EE Messaging relay (no plaintext stored) ----------------------
 
 // POST /messages/send
@@ -950,7 +963,6 @@ app.post('/messages/send', (req, res) => {
   const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
   const messageId            = String(req.body?.messageId || '').trim();
   const tsRaw                = req.body?.timestamp;
-
   const ciphertextB64        = String(req.body?.ciphertextB64 || '').trim();
 
   if (!senderMessagingId || !recipientMessagingId || !messageId || !ciphertextB64) {
@@ -983,7 +995,20 @@ app.post('/messages/send', (req, res) => {
   }
 
   // Don't log ciphertext
-  console.log(`📨 Stored message for recipient ${recipientMessagingId.slice(0, 12)}… (queue size=${messagesByRecipient[recipientMessagingId].length})`);
+  console.log(
+    `📨 Stored message for recipient ${recipientMessagingId.slice(0, 12)}… ` +
+    `(queue size=${messagesByRecipient[recipientMessagingId].length})`
+  );
+
+  // Fire-and-forget: push notification to recipient’s devices
+  sendPushNotificationForMessage({
+    recipientMessagingId,
+    senderMessagingId,
+    messageId,
+    timestamp: ts
+  }).catch(err => {
+    console.error('❌ Failed to send FCM push for message', messageId, err);
+  });
 
   return res.json({ success: true });
 });
@@ -1002,11 +1027,68 @@ app.post('/messages/sync', (req, res) => {
   delete messagesByRecipient[recipientMessagingId];
 
   // We do NOT log message contents
-  console.log(`📤 Sync for recipient ${recipientMessagingId.slice(0, 12)}… returned=${list.length}`);
+  console.log(
+    `📤 Sync for recipient ${recipientMessagingId.slice(0, 12)}… returned=${list.length}`
+  );
 
   res.setHeader('Cache-Control', 'no-store');
   return res.json({ success: true, messages: list });
 });
+
+
+// =============================
+// FCM push for new messages
+// =============================
+
+async function sendPushNotificationForMessage({ recipientMessagingId, senderMessagingId, messageId, timestamp }) {
+  // TODO: Implement this so it returns all FCM tokens for the recipient device(s)
+  // e.g. lookup user by messagingId, then fetch tokens from your /save-token store.
+  const tokens = await getFcmTokensForRecipient(recipientMessagingId);
+
+  if (!tokens || tokens.length === 0) {
+    // No devices registered for this recipient; nothing to push.
+    return;
+  }
+
+  const payload = {
+    tokens,
+    notification: {
+      title: 'New message',
+      body: 'You have a new message'
+    },
+    data: {
+      type: 'message',
+      senderMessagingId,
+      messageId,
+      timestamp: String(timestamp)
+      // DO NOT put ciphertext here; app will pull via /messages/sync
+    }
+  };
+
+  const resp = await admin.messaging().sendEachForMulticast(payload);
+  console.log(
+    `📲 FCM push for message ${messageId.slice(0, 8)}… ` +
+    `success=${resp.successCount}, failure=${resp.failureCount}`
+  );
+}
+
+// Stub – wire this to your actual token store.
+// It must return an array of FCM tokens (strings) for this recipientMessagingId.
+async function getFcmTokensForRecipient(recipientMessagingId) {
+  // Example pattern (you must adapt to your DB / in-memory structure):
+  //
+  // 1) Look up user by messagingId:
+  //    const user = await db.users.findOne({ messagingId: recipientMessagingId });
+  //    if (!user) return [];
+  //
+  // 2) Get all tokens for that user:
+  //    const rows = await db.deviceTokens.find({ userId: user.id, appType: 'messenger' });
+  //    return rows.map(r => r.deviceToken);
+  //
+  // For now, return [] so this is a no-op until you wire it.
+  return [];
+}
+
 
 
 // ---------------------- Phone-assisted decrypt ----------------------

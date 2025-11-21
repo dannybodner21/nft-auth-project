@@ -150,6 +150,13 @@ if (process.env.FIREBASE_CONFIG) {
 } else {
   throw new Error('No Firebase credentials: set FIREBASE_CONFIG or GOOGLE_APPLICATION_CREDENTIALS');
 }
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
+
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 // ---------------------- Card public key load ----------------------
@@ -1010,6 +1017,11 @@ app.post('/messages/send', (req, res) => {
 
     // ==== NEW: fire-and-forget push notification for chat ====
     const tokenSet = messagingTokensById[recipientMessagingId];
+    const count = tokenSet ? tokenSet.size : 0;
+    console.log(
+      `🔔 Chat push lookup for ${recipientMessagingId.slice(0, 12)}… tokens=${count}`
+    );
+
     if (tokenSet && tokenSet.size > 0) {
       const tokens = Array.from(tokenSet);
 
@@ -1030,15 +1042,23 @@ app.post('/messages/send', (req, res) => {
           .messaging()
           .send({ token, ...baseMsg })
           .then((id) => {
-            console.log(`📨 FCM push sent to chat recipient (${token.slice(0, 12)}…): ${id}`);
+            console.log(
+              `📨 FCM chat push sent to ${token.slice(0, 12)}…: ${id}`
+            );
           })
           .catch((err) => {
-            console.warn('⚠️ FCM push for chat failed:', err.message || err);
+            console.warn(
+              '⚠️ FCM chat push failed:',
+              err.message || err
+            );
           });
       });
     } else {
       console.log(
-        `ℹ️ No registered messaging tokens for ${recipientMessagingId.slice(0, 12)}…`
+        `ℹ️ No registered messaging tokens for ${recipientMessagingId.slice(
+          0,
+          12
+        )}…`
       );
     }
     // =========================================================

@@ -1325,7 +1325,9 @@ app.post("/calls/offer", async (req, res) => {
       callId: String(callId),
       callerMessagingId: String(fromMessagingId),
       callerDisplayName: displayName ? String(displayName) : "",
-      sdpOffer: String(sdpOffer)
+      // send under both names so Swift side can read whichever it expects
+      sdpOffer: String(sdpOffer),
+      sdp: String(sdpOffer),
     });
 
     return res.json({ ok: true });
@@ -1334,6 +1336,7 @@ app.post("/calls/offer", async (req, res) => {
     return res.status(500).json({ error: "internal_error" });
   }
 });
+
 
 
 

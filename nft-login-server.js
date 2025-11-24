@@ -1000,39 +1000,62 @@ app.post('/wipe-credentials', (req, res) => {
 const messagingTokensById = Object.create(null);
 
 // Generic helper: fan-out a push to all FCM tokens registered for a messagingId
-function pushToMessagingId(messagingId, { notification, data }) {
-  const tokenSet = messagingTokensById[messagingId];
-  if (!tokenSet || tokenSet.size === 0) {
-    console.log(`ℹ️ No FCM tokens for messagingId ${messagingId.slice(0, 12)}…`);
+// messagingId (base64 pubkey) -> FCM tokens are stored in callDeviceMap / messaging device maps
+async function pushToMessagingId(messagingId, data) {
+  const tokens = await getDeviceTokensForMessagingId(messagingId);
+  if (!tokens || tokens.length === 0) {
+    console.warn("📡 pushToMessagingId: no tokens for", messagingId);
     return;
   }
 
-  const tokens = Array.from(tokenSet);
-  console.log(`📡 pushToMessagingId ${messagingId.slice(0, 12)}… → ${tokens.length} tokens`);
+  // FCM data payload must be string values
+  const dataStrings = {};
+  for (const [k, v] of Object.entries(data || {})) {
+    if (v === undefined || v === null) continue;
+    dataStrings[k] = String(v);
+  }
 
-  tokens.forEach((token) => {
-    const msg = {
-      token,
-      android: { priority: 'high' },
-      apns: { payload: { aps: { contentAvailable: 1 } } },
-      ...(notification ? { notification } : {}),
-      data: {
-        // NEVER send undefined – only strings in data
-        ...(data || {})
-      }
-    };
+  // iOS background / silent push with custom data
+  const apnsPayload = {
+    aps: {
+      "content-available": 1
+    }
+  };
 
-    admin
-      .messaging()
-      .send(msg)
-      .then((id) => {
-        console.log(`✅ FCM push → ${token.slice(0, 12)}… (${id})`);
-      })
-      .catch((err) => {
-        console.warn('⚠️ FCM push failed:', err.message || err);
-      });
-  });
+  // Put type into aps.category as well so your iOS code can read it from aps.category if needed
+  if (dataStrings.type) {
+    apnsPayload.aps.category = dataStrings.type;
+  }
+
+  const message = {
+    tokens,
+    data: dataStrings,
+    apns: {
+      headers: {
+        "apns-push-type": "background",
+        "apns-priority": "5"
+      },
+      payload: apnsPayload
+    }
+  };
+
+  try {
+    const resp = await admin.messaging().sendEachForMulticast(message);
+    console.log(
+      "✅ FCM push →",
+      resp.successCount,
+      "success,",
+      resp.failureCount,
+      "failure for type=",
+      dataStrings.type || ""
+    );
+    return resp;
+  } catch (err) {
+    console.error("🔥 pushToMessagingId error:", err);
+    throw err;
+  }
 }
+
 
 
 // ---------------------- E2EE Messaging relay (no plaintext stored) ----------------------
@@ -1230,56 +1253,57 @@ app.post("/calls/register", (req, res) => {
 
 // POST /calls/offer
 // Body: { callId?, fromMessagingId, toMessagingId, sdpOffer, displayName? }
-app.post('/calls/offer', (req, res) => {
+// === CALLS: send offer to callee ===
+//
+// POST /calls/offer
+// {
+//   "callId": "uuid",
+//   "fromMessagingId": "...",
+//   "toMessagingId": "...",
+//   "sdpOffer": "...",
+//   "displayName": "Caller Name"
+// }
+app.post("/calls/offer", async (req, res) => {
   try {
-    const fromMessagingId = String(req.body?.fromMessagingId || '').trim();
-    const toMessagingId   = String(req.body?.toMessagingId || '').trim();
-    let   callId          = String(req.body?.callId || '').trim();
-    const sdpOffer        = String(req.body?.sdpOffer || '').trim();
-    const displayName     = String(req.body?.displayName || '').trim() || null;
-
-    if (!fromMessagingId || !toMessagingId || !sdpOffer) {
-      return res.status(400).json({ success: false, error: 'fromMessagingId, toMessagingId, sdpOffer required' });
-    }
-
-    if (!callId) {
-      callId = uuidv4();
-    }
-
-    const now = Date.now();
-    callsById[callId] = {
-      id: callId,
+    const {
+      callId,
       fromMessagingId,
       toMessagingId,
-      status: 'ringing',
       sdpOffer,
-      createdAt: now,
-      lastUpdate: now
+      displayName
+    } = req.body || {};
+
+    if (!callId || !fromMessagingId || !toMessagingId || !sdpOffer) {
+      console.error("❌ /calls/offer missing fields:", req.body);
+      return res.status(400).json({ error: "missing required fields" });
+    }
+
+    console.log(
+      "📞 /calls/offer",
+      callId,
+      "from",
+      (fromMessagingId || "").slice(0, 12) + "…",
+      "→",
+      (toMessagingId || "").slice(0, 12) + "…"
+    );
+
+    const dataPayload = {
+      type: "call_offer",
+      callId: String(callId),
+      callerMessagingId: String(fromMessagingId),
+      callerDisplayName: displayName ? String(displayName) : "",
+      sdpOffer: String(sdpOffer)
     };
 
-    console.log(`📞 /calls/offer ${callId} from ${fromMessagingId.slice(0, 12)}… → ${toMessagingId.slice(0, 12)}…`);
+    await pushToMessagingId(toMessagingId, dataPayload);
 
-    // Notify callee
-    pushToMessagingId(toMessagingId, {
-      notification: {
-        title: displayName ? `Call from ${displayName}` : 'Incoming call',
-        body: 'Tap to answer'
-      },
-      data: {
-        type: 'call_offer',
-        callId,
-        fromMessagingId,
-        toMessagingId,
-        sdpOffer
-      }
-    });
-
-    return res.json({ success: true, callId });
+    return res.json({ ok: true });
   } catch (err) {
-    console.error('❌ /calls/offer crashed:', err);
-    return res.status(500).json({ success: false, error: 'internal_error' });
+    console.error("🔥 /calls/offer error:", err);
+    return res.status(500).json({ error: "internal_error" });
   }
 });
+
 
 
 // iOS sends POST /calls/answer with:

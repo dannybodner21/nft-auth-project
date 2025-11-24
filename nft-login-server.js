@@ -29,59 +29,69 @@ process.on('unhandledRejection', err => {
 });
 
 
-// === Call device mapping ===
-// messagingId (base64 pubkey) -> Set<FCM token> (for calls)
-const callDeviceMap = new Map();
 
-function addDeviceTokenForMessagingId(messagingId, token) {
+// Store FCM token for a messagingId (for calls)
+async function addDeviceTokenForMessagingId(messagingId, token) {
   if (!messagingId || !token) return;
   const cleaned = String(token).trim();
   if (!cleaned) return;
 
-  const set = callDeviceMap.get(messagingId) || new Set();
-  set.add(cleaned);
-  callDeviceMap.set(messagingId, set);
-
-  console.log("🔄 callDeviceMap updated for", messagingId, "tokens:", set.size);
+  try {
+      // Use a Redis Set so each messagingId can have multiple tokens (multiple devices)
+      await redis.sadd(`call_tokens:${messagingId}`, cleaned);
+      // Set expiry of 30 days - tokens refresh when app opens
+      await redis.expire(`call_tokens:${messagingId}`, 30 * 24 * 60 * 60);
+      
+      const count = await redis.scard(`call_tokens:${messagingId}`);
+      console.log("🔄 Redis: call token stored for", messagingId.slice(0, 16) + "…", "count:", count);
+  } catch (err) {
+      console.error("❌ Redis addDeviceTokenForMessagingId error:", err.message);
+  }
 }
 
-// NOTE: we prefer callDeviceMap, but fall back to messagingTokensById (chat) if needed.
+// Get FCM tokens for a messagingId
 async function getDeviceTokensForMessagingId(messagingId) {
   if (!messagingId) return [];
 
-  // 1) primary: explicit call registration
-  const callSet = callDeviceMap.get(messagingId);
-  if (callSet && callSet.size > 0) {
-    return Array.from(callSet);
-  }
-
-  // 2) fallback: chat registration (messagingTokensById is defined later)
   try {
-    if (typeof messagingTokensById === 'object' && messagingTokensById !== null) {
-      const tokenSet = messagingTokensById[messagingId];
-      if (tokenSet && tokenSet.size > 0) {
-        console.warn(
-          "ℹ️ getDeviceTokensForMessagingId fallback to messagingTokensById for",
-          messagingId
-        );
-        return Array.from(tokenSet);
+      // First try call tokens
+      let tokens = await redis.smembers(`call_tokens:${messagingId}`);
+      
+      if (tokens && tokens.length > 0) {
+          return tokens;
       }
-    }
-  } catch (_) {
-    // if messagingTokensById not defined yet at runtime, just ignore
-  }
 
-  console.warn(
-    "ℹ️ No FCM tokens for messagingId",
-    messagingId,
-    "call map keys:",
-    Array.from(callDeviceMap.keys())
-  );
-  return [];
+      // Fallback: try messaging tokens
+      tokens = await redis.smembers(`msg_tokens:${messagingId}`);
+      if (tokens && tokens.length > 0) {
+          console.log("ℹ️ Falling back to msg_tokens for", messagingId.slice(0, 16) + "…");
+          return tokens;
+      }
+
+      console.warn("ℹ️ No FCM tokens found for", messagingId.slice(0, 16) + "…");
+      return [];
+  } catch (err) {
+      console.error("❌ Redis getDeviceTokensForMessagingId error:", err.message);
+      return [];
+  }
 }
 
+// Store FCM token for messaging
+async function addMessagingToken(messagingId, token) {
+  if (!messagingId || !token) return;
+  const cleaned = String(token).trim();
+  if (!cleaned) return;
 
-
+  try {
+      await redis.sadd(`msg_tokens:${messagingId}`, cleaned);
+      await redis.expire(`msg_tokens:${messagingId}`, 30 * 24 * 60 * 60);
+      
+      const count = await redis.scard(`msg_tokens:${messagingId}`);
+      console.log("🔄 Redis: msg token stored for", messagingId.slice(0, 16) + "…", "count:", count);
+  } catch (err) {
+      console.error("❌ Redis addMessagingToken error:", err.message);
+  }
+}
 
 
 // === Ethers wiring (v5/v6 compatible) ===
@@ -1036,7 +1046,7 @@ app.post('/wipe-credentials', (req, res) => {
 // ---------------------- Messaging endpoints ----------------------
 
 // In-memory mapping from messagingId (Curve25519 pubkey base64) -> Set of FCM tokens
-const messagingTokensById = Object.create(null);
+//const messagingTokensById = Object.create(null);
 
 // Generic helper: fan-out a push to all FCM tokens registered for a messagingId
 // messagingId (base64 pubkey) -> FCM tokens are stored in callDeviceMap / messaging device maps
@@ -1233,41 +1243,27 @@ app.post('/messages/sync', (req, res) => {
   return res.json({ success: true, messages: list });
 });
 
+
 // POST /messaging/register-device
-// Body: { messagingId, deviceToken }
-app.post('/messaging/register-device', (req, res) => {
+app.post('/messaging/register-device', async (req, res) => {
   try {
-    const messagingIdRaw = req.body && req.body.messagingId;
-    const deviceTokenRaw = req.body && req.body.deviceToken;
+      const messagingId = String(req.body?.messagingId || '').trim();
+      const deviceToken = String(req.body?.deviceToken || '').trim();
 
-    const messagingId = String(messagingIdRaw || '').trim();
-    const deviceToken = String(deviceTokenRaw || '').trim();
+      if (!messagingId || !deviceToken) {
+          console.warn('⚠️ /messaging/register-device missing fields', req.body);
+          return res.status(400).json({ success: false, error: 'messagingId and deviceToken required' });
+      }
 
-    if (!messagingId || !deviceToken) {
-      console.warn('⚠️ /messaging/register-device missing fields', req.body);
-      return res
-        .status(400)
-        .json({ success: false, error: 'messagingId and deviceToken required' });
-    }
+      await addMessagingToken(messagingId, deviceToken);
 
-    if (!messagingTokensById[messagingId]) {
-      messagingTokensById[messagingId] = new Set();
-    }
-    messagingTokensById[messagingId].add(deviceToken);
-
-    console.log(
-      `💾 /messaging/register-device stored token for ${messagingId.slice(
-        0,
-        12
-      )}… (count=${messagingTokensById[messagingId].size})`
-    );
-
-    return res.json({ success: true });
+      return res.json({ success: true });
   } catch (err) {
-    console.error('❌ /messaging/register-device crashed:', err);
-    return res.status(500).json({ success: false, error: 'internal_error' });
+      console.error('❌ /messaging/register-device error:', err);
+      return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
+
 
 // === CALLS: register device token for a messagingId ===
 //
@@ -1276,21 +1272,21 @@ app.post('/messaging/register-device', (req, res) => {
 //   "messagingId": "base64-public-key",
 //   "fcmToken": "device-fcm-token"
 // }
-app.post("/calls/register", (req, res) => {
+app.post("/calls/register", async (req, res) => {
   try {
-    const { messagingId, fcmToken } = req.body || {};
-    if (!messagingId || !fcmToken) {
-      console.error("❌ /calls/register missing fields:", req.body);
-      return res.status(400).json({ error: "missing messagingId or fcmToken" });
-    }
+      const { messagingId, fcmToken } = req.body || {};
+      if (!messagingId || !fcmToken) {
+          console.error("❌ /calls/register missing fields:", req.body);
+          return res.status(400).json({ error: "missing messagingId or fcmToken" });
+      }
 
-    addDeviceTokenForMessagingId(messagingId, fcmToken);
+      await addDeviceTokenForMessagingId(messagingId, fcmToken);
 
-    const size = callDeviceMap.get(messagingId)?.size || 0;
-    return res.json({ ok: true, tokenCount: size });
+      const count = await redis.scard(`call_tokens:${messagingId}`);
+      return res.json({ ok: true, tokenCount: count });
   } catch (err) {
-    console.error("🔥 /calls/register error:", err);
-    return res.status(500).json({ error: "internal_error" });
+      console.error("🔥 /calls/register error:", err);
+      return res.status(500).json({ error: "internal_error" });
   }
 });
 

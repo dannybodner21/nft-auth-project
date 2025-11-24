@@ -1008,23 +1008,30 @@ async function pushToMessagingId(messagingId, data) {
     return;
   }
 
-  // FCM data payload must be string values
+  // FCM data must be strings
   const dataStrings = {};
   for (const [k, v] of Object.entries(data || {})) {
     if (v === undefined || v === null) continue;
     dataStrings[k] = String(v);
   }
 
-  // iOS background / silent push with custom data
+  // Build APNs payload with all keys at top level
   const apnsPayload = {
     aps: {
       "content-available": 1
     }
   };
 
-  // Put type into aps.category as well so your iOS code can read it from aps.category if needed
+  // Mirror all data keys into APNs (top-level in userInfo)
+  for (const [k, v] of Object.entries(dataStrings)) {
+    if (k === "type") continue; // type handled below
+    apnsPayload[k] = v;
+  }
+
+  // Put type into aps.category and into userInfo["type"]
   if (dataStrings.type) {
     apnsPayload.aps.category = dataStrings.type;
+    apnsPayload.type = dataStrings.type;
   }
 
   const message = {
@@ -1055,6 +1062,7 @@ async function pushToMessagingId(messagingId, data) {
     throw err;
   }
 }
+
 
 
 

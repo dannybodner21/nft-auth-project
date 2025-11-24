@@ -241,6 +241,20 @@ let messagesByRecipient = {};
 // messagingRouting[messagingId] = { email, deviceToken }
 let messagingRouting = {};
 
+// ---- Call signaling state (in-memory, ephemeral) ----
+// callsById[callId] = {
+//   id,
+//   fromMessagingId,
+//   toMessagingId,
+//   status: 'ringing' | 'connected' | 'ended',
+//   sdpOffer?: string,
+//   sdpAnswer?: string,
+//   createdAt: number,
+//   endedAt?: number,
+//   lastUpdate: number
+// }
+const callsById = Object.create(null);
+
 const pendingEmailCodes = {};
 const verifiedEmails = {};
 
@@ -958,6 +972,42 @@ app.post('/wipe-credentials', (req, res) => {
 // In-memory mapping from messagingId (Curve25519 pubkey base64) -> Set of FCM tokens
 const messagingTokensById = Object.create(null);
 
+// Generic helper: fan-out a push to all FCM tokens registered for a messagingId
+function pushToMessagingId(messagingId, { notification, data }) {
+  const tokenSet = messagingTokensById[messagingId];
+  if (!tokenSet || tokenSet.size === 0) {
+    console.log(`ℹ️ No FCM tokens for messagingId ${messagingId.slice(0, 12)}…`);
+    return;
+  }
+
+  const tokens = Array.from(tokenSet);
+  console.log(`📡 pushToMessagingId ${messagingId.slice(0, 12)}… → ${tokens.length} tokens`);
+
+  tokens.forEach((token) => {
+    const msg = {
+      token,
+      android: { priority: 'high' },
+      apns: { payload: { aps: { contentAvailable: 1 } } },
+      ...(notification ? { notification } : {}),
+      data: {
+        // NEVER send undefined – only strings in data
+        ...(data || {})
+      }
+    };
+
+    admin
+      .messaging()
+      .send(msg)
+      .then((id) => {
+        console.log(`✅ FCM push → ${token.slice(0, 12)}… (${id})`);
+      })
+      .catch((err) => {
+        console.warn('⚠️ FCM push failed:', err.message || err);
+      });
+  });
+}
+
+
 // ---------------------- E2EE Messaging relay (no plaintext stored) ----------------------
 
 // POST /messages/send
@@ -1123,6 +1173,194 @@ app.post('/messaging/register-device', (req, res) => {
 });
 
 
+// ---------------------- Call signaling (WebRTC-style) ----------------------
+
+// POST /calls/offer
+// Body: { callId?, fromMessagingId, toMessagingId, sdpOffer, displayName? }
+app.post('/calls/offer', (req, res) => {
+  try {
+    const fromMessagingId = String(req.body?.fromMessagingId || '').trim();
+    const toMessagingId   = String(req.body?.toMessagingId || '').trim();
+    let   callId          = String(req.body?.callId || '').trim();
+    const sdpOffer        = String(req.body?.sdpOffer || '').trim();
+    const displayName     = String(req.body?.displayName || '').trim() || null;
+
+    if (!fromMessagingId || !toMessagingId || !sdpOffer) {
+      return res.status(400).json({ success: false, error: 'fromMessagingId, toMessagingId, sdpOffer required' });
+    }
+
+    if (!callId) {
+      callId = uuidv4();
+    }
+
+    const now = Date.now();
+    callsById[callId] = {
+      id: callId,
+      fromMessagingId,
+      toMessagingId,
+      status: 'ringing',
+      sdpOffer,
+      createdAt: now,
+      lastUpdate: now
+    };
+
+    console.log(`📞 /calls/offer ${callId} from ${fromMessagingId.slice(0, 12)}… → ${toMessagingId.slice(0, 12)}…`);
+
+    // Notify callee
+    pushToMessagingId(toMessagingId, {
+      notification: {
+        title: displayName ? `Call from ${displayName}` : 'Incoming call',
+        body: 'Tap to answer'
+      },
+      data: {
+        type: 'call_offer',
+        callId,
+        fromMessagingId,
+        toMessagingId,
+        sdpOffer
+      }
+    });
+
+    return res.json({ success: true, callId });
+  } catch (err) {
+    console.error('❌ /calls/offer crashed:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+// POST /calls/answer
+// Body: { callId, fromMessagingId, toMessagingId, sdpAnswer }
+app.post('/calls/answer', (req, res) => {
+  try {
+    const callId          = String(req.body?.callId || '').trim();
+    const fromMessagingId = String(req.body?.fromMessagingId || '').trim(); // callee
+    const toMessagingId   = String(req.body?.toMessagingId || '').trim();   // caller
+    const sdpAnswer       = String(req.body?.sdpAnswer || '').trim();
+
+    if (!callId || !fromMessagingId || !toMessagingId || !sdpAnswer) {
+      return res.status(400).json({ success: false, error: 'callId, fromMessagingId, toMessagingId, sdpAnswer required' });
+    }
+
+    const call = callsById[callId];
+    if (!call) {
+      return res.status(404).json({ success: false, error: 'call not found' });
+    }
+    if (call.toMessagingId !== fromMessagingId || call.fromMessagingId !== toMessagingId) {
+      console.warn('⚠️ /calls/answer identity mismatch', { call, fromMessagingId, toMessagingId });
+    }
+
+    call.status    = 'connected';
+    call.sdpAnswer = sdpAnswer;
+    call.lastUpdate = Date.now();
+
+    console.log(`📞 /calls/answer ${callId} from ${fromMessagingId.slice(0, 12)}…`);
+
+    // Notify caller
+    pushToMessagingId(toMessagingId, {
+      notification: null, // silent; app shows in-call UI
+      data: {
+        type: 'call_answer',
+        callId,
+        fromMessagingId,
+        toMessagingId,
+        sdpAnswer
+      }
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /calls/answer crashed:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+// POST /calls/candidate
+// Body: { callId, fromMessagingId, toMessagingId, candidateJson }
+// - candidateJson is a stringified ICE candidate (client just forwards it).
+app.post('/calls/candidate', (req, res) => {
+  try {
+    const callId          = String(req.body?.callId || '').trim();
+    const fromMessagingId = String(req.body?.fromMessagingId || '').trim();
+    const toMessagingId   = String(req.body?.toMessagingId || '').trim();
+    const candidateJson   = String(req.body?.candidateJson || '').trim();
+
+    if (!callId || !fromMessagingId || !toMessagingId || !candidateJson) {
+      return res.status(400).json({ success: false, error: 'callId, fromMessagingId, toMessagingId, candidateJson required' });
+    }
+
+    const call = callsById[callId];
+    if (!call) {
+      console.warn('⚠️ /calls/candidate unknown callId', callId);
+      // still accept for stateless relaying
+    } else {
+      call.lastUpdate = Date.now();
+    }
+
+    // Relay ICE candidate to the peer
+    pushToMessagingId(toMessagingId, {
+      notification: null,
+      data: {
+        type: 'call_candidate',
+        callId,
+        fromMessagingId,
+        toMessagingId,
+        candidateJson
+      }
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /calls/candidate crashed:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+// POST /calls/hangup
+// Body: { callId, fromMessagingId, toMessagingId, reason? }
+app.post('/calls/hangup', (req, res) => {
+  try {
+    const callId          = String(req.body?.callId || '').trim();
+    const fromMessagingId = String(req.body?.fromMessagingId || '').trim();
+    const toMessagingId   = String(req.body?.toMessagingId || '').trim();
+    const reason          = String(req.body?.reason || 'hangup').trim();
+
+    if (!callId || !fromMessagingId || !toMessagingId) {
+      return res.status(400).json({ success: false, error: 'callId, fromMessagingId, toMessagingId required' });
+    }
+
+    const call = callsById[callId];
+    if (call) {
+      call.status    = 'ended';
+      call.endedAt   = Date.now();
+      call.lastUpdate = call.endedAt;
+    }
+
+    console.log(`📵 /calls/hangup ${callId} from ${fromMessagingId.slice(0, 12)}… reason=${reason}`);
+
+    // Notify peer
+    pushToMessagingId(toMessagingId, {
+      notification: null,
+      data: {
+        type: 'call_hangup',
+        callId,
+        fromMessagingId,
+        toMessagingId,
+        reason
+      }
+    });
+
+    // We can drop the call immediately or let cleanup sweep it
+    delete callsById[callId];
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /calls/hangup crashed:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+
+
 
 // ---------------------- Phone-assisted decrypt ----------------------
 app.post('/request-decrypt', async (req, res) => {
@@ -1261,6 +1499,17 @@ setInterval(() => {
       delete messagesByRecipient[recipientId];
     }
   }
+
+    // Cleanup stale calls (e.g. > 15 minutes old)
+    const CALL_TTL = 15 * 60_000;
+    for (const [id, c] of Object.entries(callsById)) {
+      const t = c.lastUpdate || c.createdAt || 0;
+      if (!t || now - t > CALL_TTL) {
+        console.log(`🧹 Cleaning stale call ${id}`);
+        delete callsById[id];
+      }
+    }
+    
 }, 60_000);
 
 

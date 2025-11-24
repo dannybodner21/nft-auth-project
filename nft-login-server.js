@@ -1159,7 +1159,7 @@ app.post('/messages/send', async (req, res) => {
           await redis.ltrim(msgKey, listLen - 200, -1);
       }
 
-      console.log(`📨 Stored message for recipient ${recipientMessagingId.slice(0, 16)}… (queue size=${messagesByRecipient[recipientMessagingId].length})`);
+      console.log(`📨 Stored message for recipient ${recipientMessagingId.slice(0, 16)}… (queue size=${listLen})`);
 
       // ✅ NEW: Get tokens from Redis instead of in-memory object
       const tokens = await redis.smembers(`msg_tokens:${recipientMessagingId}`);

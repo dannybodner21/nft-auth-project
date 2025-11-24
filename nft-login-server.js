@@ -21,6 +21,7 @@ redis.on('error', (err) => {
     console.error('❌ Redis error:', err.message);
 });
 
+
 process.on('uncaughtException', err => {
   console.error("🔥 Uncaught Exception:", err);
 });
@@ -28,6 +29,15 @@ process.on('unhandledRejection', err => {
   console.error("🔥 Unhandled Promise Rejection:", err);
 });
 
+
+// Rate limiting helper
+async function checkRateLimit(key, maxRequests, windowSeconds) {
+  const current = await redis.incr(key);
+  if (current === 1) {
+      await redis.expire(key, windowSeconds);
+  }
+  return current <= maxRequests;
+}
 
 
 // Store FCM token for a messagingId (for calls)
@@ -215,6 +225,19 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
+
+
+// Global IP rate limit - 200 requests per minute per IP
+app.use(async (req, res, next) => {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+  const allowed = await checkRateLimit(`ratelimit:ip:${ip}`, 200, 60);
+  if (!allowed) {
+      console.log(`🚫 Global rate limit for IP ${ip}`);
+      return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
+  }
+  next();
+});
+
 
 // 🔐 Firebase Admin
 let serviceAccount;
@@ -1131,6 +1154,13 @@ app.post('/messages/send', async (req, res) => {
           return res.status(400).json({ success: false, error: 'Missing fields' });
       }
 
+      // Rate limit: 60 messages per minute per sender
+      const allowed = await checkRateLimit(`ratelimit:send:${senderMessagingId}`, 60, 60);
+      if (!allowed) {
+          console.log(`🚫 Rate limited /messages/send for ${senderMessagingId.slice(0, 16)}…`);
+          return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
+      }
+
       if (
           senderMessagingId.length > 256 ||
           recipientMessagingId.length > 256 ||
@@ -1250,6 +1280,13 @@ app.post('/messages/sync', async (req, res) => {
       return res.status(400).json({ success: false, error: 'recipientMessagingId required' });
     }
 
+    // Rate limit: 30 syncs per minute
+    const allowed = await checkRateLimit(`ratelimit:sync:${recipientMessagingId}`, 30, 60);
+    if (!allowed) {
+        console.log(`🚫 Rate limited /messages/sync for ${recipientMessagingId.slice(0, 16)}…`);
+        return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
+    }
+
     const key = `pending_msgs:${recipientMessagingId}`;
     
     // Get all pending messages (but don't delete)
@@ -1348,6 +1385,13 @@ app.post("/calls/offer", async (req, res) => {
     if (!callId || !fromMessagingId || !toMessagingId || !sdpOffer) {
       console.error("❌ /calls/offer missing fields:", req.body);
       return res.status(400).json({ error: "missing required fields" });
+    }
+
+    // Rate limit: 10 calls per minute per caller
+    const allowed = await checkRateLimit(`ratelimit:call:${fromMessagingId}`, 10, 60);
+    if (!allowed) {
+        console.log(`🚫 Rate limited /calls/offer for ${fromMessagingId.slice(0, 16)}…`);
+        return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
     }
 
     console.log(

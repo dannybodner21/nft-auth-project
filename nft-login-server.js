@@ -16,6 +16,29 @@ process.on('unhandledRejection', err => {
 });
 
 
+// In-memory mapping from messagingId → set of FCM tokens
+const callDeviceMap = new Map();
+
+function addDeviceTokenForMessagingId(messagingId, token) {
+  if (!messagingId || !token) return;
+  const cleaned = String(token).trim();
+  if (!cleaned) return;
+
+  const set = callDeviceMap.get(messagingId) || new Set();
+  set.add(cleaned);
+  callDeviceMap.set(messagingId, set);
+  console.log("🔄 callDeviceMap updated for", messagingId, "tokens:", set.size);
+}
+
+async function getDeviceTokensForMessagingId(messagingId) {
+  const set = callDeviceMap.get(messagingId);
+  if (!set) {
+    console.warn("ℹ️ No FCM tokens for messagingId", messagingId);
+    return [];
+  }
+  return Array.from(set);
+}
+
 
 
 // === Ethers wiring (v5/v6 compatible) ===
@@ -1424,14 +1447,7 @@ app.post('/calls/hangup', (req, res) => {
   }
 });
 
-// === Helper: look up device tokens for a messagingId ===
-// TODO: replace this stub with your real lookup (DB, in-memory map, etc.)
-async function getDeviceTokensForMessagingId(messagingId) {
-  // Example if you already track this somewhere:
-  // return await db.getTokensForMessagingId(messagingId);
-  console.warn("⚠️ getDeviceTokensForMessagingId not implemented, messagingId=", messagingId);
-  return []; // no tokens → callee won't get the offer yet
-}
+
 
 // === CALLS: outgoing offer ===
 //

@@ -1148,13 +1148,15 @@ app.post('/messages/send', async (req, res) => {
           ciphertextB64
       };
 
-      // Store message in memory (we'll migrate this to Redis next)
-      if (!messagesByRecipient[recipientMessagingId]) {
-          messagesByRecipient[recipientMessagingId] = [];
-      }
-      messagesByRecipient[recipientMessagingId].push(msg);
-      if (messagesByRecipient[recipientMessagingId].length > 200) {
-          messagesByRecipient[recipientMessagingId].shift();
+      // Store message in Redis with 7-day TTL
+      const msgKey = `pending_msgs:${recipientMessagingId}`;
+      await redis.rpush(msgKey, JSON.stringify(msg));
+      await redis.expire(msgKey, 7 * 24 * 60 * 60);  // 7 days TTL
+
+      // Cap at 200 messages per recipient
+      const listLen = await redis.llen(msgKey);
+      if (listLen > 200) {
+          await redis.ltrim(msgKey, listLen - 200, -1);
       }
 
       console.log(`📨 Stored message for recipient ${recipientMessagingId.slice(0, 16)}… (queue size=${messagesByRecipient[recipientMessagingId].length})`);
@@ -1201,21 +1203,40 @@ app.post('/messages/send', async (req, res) => {
 // POST /messages/sync
 // Body: { recipientMessagingId }
 // Returns and *clears* all queued messages for that recipient
-app.post('/messages/sync', (req, res) => {
-  const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
-  if (!recipientMessagingId) {
-    return res.status(400).json({ success: false, error: 'recipientMessagingId required' });
+app.post('/messages/sync', async (req, res) => {
+  try {
+    const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
+    if (!recipientMessagingId) {
+      return res.status(400).json({ success: false, error: 'recipientMessagingId required' });
+    }
+
+    const key = `pending_msgs:${recipientMessagingId}`;
+    
+    // Get all pending messages
+    const rawMessages = await redis.lrange(key, 0, -1);
+    
+    // Parse JSON strings back to objects
+    const messages = rawMessages.map(m => {
+      try {
+        return JSON.parse(m);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+
+    // Delete after successful read
+    if (messages.length > 0) {
+      await redis.del(key);
+    }
+
+    console.log(`📤 Sync for recipient ${recipientMessagingId.slice(0, 16)}… returned=${messages.length}`);
+
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({ success: true, messages });
+  } catch (err) {
+    console.error('❌ /messages/sync error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
   }
-
-  const list = messagesByRecipient[recipientMessagingId] || [];
-  // Deliver-once: wipe after read
-  delete messagesByRecipient[recipientMessagingId];
-
-  // We do NOT log message contents
-  console.log(`📤 Sync for recipient ${recipientMessagingId.slice(0, 12)}… returned=${list.length}`);
-
-  res.setHeader('Cache-Control', 'no-store');
-  return res.json({ success: true, messages: list });
 });
 
 

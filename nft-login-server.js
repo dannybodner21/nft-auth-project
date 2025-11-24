@@ -1181,7 +1181,7 @@ app.post('/messages/send', async (req, res) => {
       // Store message in Redis with 7-day TTL
       const msgKey = `pending_msgs:${recipientMessagingId}`;
       await redis.rpush(msgKey, JSON.stringify(msg));
-      await redis.expire(msgKey, 7 * 24 * 60 * 60);  // 7 days TTL
+      await redis.expire(msgKey, 24 * 60 * 60);  // 24 hours TTL
 
       // Cap at 200 messages per recipient
       const listLen = await redis.llen(msgKey);
@@ -1257,7 +1257,7 @@ app.post('/messages/ack', async (req, res) => {
     await redis.del(key);
     if (remaining.length > 0) {
       await redis.rpush(key, ...remaining);
-      await redis.expire(key, 7 * 24 * 60 * 60);
+      await redis.expire(ackedKey, 24 * 60 * 60);  // 24 hours TTL
     }
 
     console.log(`✅ ACK ${messageIds.length} messages for ${recipientMessagingId.slice(0, 16)}… (${remaining.length} remaining)`);

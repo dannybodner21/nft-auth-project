@@ -16,7 +16,8 @@ process.on('unhandledRejection', err => {
 });
 
 
-// In-memory mapping from messagingId → set of FCM tokens
+// === Call device mapping ===
+// messagingId (base64 pubkey) -> Set<FCM token>
 const callDeviceMap = new Map();
 
 function addDeviceTokenForMessagingId(messagingId, token) {
@@ -27,17 +28,20 @@ function addDeviceTokenForMessagingId(messagingId, token) {
   const set = callDeviceMap.get(messagingId) || new Set();
   set.add(cleaned);
   callDeviceMap.set(messagingId, set);
+
   console.log("🔄 callDeviceMap updated for", messagingId, "tokens:", set.size);
 }
 
 async function getDeviceTokensForMessagingId(messagingId) {
   const set = callDeviceMap.get(messagingId);
   if (!set) {
-    console.warn("ℹ️ No FCM tokens for messagingId", messagingId);
+    console.warn("ℹ️ No FCM tokens for messagingId", messagingId,
+                 "map keys:", Array.from(callDeviceMap.keys()));
     return [];
   }
   return Array.from(set);
 }
+
 
 
 
@@ -1194,6 +1198,32 @@ app.post('/messaging/register-device', (req, res) => {
     return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
+
+// === CALLS: register device token for a messagingId ===
+//
+// POST /calls/register
+// {
+//   "messagingId": "base64-public-key",
+//   "fcmToken": "device-fcm-token"
+// }
+app.post("/calls/register", (req, res) => {
+  try {
+    const { messagingId, fcmToken } = req.body || {};
+    if (!messagingId || !fcmToken) {
+      console.error("❌ /calls/register missing fields:", req.body);
+      return res.status(400).json({ error: "missing messagingId or fcmToken" });
+    }
+
+    addDeviceTokenForMessagingId(messagingId, fcmToken);
+
+    const size = callDeviceMap.get(messagingId)?.size || 0;
+    return res.json({ ok: true, tokenCount: size });
+  } catch (err) {
+    console.error("🔥 /calls/register error:", err);
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
 
 
 // ---------------------- Call signaling (WebRTC-style) ----------------------

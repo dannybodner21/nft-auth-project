@@ -1321,50 +1321,38 @@ app.post("/calls/offer", async (req, res) => {
 //   toMessagingId: "caller pubkey",
 //   sdpAnswer: "…"
 // }
-app.post("/calls/answer", async (req, res) => {
+// === Answer a call ===
+app.post('/calls/answer', async (req, res) => {
   try {
-    const {
+    const { callId, callerMessagingId, calleeMessagingId, sdpAnswer } = req.body;
+
+    console.log(
+      "📞 /calls/answer",
       callId,
-      fromMessagingId,
-      toMessagingId,
-      sdpAnswer
-    } = req.body || {};
+      "from",
+      calleeMessagingId,
+      "→",
+      callerMessagingId
+    );
 
-    if (!callId || !fromMessagingId || !toMessagingId || !sdpAnswer) {
-      console.error("❌ /calls/answer missing fields:", req.body);
-      return res.status(400).json({ error: "missing required fields" });
+    if (!callId || !callerMessagingId || !sdpAnswer) {
+      return res.status(400).json({ error: "missing_fields" });
     }
 
-    // We are sending the answer back to the ORIGINAL caller,
-    // so we look up tokens for `toMessagingId` (the caller).
-    const tokens = await getDeviceTokensForMessagingId(toMessagingId);
-    if (!tokens || tokens.length === 0) {
-      console.warn("⚠️ /calls/answer: no device tokens for", toMessagingId);
-      return res.status(404).json({ error: "no devices for caller" });
-    }
-
-    const dataPayload = {
+    // Re-use your working FCM helper
+    await pushToMessagingId(callerMessagingId, {
       type: "call_answer",
-      callId: String(callId),
-      // optional, might be useful on caller side
-      fromMessagingId: String(fromMessagingId),
-      sdpAnswer: String(sdpAnswer)
-    };
+      callId,
+      sdpAnswer
+    });
 
-    const message = {
-      tokens,
-      data: dataPayload
-    };
-
-    const resp = await admin.messaging().sendMulticast(message);
-    console.log("✅ /calls/answer FCM sent:", resp.successCount, "success,", resp.failureCount, "failure");
-
-    return res.json({ ok: true, fcm: resp });
+    return res.json({ ok: true });
   } catch (err) {
     console.error("🔥 /calls/answer error:", err);
     return res.status(500).json({ error: "internal_error" });
   }
 });
+
 
 // === CALLS: ICE candidates ===
 //

@@ -1228,51 +1228,116 @@ app.post('/calls/offer', (req, res) => {
   }
 });
 
-// POST /calls/answer
-// Body: { callId, fromMessagingId, toMessagingId, sdpAnswer }
-app.post('/calls/answer', (req, res) => {
+
+// iOS sends POST /calls/answer with:
+// {
+//   callId: "uuid",
+//   fromMessagingId: "callee pubkey",
+//   toMessagingId: "caller pubkey",
+//   sdpAnswer: "…"
+// }
+app.post("/calls/answer", async (req, res) => {
   try {
-    const callId          = String(req.body?.callId || '').trim();
-    const fromMessagingId = String(req.body?.fromMessagingId || '').trim(); // callee
-    const toMessagingId   = String(req.body?.toMessagingId || '').trim();   // caller
-    const sdpAnswer       = String(req.body?.sdpAnswer || '').trim();
+    const {
+      callId,
+      fromMessagingId,
+      toMessagingId,
+      sdpAnswer
+    } = req.body || {};
 
     if (!callId || !fromMessagingId || !toMessagingId || !sdpAnswer) {
-      return res.status(400).json({ success: false, error: 'callId, fromMessagingId, toMessagingId, sdpAnswer required' });
+      console.error("❌ /calls/answer missing fields:", req.body);
+      return res.status(400).json({ error: "missing required fields" });
     }
 
-    const call = callsById[callId];
-    if (!call) {
-      return res.status(404).json({ success: false, error: 'call not found' });
+    // We are sending the answer back to the ORIGINAL caller,
+    // so we look up tokens for `toMessagingId` (the caller).
+    const tokens = await getDeviceTokensForMessagingId(toMessagingId);
+    if (!tokens || tokens.length === 0) {
+      console.warn("⚠️ /calls/answer: no device tokens for", toMessagingId);
+      return res.status(404).json({ error: "no devices for caller" });
     }
-    if (call.toMessagingId !== fromMessagingId || call.fromMessagingId !== toMessagingId) {
-      console.warn('⚠️ /calls/answer identity mismatch', { call, fromMessagingId, toMessagingId });
-    }
 
-    call.status    = 'connected';
-    call.sdpAnswer = sdpAnswer;
-    call.lastUpdate = Date.now();
+    const dataPayload = {
+      type: "call_answer",
+      callId: String(callId),
+      // optional, might be useful on caller side
+      fromMessagingId: String(fromMessagingId),
+      sdpAnswer: String(sdpAnswer)
+    };
 
-    console.log(`📞 /calls/answer ${callId} from ${fromMessagingId.slice(0, 12)}…`);
+    const message = {
+      tokens,
+      data: dataPayload
+    };
 
-    // Notify caller
-    pushToMessagingId(toMessagingId, {
-      notification: null, // silent; app shows in-call UI
-      data: {
-        type: 'call_answer',
-        callId,
-        fromMessagingId,
-        toMessagingId,
-        sdpAnswer
-      }
-    });
+    const resp = await admin.messaging().sendMulticast(message);
+    console.log("✅ /calls/answer FCM sent:", resp.successCount, "success,", resp.failureCount, "failure");
 
-    return res.json({ success: true });
+    return res.json({ ok: true, fcm: resp });
   } catch (err) {
-    console.error('❌ /calls/answer crashed:', err);
-    return res.status(500).json({ success: false, error: 'internal_error' });
+    console.error("🔥 /calls/answer error:", err);
+    return res.status(500).json({ error: "internal_error" });
   }
 });
+
+// === CALLS: ICE candidates ===
+//
+// iOS sends POST /calls/ice with:
+// {
+//   callId: "uuid",
+//   fromMessagingId: "sender pubkey",
+//   toMessagingId: "receiver pubkey",
+//   sdp: "candidate sdp",
+//   sdpMLineIndex: 0,
+//   sdpMid: "0"
+// }
+app.post("/calls/ice", async (req, res) => {
+  try {
+    const {
+      callId,
+      fromMessagingId,
+      toMessagingId,
+      sdp,
+      sdpMLineIndex,
+      sdpMid
+    } = req.body || {};
+
+    if (!callId || !fromMessagingId || !toMessagingId || !sdp) {
+      console.error("❌ /calls/ice missing fields:", req.body);
+      return res.status(400).json({ error: "missing required fields" });
+    }
+
+    const tokens = await getDeviceTokensForMessagingId(toMessagingId);
+    if (!tokens || tokens.length === 0) {
+      console.warn("⚠️ /calls/ice: no device tokens for", toMessagingId);
+      return res.status(404).json({ error: "no devices for peer" });
+    }
+
+    const dataPayload = {
+      type: "call_ice",
+      callId: String(callId),
+      sdp: String(sdp),
+      // normalize to string so iOS can parse flexibly
+      sdpMLineIndex: String(sdpMLineIndex),
+      sdpMid: sdpMid != null ? String(sdpMid) : ""
+    };
+
+    const message = {
+      tokens,
+      data: dataPayload
+    };
+
+    const resp = await admin.messaging().sendMulticast(message);
+    console.log("✅ /calls/ice FCM sent:", resp.successCount, "success,", resp.failureCount, "failure");
+
+    return res.json({ ok: true, fcm: resp });
+  } catch (err) {
+    console.error("🔥 /calls/ice error:", err);
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
 
 // POST /calls/candidate
 // Body: { callId, fromMessagingId, toMessagingId, candidateJson }
@@ -1358,6 +1423,70 @@ app.post('/calls/hangup', (req, res) => {
     return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
+
+// === Helper: look up device tokens for a messagingId ===
+// TODO: replace this stub with your real lookup (DB, in-memory map, etc.)
+async function getDeviceTokensForMessagingId(messagingId) {
+  // Example if you already track this somewhere:
+  // return await db.getTokensForMessagingId(messagingId);
+  console.warn("⚠️ getDeviceTokensForMessagingId not implemented, messagingId=", messagingId);
+  return []; // no tokens → callee won't get the offer yet
+}
+
+// === CALLS: outgoing offer ===
+//
+// iOS sends POST /calls/offer with:
+// {
+//   callId: "uuid",
+//   fromMessagingId: "base64 pubkey",
+//   toMessagingId: "base64 pubkey",
+//   sdpOffer: "…",
+//   displayName: "Caller Name"
+// }
+app.post("/calls/offer", async (req, res) => {
+  try {
+    const {
+      callId,
+      fromMessagingId,
+      toMessagingId,
+      sdpOffer,
+      displayName
+    } = req.body || {};
+
+    if (!callId || !fromMessagingId || !toMessagingId || !sdpOffer) {
+      console.error("❌ /calls/offer missing fields:", req.body);
+      return res.status(400).json({ error: "missing required fields" });
+    }
+
+    const tokens = await getDeviceTokensForMessagingId(toMessagingId);
+    if (!tokens || tokens.length === 0) {
+      console.warn("⚠️ /calls/offer: no device tokens for", toMessagingId);
+      return res.status(404).json({ error: "no devices for callee" });
+    }
+
+    const dataPayload = {
+      type: "call_offer",
+      callId: String(callId),
+      callerMessagingId: String(fromMessagingId),
+      callerDisplayName: displayName ? String(displayName) : "",
+      sdpOffer: String(sdpOffer)
+    };
+
+    const message = {
+      tokens,
+      data: dataPayload
+    };
+
+    const resp = await admin.messaging().sendMulticast(message);
+    console.log("✅ /calls/offer FCM sent:", resp.successCount, "success,", resp.failureCount, "failure");
+
+    return res.json({ ok: true, fcm: resp });
+  } catch (err) {
+    console.error("🔥 /calls/offer error:", err);
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
 
 
 
@@ -1509,7 +1638,7 @@ setInterval(() => {
         delete callsById[id];
       }
     }
-    
+
 }, 60_000);
 
 

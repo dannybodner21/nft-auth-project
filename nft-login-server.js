@@ -8,6 +8,19 @@ const fs = require('fs');
 const crypto = require('crypto');
 
 
+const Redis = require('ioredis');
+
+// Initialize Redis connection
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+
+redis.on('connect', () => {
+    console.log('✅ Redis connected');
+});
+
+redis.on('error', (err) => {
+    console.error('❌ Redis error:', err.message);
+});
+
 process.on('uncaughtException', err => {
   console.error("🔥 Uncaught Exception:", err);
 });

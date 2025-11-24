@@ -1320,15 +1320,84 @@ app.post("/calls/offer", async (req, res) => {
       (toMessagingId || "").slice(0, 12) + "…"
     );
 
-    await pushToMessagingId(toMessagingId, {
+    // Get tokens for the callee
+    const tokens = await getDeviceTokensForMessagingId(toMessagingId);
+    if (!tokens || tokens.length === 0) {
+      console.warn("📡 /calls/offer: no tokens for", toMessagingId);
+      return res.status(404).json({ error: "no device tokens for recipient" });
+    }
+
+    const callerName = displayName || fromMessagingId.slice(0, 8) + "…";
+
+    // Data payload (all strings)
+    const dataPayload = {
       type: "call_offer",
       callId: String(callId),
       callerMessagingId: String(fromMessagingId),
-      callerDisplayName: displayName ? String(displayName) : "",
-      // send under both names so Swift side can read whichever it expects
+      callerDisplayName: callerName,
       sdpOffer: String(sdpOffer),
-      sdp: String(sdpOffer),
-    });
+      sdp: String(sdpOffer)
+    };
+
+    const message = {
+      tokens,
+      
+      // ✅ Visible notification for iOS
+      notification: {
+        title: "Incoming Call",
+        body: `${callerName} is calling you`
+      },
+      
+      // Data payload
+      data: dataPayload,
+      
+      // Android: high priority
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "calls",
+          priority: "max",
+          defaultSound: true,
+          defaultVibrateTimings: true
+        }
+      },
+      
+      // ✅ iOS: alert push with high priority
+      apns: {
+        headers: {
+          "apns-push-type": "alert",   // ← Changed from "background"
+          "apns-priority": "10"         // ← High priority (10 = immediate)
+        },
+        payload: {
+          aps: {
+            alert: {
+              title: "Incoming Call",
+              body: `${callerName} is calling you`
+            },
+            sound: "default",           // ← Play sound
+            badge: 1,
+            "content-available": 1,     // Also wake the app
+            category: "CALL_INCOMING"   // Optional: for actionable notifications
+          },
+          // Mirror data into APNs payload
+          type: "call_offer",
+          callId: String(callId),
+          callerMessagingId: String(fromMessagingId),
+          callerDisplayName: callerName,
+          sdpOffer: String(sdpOffer),
+          sdp: String(sdpOffer)
+        }
+      }
+    };
+
+    const resp = await admin.messaging().sendEachForMulticast(message);
+    console.log(
+      "✅ FCM call_offer push →",
+      resp.successCount,
+      "success,",
+      resp.failureCount,
+      "failure"
+    );
 
     return res.json({ ok: true });
   } catch (err) {

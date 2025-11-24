@@ -17,7 +17,7 @@ process.on('unhandledRejection', err => {
 
 
 // === Call device mapping ===
-// messagingId (base64 pubkey) -> Set<FCM token>
+// messagingId (base64 pubkey) -> Set<FCM token> (for calls)
 const callDeviceMap = new Map();
 
 function addDeviceTokenForMessagingId(messagingId, token) {
@@ -32,15 +32,41 @@ function addDeviceTokenForMessagingId(messagingId, token) {
   console.log("🔄 callDeviceMap updated for", messagingId, "tokens:", set.size);
 }
 
+// NOTE: we prefer callDeviceMap, but fall back to messagingTokensById (chat) if needed.
 async function getDeviceTokensForMessagingId(messagingId) {
-  const set = callDeviceMap.get(messagingId);
-  if (!set) {
-    console.warn("ℹ️ No FCM tokens for messagingId", messagingId,
-                 "map keys:", Array.from(callDeviceMap.keys()));
-    return [];
+  if (!messagingId) return [];
+
+  // 1) primary: explicit call registration
+  const callSet = callDeviceMap.get(messagingId);
+  if (callSet && callSet.size > 0) {
+    return Array.from(callSet);
   }
-  return Array.from(set);
+
+  // 2) fallback: chat registration (messagingTokensById is defined later)
+  try {
+    if (typeof messagingTokensById === 'object' && messagingTokensById !== null) {
+      const tokenSet = messagingTokensById[messagingId];
+      if (tokenSet && tokenSet.size > 0) {
+        console.warn(
+          "ℹ️ getDeviceTokensForMessagingId fallback to messagingTokensById for",
+          messagingId
+        );
+        return Array.from(tokenSet);
+      }
+    }
+  } catch (_) {
+    // if messagingTokensById not defined yet at runtime, just ignore
+  }
+
+  console.warn(
+    "ℹ️ No FCM tokens for messagingId",
+    messagingId,
+    "call map keys:",
+    Array.from(callDeviceMap.keys())
+  );
+  return [];
 }
+
 
 
 
@@ -1259,17 +1285,16 @@ app.post("/calls/register", (req, res) => {
 
 // ---------------------- Call signaling (WebRTC-style) ----------------------
 
-// POST /calls/offer
-// Body: { callId?, fromMessagingId, toMessagingId, sdpOffer, displayName? }
-// === CALLS: send offer to callee ===
+
+// === CALLS: outgoing offer ===
 //
-// POST /calls/offer
+// iOS sends POST /calls/offer with:
 // {
-//   "callId": "uuid",
-//   "fromMessagingId": "...",
-//   "toMessagingId": "...",
-//   "sdpOffer": "...",
-//   "displayName": "Caller Name"
+//   callId: "uuid",
+//   fromMessagingId: "base64 pubkey (caller)",
+//   toMessagingId: "base64 pubkey (callee)",
+//   sdpOffer: "…",
+//   displayName: "Caller Name"
 // }
 app.post("/calls/offer", async (req, res) => {
   try {
@@ -1295,15 +1320,13 @@ app.post("/calls/offer", async (req, res) => {
       (toMessagingId || "").slice(0, 12) + "…"
     );
 
-    const dataPayload = {
+    await pushToMessagingId(toMessagingId, {
       type: "call_offer",
       callId: String(callId),
       callerMessagingId: String(fromMessagingId),
       callerDisplayName: displayName ? String(displayName) : "",
       sdpOffer: String(sdpOffer)
-    };
-
-    await pushToMessagingId(toMessagingId, dataPayload);
+    });
 
     return res.json({ ok: true });
   } catch (err) {
@@ -1314,46 +1337,28 @@ app.post("/calls/offer", async (req, res) => {
 
 
 
-// === Answer a call ===
-//
-// iOS can send either:
-// { callId, fromMessagingId, toMessagingId, sdpAnswer }
-// or:
-// { callId, callerMessagingId, calleeMessagingId, sdpAnswer }
+
 app.post('/calls/answer', async (req, res) => {
   try {
-    const {
-      callId,
-      sdpAnswer,
-      // new shape
-      fromMessagingId,
-      toMessagingId,
-      // alt shape
-      callerMessagingId,
-      calleeMessagingId
-    } = req.body || {};
-
-    const callerId = callerMessagingId || fromMessagingId || "";
-    const calleeId = calleeMessagingId || toMessagingId || "";
+    const { callId, callerMessagingId, calleeMessagingId, sdpAnswer } = req.body;
 
     console.log(
       "📞 /calls/answer",
       callId,
       "from",
-      calleeId || "(unknown callee)",
+      calleeMessagingId,
       "→",
-      callerId || "(unknown caller)"
+      callerMessagingId
     );
 
-    if (!callId || !callerId || !sdpAnswer) {
-      console.error("❌ /calls/answer missing fields:", req.body);
+    if (!callId || !callerMessagingId || !sdpAnswer) {
       return res.status(400).json({ error: "missing_fields" });
     }
 
-    await pushToMessagingId(callerId, {
+    await pushToMessagingId(callerMessagingId, {
       type: "call_answer",
-      callId: String(callId),
-      sdpAnswer: String(sdpAnswer)
+      callId,
+      sdpAnswer
     });
 
     return res.json({ ok: true });
@@ -1365,6 +1370,18 @@ app.post('/calls/answer', async (req, res) => {
 
 
 
+
+// === CALLS: ICE candidates ===
+//
+// iOS sends POST /calls/ice with:
+// {
+//   callId: "uuid",
+//   fromMessagingId: "sender pubkey",
+//   toMessagingId: "receiver pubkey",
+//   sdp: "candidate sdp",
+//   sdpMLineIndex: 0,
+//   sdpMid: "0"
+// }
 app.post("/calls/ice", async (req, res) => {
   try {
     const {
@@ -1384,9 +1401,11 @@ app.post("/calls/ice", async (req, res) => {
     const dataPayload = {
       type: "call_ice",
       callId: String(callId),
+      fromMessagingId: String(fromMessagingId),
+      toMessagingId: String(toMessagingId),
       sdp: String(sdp),
       sdpMLineIndex: String(sdpMLineIndex ?? "0"),
-      sdpMid: sdpMid != null ? String(sdpMid) : "0"
+      sdpMid: sdpMid != null ? String(sdpMid) : ""
     };
 
     await pushToMessagingId(toMessagingId, dataPayload);
@@ -1400,9 +1419,9 @@ app.post("/calls/ice", async (req, res) => {
 
 
 
+
 // POST /calls/candidate
 // Body: { callId, fromMessagingId, toMessagingId, candidateJson }
-// - candidateJson is a stringified ICE candidate (client just forwards it).
 app.post('/calls/candidate', async (req, res) => {
   try {
     const callId          = String(req.body?.callId || '').trim();
@@ -1411,18 +1430,11 @@ app.post('/calls/candidate', async (req, res) => {
     const candidateJson   = String(req.body?.candidateJson || '').trim();
 
     if (!callId || !fromMessagingId || !toMessagingId || !candidateJson) {
-      return res.status(400).json({
-        success: false,
-        error: 'callId, fromMessagingId, toMessagingId, candidateJson required'
-      });
+      return res.status(400).json({ success: false, error: 'callId, fromMessagingId, toMessagingId, candidateJson required' });
     }
 
     const call = callsById[callId];
-    if (call) {
-      call.lastUpdate = Date.now();
-    } else {
-      console.warn('⚠️ /calls/candidate unknown callId', callId);
-    }
+    if (call) call.lastUpdate = Date.now();
 
     await pushToMessagingId(toMessagingId, {
       type: 'call_candidate',
@@ -1440,6 +1452,7 @@ app.post('/calls/candidate', async (req, res) => {
 });
 
 
+
 // POST /calls/hangup
 // Body: { callId, fromMessagingId, toMessagingId, reason? }
 app.post('/calls/hangup', async (req, res) => {
@@ -1450,10 +1463,7 @@ app.post('/calls/hangup', async (req, res) => {
     const reason          = String(req.body?.reason || 'hangup').trim();
 
     if (!callId || !fromMessagingId || !toMessagingId) {
-      return res.status(400).json({
-        success: false,
-        error: 'callId, fromMessagingId, toMessagingId required'
-      });
+      return res.status(400).json({ success: false, error: 'callId, fromMessagingId, toMessagingId required' });
     }
 
     const call = callsById[callId];
@@ -1463,9 +1473,7 @@ app.post('/calls/hangup', async (req, res) => {
       call.lastUpdate = call.endedAt;
     }
 
-    console.log(
-      `📵 /calls/hangup ${callId} from ${fromMessagingId.slice(0, 12)}… reason=${reason}`
-    );
+    console.log(`📵 /calls/hangup ${callId} from ${fromMessagingId.slice(0, 12)}… reason=${reason}`);
 
     await pushToMessagingId(toMessagingId, {
       type: 'call_hangup',
@@ -1484,57 +1492,6 @@ app.post('/calls/hangup', async (req, res) => {
   }
 });
 
-
-
-
-// === CALLS: outgoing offer ===
-app.post("/calls/offer", async (req, res) => {
-  try {
-    const {
-      callId,
-      sdpOffer,
-      // new shape
-      fromMessagingId,
-      toMessagingId,
-      // alt shape
-      callerMessagingId,
-      calleeMessagingId,
-      displayName
-    } = req.body || {};
-
-    const callerId = fromMessagingId || callerMessagingId || "";
-    const calleeId = toMessagingId || calleeMessagingId || "";
-
-    if (!callId || !callerId || !calleeId || !sdpOffer) {
-      console.error("❌ /calls/offer missing fields:", req.body);
-      return res.status(400).json({ error: "missing required fields" });
-    }
-
-    console.log(
-      "📞 /calls/offer",
-      callId,
-      "from",
-      callerId.slice(0, 12) + "…",
-      "→",
-      calleeId.slice(0, 12) + "…"
-    );
-
-    const dataPayload = {
-      type: "call_offer",
-      callId: String(callId),
-      callerMessagingId: String(callerId),
-      callerDisplayName: displayName ? String(displayName) : "",
-      sdpOffer: String(sdpOffer)
-    };
-
-    await pushToMessagingId(calleeId, dataPayload);
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("🔥 /calls/offer error:", err);
-    return res.status(500).json({ error: "internal_error" });
-  }
-});
 
 
 

@@ -1376,15 +1376,13 @@ app.post("/calls/ice", async (req, res) => {
       sdpMid: sdpMid != null ? String(sdpMid) : ""
     };
 
-    const message = {
-      tokens,
-      data: dataPayload
-    };
+    // Reuse the same helper that /calls/offer uses
+    await pushToMessagingId(toMessagingId, dataPayload);
 
-    const resp = await admin.messaging().sendMulticast(message);
-    console.log("✅ /calls/ice FCM sent:", resp.successCount, "success,", resp.failureCount, "failure");
+    return res.json({ ok: true });
+    
 
-    return res.json({ ok: true, fcm: resp });
+
   } catch (err) {
     console.error("🔥 /calls/ice error:", err);
     return res.status(500).json({ error: "internal_error" });

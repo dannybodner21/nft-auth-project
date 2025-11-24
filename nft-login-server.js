@@ -1199,6 +1199,46 @@ app.post('/messages/send', async (req, res) => {
   }
 });
 
+app.post('/messages/ack', async (req, res) => {
+  try {
+    const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
+    const messageIds = req.body?.messageIds;
+
+    if (!recipientMessagingId || !Array.isArray(messageIds) || messageIds.length === 0) {
+      return res.status(400).json({ success: false, error: 'recipientMessagingId and messageIds[] required' });
+    }
+
+    const key = `pending_msgs:${recipientMessagingId}`;
+    
+    // Get all messages
+    const rawMessages = await redis.lrange(key, 0, -1);
+    
+    // Filter out acknowledged ones
+    const remaining = rawMessages.filter(m => {
+      try {
+        const parsed = JSON.parse(m);
+        return !messageIds.includes(parsed.id);
+      } catch {
+        return false;
+      }
+    });
+
+    // Replace list with remaining messages
+    await redis.del(key);
+    if (remaining.length > 0) {
+      await redis.rpush(key, ...remaining);
+      await redis.expire(key, 7 * 24 * 60 * 60);
+    }
+
+    console.log(`✅ ACK ${messageIds.length} messages for ${recipientMessagingId.slice(0, 16)}… (${remaining.length} remaining)`);
+
+    return res.json({ success: true, acknowledged: messageIds.length });
+  } catch (err) {
+    console.error('❌ /messages/ack error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
 
 // POST /messages/sync
 // Body: { recipientMessagingId }
@@ -1212,10 +1252,9 @@ app.post('/messages/sync', async (req, res) => {
 
     const key = `pending_msgs:${recipientMessagingId}`;
     
-    // Get all pending messages
+    // Get all pending messages (but don't delete)
     const rawMessages = await redis.lrange(key, 0, -1);
     
-    // Parse JSON strings back to objects
     const messages = rawMessages.map(m => {
       try {
         return JSON.parse(m);
@@ -1224,12 +1263,7 @@ app.post('/messages/sync', async (req, res) => {
       }
     }).filter(Boolean);
 
-    // Delete after successful read
-    if (messages.length > 0) {
-      await redis.del(key);
-    }
-
-    console.log(`📤 Sync for recipient ${recipientMessagingId.slice(0, 16)}… returned=${messages.length}`);
+    console.log(`📤 Sync for ${recipientMessagingId.slice(0, 16)}… returned=${messages.length}`);
 
     res.setHeader('Cache-Control', 'no-store');
     return res.json({ success: true, messages });

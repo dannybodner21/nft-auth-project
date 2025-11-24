@@ -1119,106 +1119,81 @@ async function pushToMessagingId(messagingId, data) {
 
 // POST /messages/send
 // Body: { senderMessagingId, recipientMessagingId, messageId, timestamp, ciphertextB64 }
-app.post('/messages/send', (req, res) => {
+app.post('/messages/send', async (req, res) => {
   try {
-    const senderMessagingId    = String(req.body?.senderMessagingId || '').trim();
-    const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
-    const messageId            = String(req.body?.messageId || '').trim();
-    const tsRaw                = req.body?.timestamp;
-    const ciphertextB64        = String(req.body?.ciphertextB64 || '').trim();
+      const senderMessagingId    = String(req.body?.senderMessagingId || '').trim();
+      const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
+      const messageId            = String(req.body?.messageId || '').trim();
+      const tsRaw                = req.body?.timestamp;
+      const ciphertextB64        = String(req.body?.ciphertextB64 || '').trim();
 
-    if (!senderMessagingId || !recipientMessagingId || !messageId || !ciphertextB64) {
-      return res.status(400).json({ success: false, error: 'Missing fields' });
-    }
+      if (!senderMessagingId || !recipientMessagingId || !messageId || !ciphertextB64) {
+          return res.status(400).json({ success: false, error: 'Missing fields' });
+      }
 
-    // Basic length sanity checks to avoid garbage
-    if (
-      senderMessagingId.length > 256 ||
-      recipientMessagingId.length > 256 ||
-      messageId.length > 128
-    ) {
-      return res.status(400).json({ success: false, error: 'Bad id length' });
-    }
+      if (
+          senderMessagingId.length > 256 ||
+          recipientMessagingId.length > 256 ||
+          messageId.length > 128
+      ) {
+          return res.status(400).json({ success: false, error: 'Bad id length' });
+      }
 
-    const ts = Number(tsRaw) > 0 ? Number(tsRaw) : Date.now();
+      const ts = Number(tsRaw) > 0 ? Number(tsRaw) : Date.now();
 
-    const msg = {
-      id: messageId,
-      ts,
-      senderMessagingId,
-      ciphertextB64
-      // NO plaintext, NO alias, NO fromMe flag – clients infer everything
-    };
-
-    if (!messagesByRecipient[recipientMessagingId]) {
-      messagesByRecipient[recipientMessagingId] = [];
-    }
-
-    // Append, but cap queue size per recipient to avoid unbounded growth
-    messagesByRecipient[recipientMessagingId].push(msg);
-    if (messagesByRecipient[recipientMessagingId].length > 200) {
-      messagesByRecipient[recipientMessagingId].shift(); // drop oldest
-    }
-
-    console.log(
-      `📨 Stored message for recipient ${recipientMessagingId.slice(
-        0,
-        12
-      )}… (queue size=${messagesByRecipient[recipientMessagingId].length})`
-    );
-
-    // ==== NEW: fire-and-forget push notification for chat ====
-    const tokenSet = messagingTokensById[recipientMessagingId];
-    const count = tokenSet ? tokenSet.size : 0;
-    console.log(
-      `🔔 Chat push lookup for ${recipientMessagingId.slice(0, 12)}… tokens=${count}`
-    );
-
-    if (tokenSet && tokenSet.size > 0) {
-      const tokens = Array.from(tokenSet);
-
-      const baseMsg = {
-        notification: {
-          title: 'NFTAuth Messenger',
-          body: 'New encrypted message'
-        },
-        data: {
-          type: 'message',
+      const msg = {
+          id: messageId,
+          ts,
           senderMessagingId,
-          messageId
-        }
+          ciphertextB64
       };
 
-      tokens.forEach((token) => {
-        admin
-          .messaging()
-          .send({ token, ...baseMsg })
-          .then((id) => {
-            console.log(
-              `📨 FCM chat push sent to ${token.slice(0, 12)}…: ${id}`
-            );
-          })
-          .catch((err) => {
-            console.warn(
-              '⚠️ FCM chat push failed:',
-              err.message || err
-            );
-          });
-      });
-    } else {
-      console.log(
-        `ℹ️ No registered messaging tokens for ${recipientMessagingId.slice(
-          0,
-          12
-        )}…`
-      );
-    }
-    // =========================================================
+      // Store message in memory (we'll migrate this to Redis next)
+      if (!messagesByRecipient[recipientMessagingId]) {
+          messagesByRecipient[recipientMessagingId] = [];
+      }
+      messagesByRecipient[recipientMessagingId].push(msg);
+      if (messagesByRecipient[recipientMessagingId].length > 200) {
+          messagesByRecipient[recipientMessagingId].shift();
+      }
 
-    return res.json({ success: true });
+      console.log(`📨 Stored message for recipient ${recipientMessagingId.slice(0, 16)}… (queue size=${messagesByRecipient[recipientMessagingId].length})`);
+
+      // ✅ NEW: Get tokens from Redis instead of in-memory object
+      const tokens = await redis.smembers(`msg_tokens:${recipientMessagingId}`);
+      console.log(`🔔 Chat push lookup for ${recipientMessagingId.slice(0, 16)}… tokens=${tokens.length}`);
+
+      if (tokens && tokens.length > 0) {
+          const baseMsg = {
+              notification: {
+                  title: 'NFTAuth Messenger',
+                  body: 'New encrypted message'
+              },
+              data: {
+                  type: 'message',
+                  senderMessagingId,
+                  messageId
+              }
+          };
+
+          for (const token of tokens) {
+              admin.messaging()
+                  .send({ token, ...baseMsg })
+                  .then((id) => {
+                      console.log(`📨 FCM chat push sent to ${token.slice(0, 12)}…: ${id}`);
+                  })
+                  .catch((err) => {
+                      console.warn('⚠️ FCM chat push failed:', err.message || err);
+                  });
+          }
+      } else {
+          console.log(`ℹ️ No registered messaging tokens for ${recipientMessagingId.slice(0, 16)}…`);
+      }
+
+      return res.json({ success: true });
   } catch (err) {
-    console.error('❌ /messages/send crashed:', err);
-    return res.status(500).json({ success: false, error: 'internal_error' });
+      console.error('❌ /messages/send crashed:', err);
+      return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
 

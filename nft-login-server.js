@@ -1314,36 +1314,46 @@ app.post("/calls/offer", async (req, res) => {
 
 
 
-// iOS sends POST /calls/answer with:
-// {
-//   callId: "uuid",
-//   fromMessagingId: "callee pubkey",
-//   toMessagingId: "caller pubkey",
-//   sdpAnswer: "…"
-// }
 // === Answer a call ===
+//
+// iOS can send either:
+// { callId, fromMessagingId, toMessagingId, sdpAnswer }
+// or:
+// { callId, callerMessagingId, calleeMessagingId, sdpAnswer }
 app.post('/calls/answer', async (req, res) => {
   try {
-    const { callId, callerMessagingId, calleeMessagingId, sdpAnswer } = req.body;
+    const {
+      callId,
+      sdpAnswer,
+      // new shape
+      fromMessagingId,
+      toMessagingId,
+      // alt shape
+      callerMessagingId,
+      calleeMessagingId
+    } = req.body || {};
+
+    const callerId = callerMessagingId || fromMessagingId || "";
+    const calleeId = calleeMessagingId || toMessagingId || "";
 
     console.log(
       "📞 /calls/answer",
       callId,
       "from",
-      calleeMessagingId,
+      calleeId || "(unknown callee)",
       "→",
-      callerMessagingId
+      callerId || "(unknown caller)"
     );
 
-    if (!callId || !callerMessagingId || !sdpAnswer) {
+    if (!callId || !callerId || !sdpAnswer) {
+      console.error("❌ /calls/answer missing fields:", req.body);
       return res.status(400).json({ error: "missing_fields" });
     }
 
-    // Re-use your working FCM helper
-    await pushToMessagingId(callerMessagingId, {
+    await pushToMessagingId(callerId, {
       type: "call_answer",
-      callId,
-      sdpAnswer
+      callId: String(callId),
+      sdpAnswer: String(sdpAnswer)
     });
 
     return res.json({ ok: true });
@@ -1354,17 +1364,7 @@ app.post('/calls/answer', async (req, res) => {
 });
 
 
-// === CALLS: ICE candidates ===
-//
-// iOS sends POST /calls/ice with:
-// {
-//   callId: "uuid",
-//   fromMessagingId: "sender pubkey",
-//   toMessagingId: "receiver pubkey",
-//   sdp: "candidate sdp",
-//   sdpMLineIndex: 0,
-//   sdpMid: "0"
-// }
+
 app.post("/calls/ice", async (req, res) => {
   try {
     const {
@@ -1381,28 +1381,17 @@ app.post("/calls/ice", async (req, res) => {
       return res.status(400).json({ error: "missing required fields" });
     }
 
-    const tokens = await getDeviceTokensForMessagingId(toMessagingId);
-    if (!tokens || tokens.length === 0) {
-      console.warn("⚠️ /calls/ice: no device tokens for", toMessagingId);
-      return res.status(404).json({ error: "no devices for peer" });
-    }
-
     const dataPayload = {
       type: "call_ice",
       callId: String(callId),
       sdp: String(sdp),
-      // normalize to string so iOS can parse flexibly
-      sdpMLineIndex: String(sdpMLineIndex),
-      sdpMid: sdpMid != null ? String(sdpMid) : ""
+      sdpMLineIndex: String(sdpMLineIndex ?? "0"),
+      sdpMid: sdpMid != null ? String(sdpMid) : "0"
     };
 
-    // Reuse the same helper that /calls/offer uses
     await pushToMessagingId(toMessagingId, dataPayload);
 
     return res.json({ ok: true });
-    
-
-
   } catch (err) {
     console.error("🔥 /calls/ice error:", err);
     return res.status(500).json({ error: "internal_error" });
@@ -1410,10 +1399,11 @@ app.post("/calls/ice", async (req, res) => {
 });
 
 
+
 // POST /calls/candidate
 // Body: { callId, fromMessagingId, toMessagingId, candidateJson }
 // - candidateJson is a stringified ICE candidate (client just forwards it).
-app.post('/calls/candidate', (req, res) => {
+app.post('/calls/candidate', async (req, res) => {
   try {
     const callId          = String(req.body?.callId || '').trim();
     const fromMessagingId = String(req.body?.fromMessagingId || '').trim();
@@ -1421,27 +1411,25 @@ app.post('/calls/candidate', (req, res) => {
     const candidateJson   = String(req.body?.candidateJson || '').trim();
 
     if (!callId || !fromMessagingId || !toMessagingId || !candidateJson) {
-      return res.status(400).json({ success: false, error: 'callId, fromMessagingId, toMessagingId, candidateJson required' });
+      return res.status(400).json({
+        success: false,
+        error: 'callId, fromMessagingId, toMessagingId, candidateJson required'
+      });
     }
 
     const call = callsById[callId];
-    if (!call) {
-      console.warn('⚠️ /calls/candidate unknown callId', callId);
-      // still accept for stateless relaying
-    } else {
+    if (call) {
       call.lastUpdate = Date.now();
+    } else {
+      console.warn('⚠️ /calls/candidate unknown callId', callId);
     }
 
-    // Relay ICE candidate to the peer
-    pushToMessagingId(toMessagingId, {
-      notification: null,
-      data: {
-        type: 'call_candidate',
-        callId,
-        fromMessagingId,
-        toMessagingId,
-        candidateJson
-      }
+    await pushToMessagingId(toMessagingId, {
+      type: 'call_candidate',
+      callId,
+      fromMessagingId,
+      toMessagingId,
+      candidateJson
     });
 
     return res.json({ success: true });
@@ -1451,9 +1439,10 @@ app.post('/calls/candidate', (req, res) => {
   }
 });
 
+
 // POST /calls/hangup
 // Body: { callId, fromMessagingId, toMessagingId, reason? }
-app.post('/calls/hangup', (req, res) => {
+app.post('/calls/hangup', async (req, res) => {
   try {
     const callId          = String(req.body?.callId || '').trim();
     const fromMessagingId = String(req.body?.fromMessagingId || '').trim();
@@ -1461,31 +1450,31 @@ app.post('/calls/hangup', (req, res) => {
     const reason          = String(req.body?.reason || 'hangup').trim();
 
     if (!callId || !fromMessagingId || !toMessagingId) {
-      return res.status(400).json({ success: false, error: 'callId, fromMessagingId, toMessagingId required' });
+      return res.status(400).json({
+        success: false,
+        error: 'callId, fromMessagingId, toMessagingId required'
+      });
     }
 
     const call = callsById[callId];
     if (call) {
-      call.status    = 'ended';
-      call.endedAt   = Date.now();
+      call.status     = 'ended';
+      call.endedAt    = Date.now();
       call.lastUpdate = call.endedAt;
     }
 
-    console.log(`📵 /calls/hangup ${callId} from ${fromMessagingId.slice(0, 12)}… reason=${reason}`);
+    console.log(
+      `📵 /calls/hangup ${callId} from ${fromMessagingId.slice(0, 12)}… reason=${reason}`
+    );
 
-    // Notify peer
-    pushToMessagingId(toMessagingId, {
-      notification: null,
-      data: {
-        type: 'call_hangup',
-        callId,
-        fromMessagingId,
-        toMessagingId,
-        reason
-      }
+    await pushToMessagingId(toMessagingId, {
+      type: 'call_hangup',
+      callId,
+      fromMessagingId,
+      toMessagingId,
+      reason
     });
 
-    // We can drop the call immediately or let cleanup sweep it
     delete callsById[callId];
 
     return res.json({ success: true });
@@ -1497,59 +1486,56 @@ app.post('/calls/hangup', (req, res) => {
 
 
 
+
 // === CALLS: outgoing offer ===
-//
-// iOS sends POST /calls/offer with:
-// {
-//   callId: "uuid",
-//   fromMessagingId: "base64 pubkey",
-//   toMessagingId: "base64 pubkey",
-//   sdpOffer: "…",
-//   displayName: "Caller Name"
-// }
 app.post("/calls/offer", async (req, res) => {
   try {
     const {
       callId,
+      sdpOffer,
+      // new shape
       fromMessagingId,
       toMessagingId,
-      sdpOffer,
+      // alt shape
+      callerMessagingId,
+      calleeMessagingId,
       displayName
     } = req.body || {};
 
-    if (!callId || !fromMessagingId || !toMessagingId || !sdpOffer) {
+    const callerId = fromMessagingId || callerMessagingId || "";
+    const calleeId = toMessagingId || calleeMessagingId || "";
+
+    if (!callId || !callerId || !calleeId || !sdpOffer) {
       console.error("❌ /calls/offer missing fields:", req.body);
       return res.status(400).json({ error: "missing required fields" });
     }
 
-    const tokens = await getDeviceTokensForMessagingId(toMessagingId);
-    if (!tokens || tokens.length === 0) {
-      console.warn("⚠️ /calls/offer: no device tokens for", toMessagingId);
-      return res.status(404).json({ error: "no devices for callee" });
-    }
+    console.log(
+      "📞 /calls/offer",
+      callId,
+      "from",
+      callerId.slice(0, 12) + "…",
+      "→",
+      calleeId.slice(0, 12) + "…"
+    );
 
     const dataPayload = {
       type: "call_offer",
       callId: String(callId),
-      callerMessagingId: String(fromMessagingId),
+      callerMessagingId: String(callerId),
       callerDisplayName: displayName ? String(displayName) : "",
       sdpOffer: String(sdpOffer)
     };
 
-    const message = {
-      tokens,
-      data: dataPayload
-    };
+    await pushToMessagingId(calleeId, dataPayload);
 
-    const resp = await admin.messaging().sendMulticast(message);
-    console.log("✅ /calls/offer FCM sent:", resp.successCount, "success,", resp.failureCount, "failure");
-
-    return res.json({ ok: true, fcm: resp });
+    return res.json({ ok: true });
   } catch (err) {
     console.error("🔥 /calls/offer error:", err);
     return res.status(500).json({ error: "internal_error" });
   }
 });
+
 
 
 

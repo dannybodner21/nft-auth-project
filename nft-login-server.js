@@ -8,9 +8,11 @@ const fs = require('fs');
 const crypto = require('crypto');
 
 const jwt = require('jsonwebtoken');
-// TODO: DON'T FORGET TO CHANGE BELOW VALUE
+
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET || 'CHANGE_ME_IN_PROD';
 const AUTH_JWT_TTL_SECONDS = 5 * 60; // 5 minutes
+const LOGIN_TOKEN_SECRET   = process.env.LOGIN_TOKEN_SECRET || 'CHANGE_ME_IN_PROD';
+const LOGIN_TOKEN_TTL_SEC  = 5 * 60; // 5 minutes
 
 const Redis = require('ioredis');
 
@@ -116,6 +118,19 @@ async function verifyPersonaBinding({ emailNorm, address, deviceFpr }) {
     console.error('❌ verifyPersonaBinding error:', e);
     return { ok: false, reason: 'error', error: String(e.message || e) };
   }
+}
+
+function makeLoginToken({ emailNorm, deviceHash, origin, nonce }) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const payload = {
+    sub: emailNorm,          // subject = user (hashed email already tracked server-side)
+    aud: origin,             // relying-party origin
+    iat: nowSec,
+    exp: nowSec + LOGIN_TOKEN_TTL_SEC,
+    nonce,                   // for replay protection
+    deviceHash               // hash of device identifier / pubkey
+  };
+  return jwt.sign(payload, LOGIN_TOKEN_SECRET, { algorithm: 'HS256' });
 }
 
 
@@ -458,6 +473,8 @@ let userCredentials = {};        // { email: [ ... ] }
 let pendingDecrypts = {};        // { txId: { ... } }
 let sessionApprovals = {};       // { email: expiryMs }
 let pendingCardChallenges = {};  // { emailNorm: { challenge, expiresAt } }
+const loginChallenges = Object.create(null); // nonce → challenge record
+
 
 // E2EE messaging: in-memory, deliver-once queues keyed by recipient messaging ID
 // messagesByRecipient[recipientMessagingId] = [ { id, ts, senderMessagingId, ciphertextB64 } ]
@@ -996,6 +1013,24 @@ app.post('/request-login', async (req, res) => {
     extSession: null
   };
 
+  // --- Nonce-based challenge for this login ---
+  const challengeNonce = crypto.randomBytes(16).toString('hex');
+  const challengeExpiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
+  
+  const hashedEmail = crypto
+    .createHash('sha256')
+    .update(emailNorm)
+    .digest('hex');
+  
+  const relyingPartyOrigin = websiteDomain || 'unknown';
+  
+  loginChallenges[challengeNonce] = {
+    challengeRequestId: requestId,
+    hashedEmail,
+    challengeExpiresAt,
+    relyingPartyOrigin
+  };  
+
   const user = await db.getUserByEmail(emailNorm);
   const deviceToken = user?.deviceToken;
   if (!deviceToken) return res.status(404).json({ error: 'No device token registered' });
@@ -1011,7 +1046,13 @@ app.post('/request-login', async (req, res) => {
   try {
     await admin.messaging().send(message);
     console.log(`✅ Push sent to ${emailNorm} (${requestId})`);
-    res.json({ success: true, requestId });
+    res.json({
+      success: true,
+      requestId,
+      challengeNonce,
+      challengeExpiresAt
+    });
+
   } catch (error) {
     console.error("❌ FCM error:", error);
     res.status(500).json({ success: false, error: "Failed to send push notification" });
@@ -1082,6 +1123,58 @@ app.get('/get-session-handshake/:requestId', (req, res) => {
   if (!r.extSession) return res.json({ success: true, found: false, status: 'awaiting_handshake' });
   const { keyId, eph, salt } = r.extSession || {};
   return res.json({ success: true, found: true, email: r.email, websiteDomain: r.websiteDomain || null, keyId, eph, salt });
+});
+
+app.post('/issue-login-token', (req, res) => {
+  try {
+    const { requestId, nonce } = req.body || {};
+    const originHeader = req.headers.origin || req.body?.origin || null;
+
+    if (!requestId || !nonce) {
+      return res.status(400).json({ success: false, error: 'requestId and nonce required' });
+    }
+
+    const login = pendingLogins[requestId];
+    const challenge = loginChallenges[nonce];
+
+    if (!login || !challenge) {
+      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
+    }
+    if (challenge.challengeRequestId !== requestId) {
+      return res.status(400).json({ success: false, error: 'mismatched challenge' });
+    }
+    if (Date.now() > challenge.challengeExpiresAt) {
+      delete loginChallenges[nonce];
+      return res.status(400).json({ success: false, error: 'challenge expired' });
+    }
+    if (login.status !== 'approved') {
+      return res.status(409).json({ success: false, error: 'login not approved' });
+    }
+
+    // Derive a device hash from the devicePublicKeyJwk if present
+    let deviceHash = null;
+    if (login.devicePublicKeyJwk) {
+      const serialized = JSON.stringify(login.devicePublicKeyJwk);
+      deviceHash = crypto.createHash('sha256').update(serialized).digest('hex');
+    }
+
+    const relyingPartyOrigin = originHeader || challenge.relyingPartyOrigin || 'unknown';
+
+    const token = makeLoginToken({
+      emailNorm: login.email,
+      deviceHash,
+      origin: relyingPartyOrigin,
+      nonce
+    });
+
+    // One-shot nonce
+    delete loginChallenges[nonce];
+
+    return res.json({ success: true, token, expiresIn: LOGIN_TOKEN_TTL_SEC });
+  } catch (e) {
+    console.error('❌ /issue-login-token error:', e);
+    return res.status(500).json({ success: false, error: 'token_issue_failed' });
+  }
 });
 
 // Pre-registration check - make sure email is not already registered
@@ -1954,6 +2047,12 @@ setInterval(() => {
   }
   for (const [k, v] of Object.entries(pendingLogins)) {
     if (now - (v.timestamp || 0) > 10 * 60_000) delete pendingLogins[k];
+  }
+  // Cleanup expired login challenges
+  for (const [nonce, rec] of Object.entries(loginChallenges)) {
+    if (!rec || now > (rec.challengeExpiresAt || 0)) {
+      delete loginChallenges[nonce];
+    }
   }
   for (const [email, exp] of Object.entries(sessionApprovals)) {
     if (Date.now() > exp) delete sessionApprovals[email];

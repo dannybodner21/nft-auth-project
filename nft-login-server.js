@@ -7,6 +7,10 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
+const jwt = require('jsonwebtoken');
+// TODO: DON'T FORGET TO CHANGE BELOW VALUE
+const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET || 'CHANGE_ME_IN_PROD';
+const AUTH_JWT_TTL_SECONDS = 5 * 60; // 5 minutes
 
 const Redis = require('ioredis');
 
@@ -28,6 +32,93 @@ process.on('uncaughtException', err => {
 process.on('unhandledRejection', err => {
   console.error("🔥 Unhandled Promise Rejection:", err);
 });
+
+
+// Issue a signed auth token bound to a specific relying-party origin
+function issueAuthToken({
+  emailNorm,
+  origin,          // e.g. "https://nftauthproject.com"
+  deviceHash = null,
+  nonce,           // random per-login
+  lifetimeSec = 600
+}) {
+  if (!origin || !origin.startsWith('http')) {
+    throw new Error('origin required for auth token');
+  }
+  if (!nonce) {
+    throw new Error('nonce required for auth token');
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    sub: emailNorm,
+    aud: origin,           // relying-party origin
+    iss: 'nftauthproject-login-relay',
+    iat: now,
+    exp: now + lifetimeSec,
+    nonce,
+    deviceHash: deviceHash || null
+  };
+
+  return jwt.sign(payload, AUTH_JWT_SECRET, { algorithm: 'HS256' });
+}
+
+
+// --- Helper: strict NFT + email + device binding check ---
+async function verifyPersonaBinding({ emailNorm, address, deviceFpr }) {
+  try {
+    if (!provider || !CONTRACT_ADDRESS) {
+      console.warn('⚠️ verifyPersonaBinding: contract/provider not configured');
+      return { ok: false, reason: 'not_configured' };
+    }
+
+    const addr = String(address || '').trim();
+    if (!addr || !ethers.utils.isAddress(addr)) {
+      return { ok: false, reason: 'bad_address' };
+    }
+
+    const readAbi = [
+      "function balanceOf(address owner) view returns (uint256)",
+      "function tokenOf(address user) view returns (uint256)",
+      "function identityOf(uint256 tokenId) view returns (bytes32 userIdHash, bytes32 deviceHash, bool valid)"
+    ];
+    const personaRead = new ethers.Contract(CONTRACT_ADDRESS, readAbi, provider);
+
+    const bal = await personaRead.balanceOf(addr);
+    const owned = bal.gt ? bal.gt(0) : (BigInt(bal) > 0n);
+    if (!owned) {
+      return { ok: false, reason: 'no_nft' };
+    }
+
+    const tokenId = await personaRead.tokenOf(addr);
+    const tidStr = tokenId?.toString?.() || String(tokenId || '0');
+    if (tidStr === '0') {
+      return { ok: false, reason: 'no_token_mapping' };
+    }
+
+    const id = await personaRead.identityOf(tokenId);
+    const onUser   = id.userIdHash || id[0];
+    const onDevice = id.deviceHash || id[1];
+
+    const emailOk  = emailNorm
+      ? (commitUserId(emailNorm).toLowerCase() === String(onUser).toLowerCase())
+      : true;
+    const deviceOk = deviceFpr
+      ? (commitDevice(deviceFpr).toLowerCase() === String(onDevice).toLowerCase())
+      : true;
+
+    if (!emailOk || !deviceOk) {
+      return { ok: false, reason: 'mismatch' };
+    }
+
+    return { ok: true, reason: 'ok', tokenId: tidStr };
+  } catch (e) {
+    console.error('❌ verifyPersonaBinding error:', e);
+    return { ok: false, reason: 'error', error: String(e.message || e) };
+  }
+}
+
+
 
 
 // Rate limiting helper
@@ -139,6 +230,41 @@ function commitDevice(deviceFpr) {
   const packed = solidityPack(["string","string"], [val, DEVICE_PEPPER || ""]);
   return keccak256(packed);
 }
+
+
+// --- Auth token helper (HMAC "JWT"-style) ---
+function createAuthToken({ emailNorm, websiteDomain }) {
+  if (!AUTH_TOKEN_SECRET || AUTH_TOKEN_SECRET === 'CHANGE_ME_IN_PROD') {
+    throw new Error('AUTH_TOKEN_SECRET not configured');
+  }
+
+  const now   = Math.floor(Date.now() / 1000);
+  const exp   = now + 5 * 60; // 5 minutes
+  const nonce = crypto.randomBytes(16).toString('hex');
+
+  const payload = {
+    sub: emailNorm,                       // subject = normalized email
+    aud: websiteDomain || 'nftauthproject', // relying-party origin / RP id
+    iat: now,
+    exp,
+    nonce
+  };
+
+  const header = { alg: 'HS256', typ: 'JWT' };
+
+  const b64u = (obj) =>
+    Buffer.from(JSON.stringify(obj)).toString('base64url');
+
+  const unsigned = `${b64u(header)}.${b64u(payload)}`;
+  const signature = crypto
+    .createHmac('sha256', AUTH_TOKEN_SECRET)
+    .update(unsigned)
+    .digest('base64url');
+
+  const token = `${unsigned}.${signature}`;
+  return { token, nonce, iat: now, exp, aud: payload.aud, sub: payload.sub };
+}
+
 
 // Verify the email doesn't have a registered account before attempting to register
 async function probeIdentityRegistered(emailNorm) {
@@ -907,12 +1033,46 @@ app.post('/confirm-login', (req, res) => {
   res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
 });
 
+// app.get('/check-login/:requestId', (req, res) => {
+//   const r = pendingLogins[req.params.requestId];
+//   if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
+//   res.setHeader('Cache-Control', 'no-store');
+//   res.json({ success: true, status: r.status, devicePublicKeyJwk: r.devicePublicKeyJwk || null, extSession: r.extSession || null });
+// });
+
 app.get('/check-login/:requestId', (req, res) => {
   const r = pendingLogins[req.params.requestId];
   if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
+
   res.setHeader('Cache-Control', 'no-store');
-  res.json({ success: true, status: r.status, devicePublicKeyJwk: r.devicePublicKeyJwk || null, extSession: r.extSession || null });
+
+  let authToken = null;
+  let authClaims = null;
+
+  if (r.status === 'approved') {
+    try {
+      const { token, nonce, iat, exp, aud, sub } = createAuthToken({
+        emailNorm: r.email,
+        websiteDomain: r.websiteDomain || null
+      });
+
+      authToken = token;
+      authClaims = { nonce, iat, exp, aud, sub };
+    } catch (e) {
+      console.error('❌ createAuthToken failed:', e);
+    }
+  }
+
+  return res.json({
+    success: true,
+    status: r.status,
+    devicePublicKeyJwk: r.devicePublicKeyJwk || null,
+    extSession: r.extSession || null,
+    authToken,
+    authClaims
+  });
 });
+
 
 app.get('/get-session-handshake/:requestId', (req, res) => {
   const r = pendingLogins[req.params.requestId];
@@ -1022,17 +1182,40 @@ app.post('/store-credentials', (req, res) => {
   return res.json({ success: true });
 });
 
+// app.post('/get-credentials', (req, res) => {
+//   const emailNorm = normalizeEmail(req.body?.email || '');
+//   if (!emailNorm) return res.status(400).json({ error: 'Missing email' });
+
+//   const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
+//   if (!token) return res.status(403).json({ error: 'No registered device token' });
+
+//   const creds = userCredentials[emailNorm] || [];
+//   console.log(`📤 Returned ${creds.length} credentials for ${emailNorm}`);
+//   res.json({ success: true, credentials: creds });
+// });
+
 app.post('/get-credentials', (req, res) => {
   const emailNorm = normalizeEmail(req.body?.email || '');
-  if (!emailNorm) return res.status(400).json({ error: 'Missing email' });
+  if (!emailNorm) return res.status(400).json({ success: false, error: 'Missing email' });
 
   const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
-  if (!token) return res.status(403).json({ error: 'No registered device token' });
+  if (!token) return res.status(403).json({ success: false, error: 'No registered device token' });
+
+  // Require live session or verified email before returning vault contents
+  const hasLiveSession = sessionApprovals[emailNorm] && Date.now() < sessionApprovals[emailNorm];
+  if (!verifiedEmails[emailNorm] && !hasLiveSession) {
+    return res.status(403).json({ success: false, error: 'Session locked or expired' });
+  }
 
   const creds = userCredentials[emailNorm] || [];
   console.log(`📤 Returned ${creds.length} credentials for ${emailNorm}`);
-  res.json({ success: true, credentials: creds });
+  return res.json({
+    success: true,
+    credentials: creds,
+    sessionExpiresAt: hasLiveSession ? sessionApprovals[emailNorm] : null
+  });
 });
+
 
 app.post('/delete-credential', (req, res) => {
   const emailNorm = normalizeEmail(req.body?.email || '');
@@ -1972,42 +2155,90 @@ app.get('/nft-owned', async (req, res) => {
 });
 
 // --- READ+VERIFY: strict match on email/deviceFpr (commitments) ---
+// app.post('/nft-owned-verify', async (req, res) => {
+//   try {
+//     if (!provider || !CONTRACT_ADDRESS) return res.status(503).json({ success: false, error: 'Read contract not configured' });
+//     const address = String(req.body?.address || '').trim();
+//     const email   = req.body?.email || null;
+//     const deviceFpr = req.body?.deviceFpr || null;
+//     if (!address || !ethers.utils.isAddress(address)) return res.status(400).json({ success: false, error: 'Valid address required' });
+
+//     const readAbi = [
+//       "function balanceOf(address owner) view returns (uint256)",
+//       "function tokenOf(address user) view returns (uint256)",
+//       "function identityOf(uint256 tokenId) view returns (bytes32 userIdHash, bytes32 deviceHash, bool valid)"
+//     ];
+//     const personaRead = new ethers.Contract(CONTRACT_ADDRESS, readAbi, provider);
+
+//     const bal = await personaRead.balanceOf(address);
+//     const owned = bal.gt ? bal.gt(0) : (BigInt(bal) > 0n);
+//     if (!owned) return res.json({ success: true, owned: false, matched: false });
+
+//     const tokenId = await personaRead.tokenOf(address);
+//     const tidStr = tokenId?.toString?.() || String(tokenId || "0");
+//     if (tidStr === "0") return res.json({ success: true, owned: true, matched: false });
+
+//     const id = await personaRead.identityOf(tokenId);
+//     const onUser   = id.userIdHash || id[0];
+//     const onDevice = id.deviceHash || id[1];
+
+//     const emailOk  = email  ? (commitUserId(email).toLowerCase()   === String(onUser).toLowerCase())   : true;
+//     const deviceOk = deviceFpr ? (commitDevice(deviceFpr).toLowerCase() === String(onDevice).toLowerCase()) : true;
+
+//     return res.json({ success: true, owned: true, matched: !!(emailOk && deviceOk) });
+//   } catch (e) {
+//     console.error('❌ /nft-owned-verify:', e);
+//     return res.status(500).json({ success: false, error: 'verify failed' });
+//   }
+// });
+
+// --- READ+VERIFY: strict match on email/deviceFpr (commitments) ---
 app.post('/nft-owned-verify', async (req, res) => {
   try {
-    if (!provider || !CONTRACT_ADDRESS) return res.status(503).json({ success: false, error: 'Read contract not configured' });
-    const address = String(req.body?.address || '').trim();
-    const email   = req.body?.email || null;
+    if (!provider || !CONTRACT_ADDRESS) {
+      return res.status(503).json({ success: false, error: 'Read contract not configured' });
+    }
+
+    const address   = String(req.body?.address || '').trim();
+    const emailRaw  = req.body?.email || null;
     const deviceFpr = req.body?.deviceFpr || null;
-    if (!address || !ethers.utils.isAddress(address)) return res.status(400).json({ success: false, error: 'Valid address required' });
 
-    const readAbi = [
-      "function balanceOf(address owner) view returns (uint256)",
-      "function tokenOf(address user) view returns (uint256)",
-      "function identityOf(uint256 tokenId) view returns (bytes32 userIdHash, bytes32 deviceHash, bool valid)"
-    ];
-    const personaRead = new ethers.Contract(CONTRACT_ADDRESS, readAbi, provider);
+    if (!address || !ethers.utils.isAddress(address)) {
+      return res.status(400).json({ success: false, error: 'Valid address required' });
+    }
 
-    const bal = await personaRead.balanceOf(address);
-    const owned = bal.gt ? bal.gt(0) : (BigInt(bal) > 0n);
-    if (!owned) return res.json({ success: true, owned: false, matched: false });
+    const emailNorm = emailRaw ? normalizeEmail(emailRaw) : '';
 
-    const tokenId = await personaRead.tokenOf(address);
-    const tidStr = tokenId?.toString?.() || String(tokenId || "0");
-    if (tidStr === "0") return res.json({ success: true, owned: true, matched: false });
+    const result = await verifyPersonaBinding({ emailNorm, address, deviceFpr });
 
-    const id = await personaRead.identityOf(tokenId);
-    const onUser   = id.userIdHash || id[0];
-    const onDevice = id.deviceHash || id[1];
+    // Map helper result → legacy response shape
+    if (!result.ok) {
+      if (result.reason === 'no_nft' || result.reason === 'no_token_mapping') {
+        // Address has no persona NFT
+        return res.json({ success: true, owned: false, matched: false });
+      }
+      if (result.reason === 'mismatch') {
+        // NFT exists but does not match email/deviceFpr
+        return res.json({ success: true, owned: true, matched: false });
+      }
+      // Generic error
+      console.error('❌ /nft-owned-verify helper error:', result);
+      return res.status(500).json({ success: false, error: 'verify failed' });
+    }
 
-    const emailOk  = email  ? (commitUserId(email).toLowerCase()   === String(onUser).toLowerCase())   : true;
-    const deviceOk = deviceFpr ? (commitDevice(deviceFpr).toLowerCase() === String(onDevice).toLowerCase()) : true;
-
-    return res.json({ success: true, owned: true, matched: !!(emailOk && deviceOk) });
+    // All good: NFT exists and matches bindings
+    return res.json({
+      success: true,
+      owned: true,
+      matched: true,
+      tokenId: result.tokenId || null
+    });
   } catch (e) {
     console.error('❌ /nft-owned-verify:', e);
     return res.status(500).json({ success: false, error: 'verify failed' });
   }
 });
+
 
 // GET /tx-receipt?hash=0x...
 app.get('/tx-receipt', async (req, res) => {

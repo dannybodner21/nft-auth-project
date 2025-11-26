@@ -1128,11 +1128,21 @@ app.post('/request-login', async (req, res) => {
     const requestId = uuidv4();
     const nonce     = crypto.randomBytes(16).toString('hex');
 
+    // 🔐 Compute a real relying-party origin, even if client only sends websiteDomain
+    const relyingPartyOrigin =
+      origin ||
+      (websiteDomain ? `https://${websiteDomain}` : null);
+
+    if (!relyingPartyOrigin) {
+      console.error('❌ /request-login: no origin or websiteDomain provided');
+      return res.status(400).json({ success: false, error: 'origin_required' });
+    }
+
     // Store core login request state (used later when user approves on phone)
     pendingLogins[requestId] = {
       email: emailNorm,
       websiteDomain,
-      origin,
+      origin: relyingPartyOrigin,   // 👈 ALWAYS non-null now
       nonce,
       status: 'pending',
       timestamp: Date.now(),
@@ -1140,9 +1150,8 @@ app.post('/request-login', async (req, res) => {
       extSession: null
     };
 
-
-
     // --- Nonce-based challenge object for this login (for token minting / verification) ---
+    const challengeNonce     = crypto.randomBytes(16).toString('hex');
     const challengeExpiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes (ms)
 
     const hashedEmail = crypto
@@ -1150,19 +1159,13 @@ app.post('/request-login', async (req, res) => {
       .update(emailNorm)
       .digest('hex');
 
-    const relyingPartyOrigin = origin || websiteDomain || 'unknown';
-
-    // Use the SAME nonce as the JWT nonce so /verify-login-token can look it up
-    loginChallenges[nonce] = {
+    loginChallenges[challengeNonce] = {
       requestId,
       emailHash: hashedEmail,
-      relyingPartyOrigin,
-      challengeExpiresAt
+      relyingPartyOrigin,      // 👈 keep this for later checks
+      issuedAt: Date.now(),
+      challengeExpiresAt       // 👈 name matches what /verify-login-token expects
     };
-    
-
-
-
 
     const user = await db.getUserByEmail(emailNorm);
     const deviceToken = user?.deviceToken;
@@ -1182,7 +1185,7 @@ app.post('/request-login', async (req, res) => {
         requestId,
         nonce,
         ...(websiteDomain ? { websiteDomain } : {}),
-        ...(origin ? { origin } : {})
+        origin: relyingPartyOrigin
       },
       android: { priority: 'high' },
       apns: {
@@ -1202,10 +1205,9 @@ app.post('/request-login', async (req, res) => {
         success: true,
         requestId,
         nonce,
-        challengeNonce: nonce,
+        challengeNonce,
         challengeExpiresAt
       });
-      
     } catch (error) {
       console.error('❌ FCM error:', error);
       return res.status(500).json({ success: false, error: 'Failed to send push notification' });
@@ -1215,6 +1217,7 @@ app.post('/request-login', async (req, res) => {
     return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
+
 
 
 // app.post('/confirm-login', (req, res) => {

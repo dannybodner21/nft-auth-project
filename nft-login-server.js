@@ -12,7 +12,33 @@ const jwt = require('jsonwebtoken');
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET || 'CHANGE_ME_IN_PROD';
 const AUTH_JWT_TTL_SECONDS = 5 * 60; // 5 minutes
 const LOGIN_TOKEN_SECRET   = process.env.LOGIN_TOKEN_SECRET || 'CHANGE_ME_IN_PROD';
+const LOGIN_TOKEN_ISSUER   = process.env.LOGIN_TOKEN_ISSUER || 'https://auth.nftauthproject.com';
 const LOGIN_TOKEN_TTL_SEC  = 5 * 60; // 5 minutes
+const MESSAGE_BUCKET_SALT = process.env.MESSAGE_BUCKET_SALT || 'CHANGE_ME_IN_PROD';
+
+function bucketKeyForMessagingId(messagingId) {
+  const h = crypto
+    .createHash('sha256')
+    .update(MESSAGE_BUCKET_SALT)
+    .update(':')
+    .update(String(messagingId || ''))
+    .digest('hex')
+    .slice(0, 32); // short, still unlinkable
+  return `pending_msgs:${h}`;
+}
+
+function messageBucketKey(recipientMessagingId) {
+  const id = String(recipientMessagingId || '').trim();
+  if (!id) throw new Error('recipientMessagingId required');
+
+  const hash = crypto
+    .createHash('sha256')
+    .update(id + '|' + MESSAGE_BUCKET_SALT)
+    .digest('hex');
+
+  return `pending_msgs:${hash}`;
+}
+
 
 const Redis = require('ioredis');
 
@@ -120,19 +146,30 @@ async function verifyPersonaBinding({ emailNorm, address, deviceFpr }) {
   }
 }
 
-function makeLoginToken({ emailNorm, deviceHash, origin, nonce }) {
-  const nowSec = Math.floor(Date.now() / 1000);
+function makeLoginToken({ emailNorm, origin, deviceHash, nonce }) {
+  if (!emailNorm) throw new Error('emailNorm required');
+  if (!origin)    throw new Error('origin required');
+  if (!nonce)     throw new Error('nonce required');
+
+  const now = Math.floor(Date.now() / 1000);
+
+  const sub = commitUserId(emailNorm); // hashed identifier
+
   const payload = {
-    sub: emailNorm,          // subject = user (hashed email already tracked server-side)
-    aud: origin,             // relying-party origin
-    iat: nowSec,
-    exp: nowSec + LOGIN_TOKEN_TTL_SEC,
-    nonce,                   // for replay protection
-    deviceHash               // hash of device identifier / pubkey
+    iss:  LOGIN_TOKEN_ISSUER,
+    aud:  origin,
+    sub,
+    nonce,
+    iat:  now,
+    exp:  now + LOGIN_TOKEN_TTL_SEC
   };
+
+  if (deviceHash) {
+    payload.device = deviceHash;
+  }
+
   return jwt.sign(payload, LOGIN_TOKEN_SECRET, { algorithm: 'HS256' });
 }
-
 
 
 
@@ -478,7 +515,7 @@ const loginChallenges = Object.create(null); // nonce → challenge record
 
 // E2EE messaging: in-memory, deliver-once queues keyed by recipient messaging ID
 // messagesByRecipient[recipientMessagingId] = [ { id, ts, senderMessagingId, ciphertextB64 } ]
-let messagesByRecipient = {};
+//let messagesByRecipient = {};
 
 // messagingRouting[messagingId] = { email, deviceToken }
 let messagingRouting = {};
@@ -989,6 +1026,80 @@ app.post('/save-token', (req, res) => {
 });
 
 
+// ---------------------- Login token verification ----------------------
+// POST /verify-login-token
+// Body: { token, origin }
+// Verifies HS256 JWT issued by this server and bound to a relying-party origin.
+app.post('/verify-login-token', (req, res) => {
+  try {
+    const token  = String(req.body?.token  || '').trim();
+    const origin = String(req.body?.origin || '').trim(); // relying-party origin
+
+    if (!token || !origin) {
+      return res.status(400).json({ success: false, error: 'token and origin required' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, LOGIN_TOKEN_SECRET, {
+        algorithms: ['HS256'],
+        issuer: LOGIN_TOKEN_ISSUER,
+        audience: origin
+      });
+    } catch (e) {
+      console.error('❌ /verify-login-token jwt.verify failed:', e.message || e);
+      return res.status(401).json({ success: false, error: 'invalid_token' });
+    }
+
+    // Required claims
+    const { sub, nonce, iat, exp, aud, iss, device } = decoded;
+    if (!sub || !nonce || !iat || !exp) {
+      return res.status(400).json({ success: false, error: 'missing_claims' });
+    }
+
+    // ---- Nonce / challenge replay protection ----
+    const rec = loginChallenges[nonce];
+    if (!rec) {
+      // Either unknown nonce or already consumed
+      return res.status(400).json({ success: false, error: 'unknown_or_replayed_nonce' });
+    }
+
+    // Check server-side challenge expiry (ms)
+    if (Date.now() > rec.challengeExpiresAt) {
+      delete loginChallenges[nonce];
+      return res.status(400).json({ success: false, error: 'stale_challenge' });
+    }
+
+    // Optional: enforce that the RP origin matches what we saw at challenge time
+    if (rec.relyingPartyOrigin && rec.relyingPartyOrigin !== origin) {
+      return res.status(400).json({ success: false, error: 'origin_mismatch' });
+    }
+
+    // ✅ Single-use: burn the challenge so it cannot be replayed
+    delete loginChallenges[nonce];
+
+    // All good – return minimal claims (no raw email anywhere)
+    return res.json({
+      success: true,
+      valid: true,
+      claims: {
+        sub,       // hashed email / user id
+        nonce,
+        iat,
+        exp,
+        aud,
+        iss,
+        device: device || null
+      }
+    });
+  } catch (err) {
+    console.error('❌ /verify-login-token error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+
+
 const db = {
   getUserByEmail: async (email) => {
     const token = userTokens[normalizeEmail(email)] || process.env.TEST_PUSH_TOKEN;
@@ -999,87 +1110,206 @@ const db = {
 
 // ---------------------- Login approval flow ----------------------
 app.post('/request-login', async (req, res) => {
-  const emailNorm = normalizeEmail(req.body?.email || '');
-  const websiteDomain = req.body?.websiteDomain || null;
-  if (!emailNorm) return res.status(400).json({ error: 'Email required' });
-
-  const requestId = uuidv4();
-  pendingLogins[requestId] = {
-    email: emailNorm,
-    websiteDomain,
-    status: 'pending',
-    timestamp: Date.now(),
-    devicePublicKeyJwk: null,
-    extSession: null
-  };
-
-  // --- Nonce-based challenge for this login ---
-  const challengeNonce = crypto.randomBytes(16).toString('hex');
-  const challengeExpiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
-  
-  const hashedEmail = crypto
-    .createHash('sha256')
-    .update(emailNorm)
-    .digest('hex');
-  
-  const relyingPartyOrigin = websiteDomain || 'unknown';
-  
-  loginChallenges[challengeNonce] = {
-    challengeRequestId: requestId,
-    hashedEmail,
-    challengeExpiresAt,
-    relyingPartyOrigin
-  };  
-
-  const user = await db.getUserByEmail(emailNorm);
-  const deviceToken = user?.deviceToken;
-  if (!deviceToken) return res.status(404).json({ error: 'No device token registered' });
-
-  const message = {
-    token: deviceToken,
-    notification: { title: 'NFT Auth Request', body: 'Approve or deny request' },
-    data: { type: 'login_request', email: emailNorm, requestId, ...(websiteDomain ? { websiteDomain } : {}) },
-    android: { priority: 'high' },
-    apns: { payload: { aps: { sound: 'default', category: 'LOGIN_REQUEST' } } }
-  };
-
   try {
-    await admin.messaging().send(message);
-    console.log(`✅ Push sent to ${emailNorm} (${requestId})`);
-    res.json({
-      success: true,
+    const emailNorm     = normalizeEmail(req.body?.email || '');
+    const websiteDomain = req.body?.websiteDomain || null;
+    const origin        = req.body?.origin || null; // e.g. "https://app.nftauthproject.com"
+
+    if (!emailNorm) {
+      return res.status(400).json({ error: 'Email required' });
+    }
+
+    const allowed = await checkRateLimit(`ratelimit:login:${emailNorm}`, 10, 60); // 10 per 60s
+    if (!allowed) {
+      console.log(`🚫 Rate limited /request-login for ${emailNorm}`);
+      return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
+    }
+
+    const requestId = uuidv4();
+    const nonce     = crypto.randomBytes(16).toString('hex');
+
+    // Store core login request state (used later when user approves on phone)
+    pendingLogins[requestId] = {
+      email: emailNorm,
+      websiteDomain,
+      origin,
+      nonce,
+      status: 'pending',
+      timestamp: Date.now(),
+      devicePublicKeyJwk: null,
+      extSession: null
+    };
+
+
+
+    // --- Nonce-based challenge object for this login (for token minting / verification) ---
+    const challengeExpiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes (ms)
+
+    const hashedEmail = crypto
+      .createHash('sha256')
+      .update(emailNorm)
+      .digest('hex');
+
+    const relyingPartyOrigin = origin || websiteDomain || 'unknown';
+
+    // Use the SAME nonce as the JWT nonce so /verify-login-token can look it up
+    loginChallenges[nonce] = {
       requestId,
-      challengeNonce,
+      emailHash: hashedEmail,
+      relyingPartyOrigin,
       challengeExpiresAt
-    });
+    };
+    
 
-  } catch (error) {
-    console.error("❌ FCM error:", error);
-    res.status(500).json({ success: false, error: "Failed to send push notification" });
+
+
+
+    const user = await db.getUserByEmail(emailNorm);
+    const deviceToken = user?.deviceToken;
+    if (!deviceToken) {
+      return res.status(404).json({ error: 'No device token registered' });
+    }
+
+    const message = {
+      token: deviceToken,
+      notification: {
+        title: 'NFT Auth Request',
+        body: 'Approve or deny request'
+      },
+      data: {
+        type: 'login_request',
+        email: emailNorm,
+        requestId,
+        nonce,
+        ...(websiteDomain ? { websiteDomain } : {}),
+        ...(origin ? { origin } : {})
+      },
+      android: { priority: 'high' },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            category: 'LOGIN_REQUEST'
+          }
+        }
+      }
+    };
+
+    try {
+      await admin.messaging().send(message);
+      console.log(`✅ Push sent to ${emailNorm} (${requestId})`);
+      return res.json({
+        success: true,
+        requestId,
+        nonce,
+        challengeNonce: nonce,
+        challengeExpiresAt
+      });
+      
+    } catch (error) {
+      console.error('❌ FCM error:', error);
+      return res.status(500).json({ success: false, error: 'Failed to send push notification' });
+    }
+  } catch (err) {
+    console.error('❌ /request-login error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
 
-app.post('/confirm-login', (req, res) => {
-  const { requestId, approved, devicePublicKeyJwk } = req.body || {};
-  const request = pendingLogins[requestId];
-  if (!request) return res.status(404).json({ success: false, error: 'Request not found' });
 
-  request.status = approved ? 'approved' : 'denied';
-  if (approved && devicePublicKeyJwk && devicePublicKeyJwk.x && devicePublicKeyJwk.y) {
-    request.devicePublicKeyJwk = devicePublicKeyJwk;
-    console.log(`📎 Stored devicePublicKeyJwk for ${requestId} (x.len=${devicePublicKeyJwk.x.length})`);
-  } else if (approved) {
-    console.warn(`⚠️ Approved but missing/invalid devicePublicKeyJwk for ${requestId}`);
-  }
-  res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
-});
+// app.post('/confirm-login', (req, res) => {
+//   const { requestId, approved, devicePublicKeyJwk } = req.body || {};
+//   const request = pendingLogins[requestId];
+//   if (!request) return res.status(404).json({ success: false, error: 'Request not found' });
 
-// app.get('/check-login/:requestId', (req, res) => {
-//   const r = pendingLogins[req.params.requestId];
-//   if (!r) return res.status(404).json({ success: false, error: 'Request not found' });
-//   res.setHeader('Cache-Control', 'no-store');
-//   res.json({ success: true, status: r.status, devicePublicKeyJwk: r.devicePublicKeyJwk || null, extSession: r.extSession || null });
+//   request.status = approved ? 'approved' : 'denied';
+//   if (approved && devicePublicKeyJwk && devicePublicKeyJwk.x && devicePublicKeyJwk.y) {
+//     request.devicePublicKeyJwk = devicePublicKeyJwk;
+//     console.log(`📎 Stored devicePublicKeyJwk for ${requestId} (x.len=${devicePublicKeyJwk.x.length})`);
+//   } else if (approved) {
+//     console.warn(`⚠️ Approved but missing/invalid devicePublicKeyJwk for ${requestId}`);
+//   }
+//   res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
 // });
+
+
+// Phone → approves or denies a login request
+// Body: { requestId, approved, deviceFpr? }
+// Body: { requestId, approved: true/false, deviceHash? }
+app.post('/confirm-login', (req, res) => {
+  try {
+    const requestId = String(req.body?.requestId || '').trim();
+    const approved  = !!req.body?.approved;
+    const devicePublicKeyJwk = req.body?.devicePublicKeyJwk || null;
+
+    if (!requestId) {
+      return res.status(400).json({ success: false, error: 'requestId required' });
+    }
+
+    const login = pendingLogins[requestId];
+    if (!login) {
+      return res.status(404).json({ success: false, error: 'login_not_found' });
+    }
+
+    if (login.status !== 'pending') {
+      return res.status(409).json({ success: false, error: 'login_not_pending' });
+    }
+
+    // If mobile says "deny", just record and return
+    if (!approved) {
+      login.status = 'denied';
+      login.deniedAt = Date.now();
+      return res.json({ success: true, approved: false });
+    }
+
+    const { email: emailNorm, origin, nonce } = login;
+
+    if (!origin) {
+      console.error('❌ /confirm-login: missing origin on pending login', requestId);
+      return res.status(400).json({ success: false, error: 'missing_origin' });
+    }
+    if (!emailNorm || !nonce) {
+      console.error('❌ /confirm-login: missing email/nonce on pending login', requestId);
+      return res.status(400).json({ success: false, error: 'missing_email_or_nonce' });
+    }
+
+    // Optionally store device key JWK (for future session / key binding)
+    if (devicePublicKeyJwk) {
+      login.devicePublicKeyJwk = devicePublicKeyJwk;
+    }
+
+    // 🔐 Issue origin-bound, nonce-bound login token
+    let loginToken;
+    try {
+      loginToken = makeLoginToken({
+        emailNorm,
+        origin,
+        deviceHash: null, // or a real deviceHash if you have it
+        nonce
+      });
+    } catch (e) {
+      console.error('❌ /confirm-login makeLoginToken failed:', e.message || e);
+      return res.status(500).json({ success: false, error: 'token_issue_failed' });
+    }
+
+    login.status      = 'approved';
+    login.approvedAt  = Date.now();
+    login.loginToken  = loginToken;
+
+    return res.json({
+      success:  true,
+      approved: true,
+      requestId,
+      token:    loginToken
+    });
+  } catch (err) {
+    console.error('❌ /confirm-login error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+
+
 
 app.get('/check-login/:requestId', (req, res) => {
   const r = pendingLogins[req.params.requestId];
@@ -1087,31 +1317,155 @@ app.get('/check-login/:requestId', (req, res) => {
 
   res.setHeader('Cache-Control', 'no-store');
 
-  let authToken = null;
-  let authClaims = null;
-
-  if (r.status === 'approved') {
-    try {
-      const { token, nonce, iat, exp, aud, sub } = createAuthToken({
-        emailNorm: r.email,
-        websiteDomain: r.websiteDomain || null
-      });
-
-      authToken = token;
-      authClaims = { nonce, iat, exp, aud, sub };
-    } catch (e) {
-      console.error('❌ createAuthToken failed:', e);
-    }
+  // If not approved yet, just report status (no token)
+  if (r.status !== 'approved') {
+    return res.json({
+      success: true,
+      status: r.status,
+      devicePublicKeyJwk: r.devicePublicKeyJwk || null,
+      extSession: r.extSession || null,
+      loginToken: null
+    });
   }
+
+  // If approved, include loginToken (if minted)
+  const loginToken = r.loginToken || null;
 
   return res.json({
     success: true,
     status: r.status,
     devicePublicKeyJwk: r.devicePublicKeyJwk || null,
     extSession: r.extSession || null,
-    authToken,
-    authClaims
+    loginToken
   });
+});
+
+
+// ---------------------- Login status (extension / RP polls) ----------------------
+// POST /check-login
+// Body: { requestId, origin }
+app.post('/check-login', (req, res) => {
+  try {
+    const { requestId, origin } = req.body || {};
+
+    if (!requestId) {
+      return res.status(400).json({ success: false, error: 'requestId required' });
+    }
+    if (!origin) {
+      return res.status(400).json({ success: false, error: 'origin required' });
+    }
+
+    const r = pendingLogins[requestId];
+    if (!r) {
+      return res.status(404).json({ success: false, error: 'request_not_found' });
+    }
+
+    // Must be approved by phone
+    if (r.status !== 'approved') {
+      return res.status(409).json({ success: false, error: 'not_approved', status: r.status });
+    }
+
+    // Enforce origin binding (must match what we stored when request-login was called)
+    if (!r.origin || r.origin !== origin) {
+      return res.status(403).json({ success: false, error: 'origin_mismatch' });
+    }
+
+    const now = Date.now();
+    const MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes from initial request
+    if (!r.timestamp || (now - r.timestamp) > MAX_AGE_MS) {
+      r.status = 'expired';
+      return res.status(410).json({ success: false, error: 'expired' });
+    }
+
+    // Single-use: if already consumed, refuse
+    if (r.status === 'consumed') {
+      return res.status(409).json({ success: false, error: 'already_consumed' });
+    }
+
+    // Either use precomputed token from /confirm-login or mint now
+    let token = r.loginToken;
+    if (!token) {
+      try {
+        token = makeLoginToken({
+          emailNorm:  r.email,
+          origin:     r.origin,
+          deviceHash: r.deviceHash || null,
+          nonce:      r.nonce
+        });
+      } catch (e) {
+        console.error('❌ makeLoginToken in /check-login failed:', e);
+        return res.status(500).json({ success: false, error: 'token_issue_failed' });
+      }
+    }
+
+    // Mark as consumed so it cannot be reused
+    r.status = 'consumed';
+    r.consumedAt = now;
+    delete r.loginToken;
+
+    return res.json({
+      success: true,
+      token,
+      requestId
+    });
+
+  } catch (err) {
+    console.error('❌ /check-login error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+
+
+app.get('/login-status/:requestId', (req, res) => {
+  const requestId = String(req.params.requestId || '').trim();
+  if (!requestId) {
+    return res.status(400).json({ success: false, error: 'requestId required' });
+  }
+
+  const r = pendingLogins[requestId];
+  if (!r) {
+    return res.status(404).json({ success: false, error: 'request_not_found' });
+  }
+
+  const now = Date.now();
+  const MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes hard cap
+  if (!r.timestamp || (now - r.timestamp) > MAX_AGE_MS) {
+    delete pendingLogins[requestId];
+    return res.status(410).json({ success: false, error: 'expired' });
+  }
+
+  // Still waiting on phone
+  if (r.status === 'pending') {
+    return res.json({ success: true, status: 'pending' });
+  }
+
+  // Phone explicitly denied
+  if (r.status === 'denied') {
+    return res.json({ success: true, status: 'denied' });
+  }
+
+  // Approved: hand back the login token once, then wipe it
+  if (r.status === 'approved') {
+    const token = r.loginToken || null;
+
+    // Optional: keep minimal record, but nuke token so it can't be replayed
+    r.loginToken = null;
+
+    if (!token) {
+      // Should not normally happen if /confirm-login set it correctly
+      return res.status(500).json({ success: false, error: 'token_missing' });
+    }
+
+    return res.json({
+      success: true,
+      status: 'approved',
+      loginToken: token
+    });
+  }
+
+  // Fallback for any weird state
+  return res.status(500).json({ success: false, error: 'bad_state', state: r.status });
 });
 
 
@@ -1125,57 +1479,62 @@ app.get('/get-session-handshake/:requestId', (req, res) => {
   return res.json({ success: true, found: true, email: r.email, websiteDomain: r.websiteDomain || null, keyId, eph, salt });
 });
 
+
+
+// ---------------------- Issue Login Token ----------------------
+// POST /issue-login-token
+// Body: { requestId, origin }
+// Returns a signed JWT login token if the request is approved.
+
 app.post('/issue-login-token', (req, res) => {
   try {
-    const { requestId, nonce } = req.body || {};
-    const originHeader = req.headers.origin || req.body?.origin || null;
+    const requestId = String(req.body?.requestId || '').trim();
+    const origin    = String(req.body?.origin || '').trim();
 
-    if (!requestId || !nonce) {
-      return res.status(400).json({ success: false, error: 'requestId and nonce required' });
+    if (!requestId || !origin) {
+      return res.status(400).json({ success: false, error: 'requestId and origin required' });
     }
 
-    const login = pendingLogins[requestId];
-    const challenge = loginChallenges[nonce];
-
-    if (!login || !challenge) {
-      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
-    }
-    if (challenge.challengeRequestId !== requestId) {
-      return res.status(400).json({ success: false, error: 'mismatched challenge' });
-    }
-    if (Date.now() > challenge.challengeExpiresAt) {
-      delete loginChallenges[nonce];
-      return res.status(400).json({ success: false, error: 'challenge expired' });
-    }
-    if (login.status !== 'approved') {
-      return res.status(409).json({ success: false, error: 'login not approved' });
+    const r = pendingLogins[requestId];
+    if (!r) {
+      return res.status(404).json({ success: false, error: 'Unknown requestId' });
     }
 
-    // Derive a device hash from the devicePublicKeyJwk if present
-    let deviceHash = null;
-    if (login.devicePublicKeyJwk) {
-      const serialized = JSON.stringify(login.devicePublicKeyJwk);
-      deviceHash = crypto.createHash('sha256').update(serialized).digest('hex');
+    if (r.status !== 'approved') {
+      return res.status(400).json({ success: false, error: 'Not approved yet' });
     }
 
-    const relyingPartyOrigin = originHeader || challenge.relyingPartyOrigin || 'unknown';
+    const emailNorm = r.email;
+    const nonce     = r.nonce;
 
+    if (!emailNorm || !nonce) {
+      return res.status(500).json({ success: false, error: 'Corrupt pendingLogin entry' });
+    }
+
+    // --- Create the final login token ---
     const token = makeLoginToken({
-      emailNorm: login.email,
-      deviceHash,
-      origin: relyingPartyOrigin,
-      nonce
+      emailNorm,
+      origin,      // relying-party origin
+      nonce,
+      deviceHash: r.deviceHash || null
     });
 
-    // One-shot nonce
-    delete loginChallenges[nonce];
+    // Mark consumed
+    r.status = 'consumed';
 
-    return res.json({ success: true, token, expiresIn: LOGIN_TOKEN_TTL_SEC });
-  } catch (e) {
-    console.error('❌ /issue-login-token error:', e);
-    return res.status(500).json({ success: false, error: 'token_issue_failed' });
+    return res.json({
+      success: true,
+      loginToken: token
+    });
+
+  } catch (err) {
+    console.error("❌ /issue-login-token error:", err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
+
+
+
 
 // Pre-registration check - make sure email is not already registered
 app.get('/identity-status', async (req, res) => {
@@ -1418,6 +1777,94 @@ async function pushToMessagingId(messagingId, data) {
 
 // POST /messages/send
 // Body: { senderMessagingId, recipientMessagingId, messageId, timestamp, ciphertextB64 }
+// app.post('/messages/send', async (req, res) => {
+//   try {
+//       const senderMessagingId    = String(req.body?.senderMessagingId || '').trim();
+//       const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
+//       const messageId            = String(req.body?.messageId || '').trim();
+//       const tsRaw                = req.body?.timestamp;
+//       const ciphertextB64        = String(req.body?.ciphertextB64 || '').trim();
+
+//       if (!senderMessagingId || !recipientMessagingId || !messageId || !ciphertextB64) {
+//           return res.status(400).json({ success: false, error: 'Missing fields' });
+//       }
+
+//       // Rate limit: 60 messages per minute per sender
+//       const allowed = await checkRateLimit(`ratelimit:send:${senderMessagingId}`, 60, 60);
+//       if (!allowed) {
+//           console.log(`🚫 Rate limited /messages/send for ${senderMessagingId.slice(0, 16)}…`);
+//           return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
+//       }
+
+//       if (
+//           senderMessagingId.length > 256 ||
+//           recipientMessagingId.length > 256 ||
+//           messageId.length > 128
+//       ) {
+//           return res.status(400).json({ success: false, error: 'Bad id length' });
+//       }
+
+//       const ts = Number(tsRaw) > 0 ? Number(tsRaw) : Date.now();
+
+//       const msg = {
+//           id: messageId,
+//           ts,
+//           senderMessagingId,
+//           ciphertextB64
+//       };
+
+//       // Store message in Redis with 7-day TTL
+//       const msgKey = `pending_msgs:${recipientMessagingId}`;
+//       await redis.rpush(msgKey, JSON.stringify(msg));
+//       await redis.expire(msgKey, 24 * 60 * 60);  // 24 hours TTL
+
+//       // Cap at 200 messages per recipient
+//       const listLen = await redis.llen(msgKey);
+//       if (listLen > 200) {
+//           await redis.ltrim(msgKey, listLen - 200, -1);
+//       }
+
+//       console.log(`📨 Stored message for recipient ${recipientMessagingId.slice(0, 16)}… (queue size=${listLen})`);
+
+//       // ✅ NEW: Get tokens from Redis instead of in-memory object
+//       const tokens = await redis.smembers(`msg_tokens:${recipientMessagingId}`);
+//       console.log(`🔔 Chat push lookup for ${recipientMessagingId.slice(0, 16)}… tokens=${tokens.length}`);
+
+//       if (tokens && tokens.length > 0) {
+//           const baseMsg = {
+//               notification: {
+//                   title: 'NFTAuth Messenger',
+//                   body: 'New encrypted message'
+//               },
+//               data: {
+//                   type: 'message',
+//                   senderMessagingId,
+//                   messageId
+//               }
+//           };
+
+//           for (const token of tokens) {
+//               admin.messaging()
+//                   .send({ token, ...baseMsg })
+//                   .then((id) => {
+//                       console.log(`📨 FCM chat push sent to ${token.slice(0, 12)}…: ${id}`);
+//                   })
+//                   .catch((err) => {
+//                       console.warn('⚠️ FCM chat push failed:', err.message || err);
+//                   });
+//           }
+//       } else {
+//           console.log(`ℹ️ No registered messaging tokens for ${recipientMessagingId.slice(0, 16)}…`);
+//       }
+
+//       return res.json({ success: true });
+//   } catch (err) {
+//       console.error('❌ /messages/send crashed:', err);
+//       return res.status(500).json({ success: false, error: 'internal_error' });
+//   }
+// });
+
+// POST /messages/send
 app.post('/messages/send', async (req, res) => {
   try {
       const senderMessagingId    = String(req.body?.senderMessagingId || '').trim();
@@ -1454,20 +1901,20 @@ app.post('/messages/send', async (req, res) => {
           ciphertextB64
       };
 
-      // Store message in Redis with 7-day TTL
-      const msgKey = `pending_msgs:${recipientMessagingId}`;
+      // Store message in Redis with 10-minute TTL
+      const msgKey = bucketKeyForMessagingId(recipientMessagingId);
       await redis.rpush(msgKey, JSON.stringify(msg));
-      await redis.expire(msgKey, 24 * 60 * 60);  // 24 hours TTL
+      await redis.expire(msgKey, 10 * 60);  // 10 minutes TTL
 
-      // Cap at 200 messages per recipient
+      // Cap at 200 messages per recipient bucket
       const listLen = await redis.llen(msgKey);
       if (listLen > 200) {
           await redis.ltrim(msgKey, listLen - 200, -1);
       }
 
-      console.log(`📨 Stored message for recipient ${recipientMessagingId.slice(0, 16)}… (queue size=${listLen})`);
+      console.log(`📨 Stored message for bucket ${msgKey} (queue size=${listLen})`);
 
-      // ✅ NEW: Get tokens from Redis instead of in-memory object
+      // ✅ Get tokens from Redis instead of in-memory object
       const tokens = await redis.smembers(`msg_tokens:${recipientMessagingId}`);
       console.log(`🔔 Chat push lookup for ${recipientMessagingId.slice(0, 16)}… tokens=${tokens.length}`);
 
@@ -1505,6 +1952,48 @@ app.post('/messages/send', async (req, res) => {
   }
 });
 
+
+
+// app.post('/messages/ack', async (req, res) => {
+//   try {
+//     const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
+//     const messageIds = req.body?.messageIds;
+
+//     if (!recipientMessagingId || !Array.isArray(messageIds) || messageIds.length === 0) {
+//       return res.status(400).json({ success: false, error: 'recipientMessagingId and messageIds[] required' });
+//     }
+
+//     const key = `pending_msgs:${recipientMessagingId}`;
+    
+//     // Get all messages
+//     const rawMessages = await redis.lrange(key, 0, -1);
+    
+//     // Filter out acknowledged ones
+//     const remaining = rawMessages.filter(m => {
+//       try {
+//         const parsed = JSON.parse(m);
+//         return !messageIds.includes(parsed.id);
+//       } catch {
+//         return false;
+//       }
+//     });
+
+//     // Replace list with remaining messages
+//     await redis.del(key);
+//     if (remaining.length > 0) {
+//       await redis.rpush(key, ...remaining);
+//       await redis.expire(ackedKey, 24 * 60 * 60);  // 24 hours TTL
+//     }
+
+//     console.log(`✅ ACK ${messageIds.length} messages for ${recipientMessagingId.slice(0, 16)}… (${remaining.length} remaining)`);
+
+//     return res.json({ success: true, acknowledged: messageIds.length });
+//   } catch (err) {
+//     console.error('❌ /messages/ack error:', err);
+//     return res.status(500).json({ success: false, error: 'internal_error' });
+//   }
+// });
+
 app.post('/messages/ack', async (req, res) => {
   try {
     const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
@@ -1514,7 +2003,7 @@ app.post('/messages/ack', async (req, res) => {
       return res.status(400).json({ success: false, error: 'recipientMessagingId and messageIds[] required' });
     }
 
-    const key = `pending_msgs:${recipientMessagingId}`;
+    const key = bucketKeyForMessagingId(recipientMessagingId);
     
     // Get all messages
     const rawMessages = await redis.lrange(key, 0, -1);
@@ -1533,10 +2022,10 @@ app.post('/messages/ack', async (req, res) => {
     await redis.del(key);
     if (remaining.length > 0) {
       await redis.rpush(key, ...remaining);
-      await redis.expire(ackedKey, 24 * 60 * 60);  // 24 hours TTL
+      await redis.expire(key, 10 * 60);
     }
 
-    console.log(`✅ ACK ${messageIds.length} messages for ${recipientMessagingId.slice(0, 16)}… (${remaining.length} remaining)`);
+    console.log(`✅ ACK ${messageIds.length} messages for bucket ${key} (${remaining.length} remaining)`);
 
     return res.json({ success: true, acknowledged: messageIds.length });
   } catch (err) {
@@ -1546,9 +2035,51 @@ app.post('/messages/ack', async (req, res) => {
 });
 
 
+
+
 // POST /messages/sync
 // Body: { recipientMessagingId }
 // Returns and *clears* all queued messages for that recipient
+// app.post('/messages/sync', async (req, res) => {
+//   try {
+//     const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
+//     if (!recipientMessagingId) {
+//       return res.status(400).json({ success: false, error: 'recipientMessagingId required' });
+//     }
+
+//     // Rate limit: 30 syncs per minute
+//     const allowed = await checkRateLimit(`ratelimit:sync:${recipientMessagingId}`, 30, 60);
+//     if (!allowed) {
+//         console.log(`🚫 Rate limited /messages/sync for ${recipientMessagingId.slice(0, 16)}…`);
+//         return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
+//     }
+
+//     const key = `pending_msgs:${recipientMessagingId}`;
+    
+//     // Get all pending messages (but don't delete)
+//     const rawMessages = await redis.lrange(key, 0, -1);
+    
+//     const messages = rawMessages.map(m => {
+//       try {
+//         return JSON.parse(m);
+//       } catch {
+//         return null;
+//       }
+//     }).filter(Boolean);
+
+//     console.log(`📤 Sync for ${recipientMessagingId.slice(0, 16)}… returned=${messages.length}`);
+
+//     res.setHeader('Cache-Control', 'no-store');
+//     return res.json({ success: true, messages });
+//   } catch (err) {
+//     console.error('❌ /messages/sync error:', err);
+//     return res.status(500).json({ success: false, error: 'internal_error' });
+//   }
+// });
+
+// POST /messages/sync
+// Body: { recipientMessagingId }
+// Returns all queued messages for that recipient (does NOT clear them here)
 app.post('/messages/sync', async (req, res) => {
   try {
     const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
@@ -1563,7 +2094,7 @@ app.post('/messages/sync', async (req, res) => {
         return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
     }
 
-    const key = `pending_msgs:${recipientMessagingId}`;
+    const key = bucketKeyForMessagingId(recipientMessagingId);
     
     // Get all pending messages (but don't delete)
     const rawMessages = await redis.lrange(key, 0, -1);
@@ -1576,7 +2107,7 @@ app.post('/messages/sync', async (req, res) => {
       }
     }).filter(Boolean);
 
-    console.log(`📤 Sync for ${recipientMessagingId.slice(0, 16)}… returned=${messages.length}`);
+    console.log(`📤 Sync for bucket ${key} returned=${messages.length}`);
 
     res.setHeader('Cache-Control', 'no-store');
     return res.json({ success: true, messages });
@@ -1585,6 +2116,7 @@ app.post('/messages/sync', async (req, res) => {
     return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
+
 
 
 // POST /messaging/register-device
@@ -1766,9 +2298,6 @@ app.post("/calls/offer", async (req, res) => {
 });
 
 
-
-
-
 app.post('/calls/answer', async (req, res) => {
   try {
     const { callId, callerMessagingId, calleeMessagingId, sdpAnswer } = req.body;
@@ -1798,8 +2327,6 @@ app.post('/calls/answer', async (req, res) => {
     return res.status(500).json({ error: "internal_error" });
   }
 });
-
-
 
 
 // === CALLS: ICE candidates ===
@@ -1849,8 +2376,6 @@ app.post("/calls/ice", async (req, res) => {
 });
 
 
-
-
 // POST /calls/candidate
 // Body: { callId, fromMessagingId, toMessagingId, candidateJson }
 app.post('/calls/candidate', async (req, res) => {
@@ -1881,7 +2406,6 @@ app.post('/calls/candidate', async (req, res) => {
     return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
-
 
 
 // POST /calls/hangup
@@ -1922,11 +2446,6 @@ app.post('/calls/hangup', async (req, res) => {
     return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
-
-
-
-
-
 
 
 // ---------------------- Phone-assisted decrypt ----------------------
@@ -2041,47 +2560,48 @@ app.get('/beacon/session-handshake', (req, res) => {
 
 // ---------------------- Cleanup ----------------------
 setInterval(() => {
+
   const now = Date.now();
+
   for (const [k, v] of Object.entries(pendingDecrypts)) {
     if ((v.expiresAt && now > v.expiresAt) || (now - (v.createdAt || 0) > 10 * 60_000)) delete pendingDecrypts[k];
   }
+
   for (const [k, v] of Object.entries(pendingLogins)) {
     if (now - (v.timestamp || 0) > 10 * 60_000) delete pendingLogins[k];
   }
+
   // Cleanup expired login challenges
   for (const [nonce, rec] of Object.entries(loginChallenges)) {
-    if (!rec || now > (rec.challengeExpiresAt || 0)) {
+    if (!rec) {
+      delete loginChallenges[nonce];
+      continue;
+    }
+    const exp = rec.challengeExpiresAt || 0;
+    if (!exp || now > exp) {
+      // ⏳ Challenge expired, remove it
       delete loginChallenges[nonce];
     }
   }
+
   for (const [email, exp] of Object.entries(sessionApprovals)) {
     if (Date.now() > exp) delete sessionApprovals[email];
   }
+
   // Cleanup stale card challenges
   for (const [email, rec] of Object.entries(pendingCardChallenges)) {
     if (!rec || now > (rec.expiresAt || 0)) delete pendingCardChallenges[email];
   }
 
-  // Cleanup old messages (hard cap ~10 minutes in relay)
-  const TTL = 10 * 60_000;
-  for (const [recipientId, list] of Object.entries(messagesByRecipient)) {
-    const fresh = list.filter(m => now - (m.ts || 0) <= TTL);
-    if (fresh.length > 0) {
-      messagesByRecipient[recipientId] = fresh;
-    } else {
-      delete messagesByRecipient[recipientId];
+  // Cleanup stale calls (e.g. > 15 minutes old)
+  const CALL_TTL = 15 * 60_000;
+  for (const [id, c] of Object.entries(callsById)) {
+    const t = c.lastUpdate || c.createdAt || 0;
+    if (!t || now - t > CALL_TTL) {
+      console.log(`🧹 Cleaning stale call ${id}`);
+      delete callsById[id];
     }
   }
-
-    // Cleanup stale calls (e.g. > 15 minutes old)
-    const CALL_TTL = 15 * 60_000;
-    for (const [id, c] of Object.entries(callsById)) {
-      const t = c.lastUpdate || c.createdAt || 0;
-      if (!t || now - t > CALL_TTL) {
-        console.log(`🧹 Cleaning stale call ${id}`);
-        delete callsById[id];
-      }
-    }
 
 }, 60_000);
 

@@ -1622,20 +1622,44 @@ app.post('/store-credentials', (req, res) => {
   const emailNorm = normalizeEmail(req.body?.email || '');
   const deviceId = String(req.body?.deviceId || '');
   const credentials = req.body?.credentials;
+
   if (!emailNorm || !deviceId || !Array.isArray(credentials)) {
+    console.log('❌ /store-credentials 400 shape', {
+      emailNorm,
+      deviceId,
+      credsType: Array.isArray(credentials) ? 'array' : typeof credentials,
+    });
     return res.status(400).json({ success: false, error: 'Missing or invalid fields' });
-    }
-  const hasLiveSession = sessionApprovals[emailNorm] && Date.now() < sessionApprovals[emailNorm];
+  }
+
+  const hasLiveSession =
+    sessionApprovals[emailNorm] && Date.now() < sessionApprovals[emailNorm];
+
   if (!verifiedEmails[emailNorm] && !hasLiveSession) {
+    console.log('❌ /store-credentials 403 session gate', {
+      emailNorm,
+      verified: !!verifiedEmails[emailNorm],
+      hasLiveSession,
+      sessionExpiry: sessionApprovals[emailNorm] || null,
+    });
     return res.status(403).json({ success: false, error: 'Session locked or expired' });
   }
-  const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN;
-  if (!token) return res.status(403).json({ success: false, error: 'Unregistered device' });
+
+  const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
+  if (!token) {
+    console.log('❌ /store-credentials 403 token gate', {
+      emailNorm,
+      hasUserToken: !!userTokens[emailNorm],
+      hasTestToken: !!process.env.TEST_PUSH_TOKEN,
+    });
+    return res.status(403).json({ success: false, error: 'Unregistered device' });
+  }
 
   userCredentials[emailNorm] = credentials;
   console.log(`💾 Stored ${credentials.length} encrypted credentials for ${emailNorm}`);
   return res.json({ success: true });
 });
+
 
 // app.post('/get-credentials', (req, res) => {
 //   const emailNorm = normalizeEmail(req.body?.email || '');

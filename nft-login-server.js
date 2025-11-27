@@ -1022,6 +1022,7 @@ app.post('/save-token', (req, res) => {
   }
 
   console.log(`💾 Saved token for ${emailNorm}`);
+  verifiedEmails[emailNorm] = true;
   res.json({ success: true });
 });
 

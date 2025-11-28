@@ -784,7 +784,7 @@ app.post('/card-register', (req, res) => {
     return res.status(500).json({ success: false, error: 'server error' });
   }
 });
-
+// delete this note
 
 
 // DROP-IN REPLACEMENT: /card-verify now prefers the **per-user** key if present; falls back to global env key for legacy.

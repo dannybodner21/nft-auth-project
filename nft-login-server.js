@@ -754,52 +754,38 @@ app.get('/card-key-fp/:email', (req, res) => {
   return res.json({ success: true, bound: true, spkiSha256: rec.spkiSha256 });
 });
 
-// Register/bind a card to an email with proof-of-possession.
-// Body: { email, spkiPem, challenge, signatureB64, scheme? }
-// - spkiPem: the card's **public key PEM** (-----BEGIN PUBLIC KEY-----...)
-// - challenge/signatureB64: must be the exact challenge from /card-challenge and a signature from THIS key
+
+
+// In-memory store, adjust to match your existing structure:
+const userCards = userCards || {}; // if you already have this, don't redeclare
+
 app.post('/card-register', (req, res) => {
   try {
-    const emailNorm    = normalizeEmail(req.body?.email || '');
-    const spkiPem      = String(req.body?.spkiPem || '').trim();
-    const challenge    = String(req.body?.challenge || '');
-    const signatureB64 = String(req.body?.signatureB64 || '');
-    const scheme       = String(req.body?.scheme || 'PKCS1V15');
+    const rawEmail = req.body?.email || '';
+    const emailNorm = normalizeEmail(rawEmail);
+    const spkiPem = req.body?.spkiPem || req.body?.publicKeyPem;
 
-    if (!emailNorm || !spkiPem || !challenge || !signatureB64) {
-      return res.status(400).json({ success: false, error: 'email, spkiPem, challenge, signatureB64 required' });
+    if (!emailNorm || !spkiPem) {
+      return res.status(400).json({
+        success: false,
+        error: 'email and publicKeyPem (or spkiPem) required'
+      });
     }
 
-    // Must be a valid pending challenge for this email
-    const rec = pendingCardChallenges[emailNorm];
-    if (!rec || rec.challenge !== challenge || Date.now() > rec.expiresAt) {
-      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
-    }
+    userCards[emailNorm] = {
+      spkiPem,
+      linkedAt: Date.now()
+    };
 
-    // Build key object from PEM and verify proof-of-possession
-    let keyObj;
-    try { keyObj = crypto.createPublicKey(spkiPem); }
-    catch (e) { return res.status(400).json({ success: false, error: 'bad spkiPem' }); }
-
-    const ok = verifyCardSignature({ publicKey: keyObj, challenge, signatureB64, scheme });
-    if (!ok) return res.status(400).json({ success: false, error: 'proof-of-possession failed' });
-
-    const info = keyInfoFromKeyObject(keyObj);
-    cardKeys[emailNorm] = { keyObj, spkiSha256: info.spkiSha256, pem: spkiPem };
-
-    // One-time use
-    delete pendingCardChallenges[emailNorm];
-
-    // Start a live session (same TTL as extension)
-    const TTL_MS = 2 * 60 * 60 * 1000;
-    sessionApprovals[emailNorm] = Date.now() + TTL_MS;
-
-    return res.json({ success: true, bound: true, spkiSha256: info.spkiSha256, sessionExpiresAt: sessionApprovals[emailNorm] });
-  } catch (e) {
-    console.error('❌ /card-register:', e);
-    return res.status(500).json({ success: false, error: 'register failed' });
+    console.log('💳 Registered card for', emailNorm);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('🔥 /card-register error:', err);
+    return res.status(500).json({ success: false, error: 'server error' });
   }
 });
+
+
 
 // DROP-IN REPLACEMENT: /card-verify now prefers the **per-user** key if present; falls back to global env key for legacy.
 app.post('/card-verify', (req, res) => {

@@ -1584,34 +1584,49 @@ app.post('/confirm-email-verify', (req, res) => {
 app.get('/debug', (req, res) => res.json({ success: true, message: 'This is the real nft-login-server.js' }));
 
 // --- Card challenge (to be signed by the card's Authentication key) ---
+// app.post('/card-challenge', (req, res) => {
+//   try {
+//     if (!cardAuthKey) return res.status(503).json({ success: false, error: 'card key not loaded' });
+//     const emailNorm = normalizeEmail(req.body?.email || '');
+//     if (!emailNorm || !emailNorm.includes('@')) return res.status(400).json({ success: false, error: 'valid email required' });
+
+//     const now = Math.floor(Date.now() / 1000);
+//     const nonce = crypto.randomBytes(16).toString('hex');
+//     const challenge = `nftvault:card-auth|email=${emailNorm}|ts=${now}|nonce=${nonce}`;
+//     const ttlSec = 120;
+
+//     pendingCardChallenges[emailNorm] = { challenge, expiresAt: Date.now() + ttlSec * 1000 };
+
+//     return res.json({
+//       success: true,
+//       challenge,
+//       expiresAt: now + ttlSec,
+//       spec: {
+//         algo: 'RSA-PKCS1v1_5-SHA256',
+//         encoding: 'UTF-8 bytes of challenge string',
+//         fieldOrder: 'literal string as returned (no JSON canonicalization)'
+//       }
+//     });
+//   } catch (e) {
+//     console.error('❌ /card-challenge:', e);
+//     return res.status(500).json({ success: false, error: 'challenge failed' });
+//   }
+// });
+
+const activeChallenges = Object.create(null);
+
 app.post('/card-challenge', (req, res) => {
-  try {
-    if (!cardAuthKey) return res.status(503).json({ success: false, error: 'card key not loaded' });
-    const emailNorm = normalizeEmail(req.body?.email || '');
-    if (!emailNorm || !emailNorm.includes('@')) return res.status(400).json({ success: false, error: 'valid email required' });
-
-    const now = Math.floor(Date.now() / 1000);
-    const nonce = crypto.randomBytes(16).toString('hex');
-    const challenge = `nftvault:card-auth|email=${emailNorm}|ts=${now}|nonce=${nonce}`;
-    const ttlSec = 120;
-
-    pendingCardChallenges[emailNorm] = { challenge, expiresAt: Date.now() + ttlSec * 1000 };
-
-    return res.json({
-      success: true,
-      challenge,
-      expiresAt: now + ttlSec,
-      spec: {
-        algo: 'RSA-PKCS1v1_5-SHA256',
-        encoding: 'UTF-8 bytes of challenge string',
-        fieldOrder: 'literal string as returned (no JSON canonicalization)'
-      }
-    });
-  } catch (e) {
-    console.error('❌ /card-challenge:', e);
-    return res.status(500).json({ success: false, error: 'challenge failed' });
+  const emailNorm = normalizeEmail(req.body?.email || '');
+  if (!emailNorm) {
+    return res.status(400).json({ success: false, error: "email required" });
   }
+
+  const challenge = crypto.randomBytes(32).toString('base64');
+  activeChallenges[emailNorm] = challenge;
+
+  res.json({ success: true, challenge });
 });
+
 
 
 

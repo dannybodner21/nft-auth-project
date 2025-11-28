@@ -1627,6 +1627,69 @@ app.post('/card-challenge', (req, res) => {
   res.json({ success: true, challenge });
 });
 
+function pemToDer(pem) {
+  return Buffer.from(
+    pem.replace(/-----BEGIN PUBLIC KEY-----/g, "")
+       .replace(/-----END PUBLIC KEY-----/g, "")
+       .replace(/\s+/g, ""),
+    "base64"
+  );
+}
+
+
+app.post('/card-register-final', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.body?.email || '');
+    const spkiPem = req.body?.spkiPem;
+    const signatureB64 = req.body?.signatureB64;
+
+    if (!emailNorm || !spkiPem || !signatureB64) {
+      return res.status(400).json({
+        success: false,
+        error: "email, spkiPem, signatureB64 required"
+      });
+    }
+
+    // 1. Verify challenge exists
+    const challenge = activeChallenges[emailNorm];
+    if (!challenge) {
+      return res.status(400).json({ success: false, error: "missing challenge" });
+    }
+
+    // 2. Verify signature
+    const verifier = crypto.createVerify("SHA256");
+    verifier.update(challenge);
+    verifier.end();
+
+    const spkiDer = pemToDer(spkiPem);
+
+    const ok = verifier.verify(
+      { key: spkiDer, type: "spki", format: "der" },
+      Buffer.from(signatureB64, "base64")
+    );
+
+    if (!ok) {
+      return res.status(400).json({ success: false, error: "signature invalid" });
+    }
+
+    // 3. Store it
+    cardRegistry[emailNorm] = {
+      spkiPem,
+      added: Date.now()
+    };
+
+    // Challenge is now consumed
+    delete activeChallenges[emailNorm];
+
+    res.json({ success: true });
+
+  } catch (e) {
+    console.error("card-register-final error:", e);
+    res.status(500).json({ success: false, error: "server error" });
+  }
+});
+
+
 
 
 

@@ -16,6 +16,9 @@ const LOGIN_TOKEN_ISSUER   = process.env.LOGIN_TOKEN_ISSUER || 'https://auth.nft
 const LOGIN_TOKEN_TTL_SEC  = 5 * 60; // 5 minutes
 const MESSAGE_BUCKET_SALT = process.env.MESSAGE_BUCKET_SALT || 'CHANGE_ME_IN_PROD';
 
+// In-memory storage maps
+const userCards = Object.create(null);   // email -> { spkiPem, linkedAt }
+
 function bucketKeyForMessagingId(messagingId) {
   const h = crypto
     .createHash('sha256')
@@ -757,13 +760,11 @@ app.get('/card-key-fp/:email', (req, res) => {
 
 
 // In-memory store, adjust to match your existing structure:
-const userCards = userCards || {}; // if you already have this, don't redeclare
-
 app.post('/card-register', (req, res) => {
   try {
-    const rawEmail = req.body?.email || '';
+    const rawEmail  = req.body?.email || '';
     const emailNorm = normalizeEmail(rawEmail);
-    const spkiPem = req.body?.spkiPem || req.body?.publicKeyPem;
+    const spkiPem   = req.body?.spkiPem || req.body?.publicKeyPem;
 
     if (!emailNorm || !spkiPem) {
       return res.status(400).json({
@@ -784,7 +785,7 @@ app.post('/card-register', (req, res) => {
     return res.status(500).json({ success: false, error: 'server error' });
   }
 });
-// delete this note
+
 
 
 // DROP-IN REPLACEMENT: /card-verify now prefers the **per-user** key if present; falls back to global env key for legacy.

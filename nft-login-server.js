@@ -1669,38 +1669,35 @@ const activeChallenges = Object.create(null);
 
 app.post('/card-challenge', (req, res) => {
   try {
+    // email is OPTIONAL here – vendor flow won’t send one
     const rawEmail  = String(req.body?.email || '').trim();
-    const emailNorm = normalizeEmail(rawEmail);
-
-    if (!emailNorm) {
-      return res.status(400).json({
-        success: false,
-        error: 'email required'
-      });
-    }
-
-    const cardInfo = userCards[emailNorm];
-    if (!cardInfo || !cardInfo.spkiPem) {
-      return res.status(400).json({
-        success: false,
-        error: 'no card registered for this email'
-      });
-    }
+    const emailNorm = rawEmail ? normalizeEmail(rawEmail) : '';
 
     const challenge = crypto.randomBytes(32).toString('base64url');
 
-    pendingCardChallenges[emailNorm] = {
-      challenge,
-      createdAt: Date.now()
-    };
+    if (emailNorm) {
+      // login app path: tie challenge to email for later /card-verify
+      pendingCardChallenges[emailNorm] = {
+        challenge,
+        createdAt: Date.now()
+      };
+      console.log(`💳 Issued card challenge for ${emailNorm}`);
+    } else {
+      // vendor path: no email, no state, just give them a challenge
+      console.log('💳 Issued card challenge (no email, vendor flow)');
+    }
 
-    console.log(`💳 Issued card challenge for ${emailNorm}`);
     return res.json({ success: true, challenge });
   } catch (err) {
     console.error('🔥 /card-challenge error:', err);
-    return res.status(500).json({ success: false, error: 'server error challenge' });
+    // DO NOT throw weird “server error challenge” at the client anymore
+    return res.status(500).json({
+      success: false,
+      error: 'card challenge internal error'
+    });
   }
 });
+
 
 
 function pemToDer(pem) {

@@ -3432,7 +3432,76 @@ app.post('/card-vendor-tap', async (req, res) => {
   }
 });
 
+app.post('/web-payment-request', async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email || '');
+    const product = String(req.body?.product || 'Purchase');
+    const amount = Number(req.body?.amount || 0);
+    const currency = String(req.body?.currency || 'USD').toUpperCase();
 
+    if (!email) {
+      return res.status(400).json({ success: false, error: 'Email required' });
+    }
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, error: 'Invalid amount' });
+    }
+
+    // Get FCM token for this email
+    const deviceToken = userTokens[email];
+    if (!deviceToken) {
+      return res.status(400).json({ success: false, error: 'No device registered for this email' });
+    }
+
+    // Create payment session
+    const paymentId = `web_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    
+    paymentSessions[paymentId] = {
+      paymentId,
+      email,
+      product,
+      amount,
+      currency,
+      status: 'pending_approval',
+      createdAt: Date.now()
+    };
+
+    // Send push notification
+    const message = {
+      token: deviceToken,
+      notification: {
+        title: 'Payment Approval',
+        body: `${product} - $${amount.toFixed(2)} ${currency}`
+      },
+      data: {
+        type: 'payment_approval',
+        paymentId: paymentId,
+        product: product,
+        amount: String(amount),
+        currency: currency,
+        vendor: 'NFTAuth Web Store'
+      },
+      android: { priority: 'high' },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            category: 'PAYMENT_APPROVAL'
+          }
+        }
+      }
+    };
+
+    await admin.messaging().send(message);
+    console.log(`📲 Web payment push sent to ${email} for ${paymentId}`);
+
+    return res.json({ success: true, paymentId });
+
+  } catch (err) {
+    console.error('❌ /web-payment-request error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
 
 
 

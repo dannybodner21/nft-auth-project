@@ -19,6 +19,77 @@ const MESSAGE_BUCKET_SALT = process.env.MESSAGE_BUCKET_SALT || 'CHANGE_ME_IN_PRO
 // In-memory storage maps
 const userCards = Object.create(null);   // email -> { spkiPem, linkedAt }
 
+// === In-memory payments (ephemeral) ===
+const emailToTokens = Object.create(null);
+const pendingPayments = Object.create(null);
+let paymentCounter = 0;
+
+// DigestInfo prefix for SHA-256 (must match OpenPGPTapSigner)
+const SHA256_DIGESTINFO_PREFIX = Buffer.from([
+  0x30, 0x31,       // SEQUENCE
+  0x30, 0x0d,       // SEQUENCE
+  0x06, 0x09,       // OID
+  0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+  0x05, 0x00,       // NULL
+  0x04, 0x20        // OCTET STRING, 32 bytes
+]);
+
+function makeDigestInfoSha256(message) {
+  const mBuf = Buffer.from(String(message), 'utf8');
+  const hash = crypto.createHash('sha256').update(mBuf).digest();
+  return Buffer.concat([SHA256_DIGESTINFO_PREFIX, hash]);
+}
+
+// very small TTL to avoid leaks
+const PAYMENT_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function cleanupStalePayments() {
+  const now = Date.now();
+  for (const pid of Object.keys(pendingPayments)) {
+    const p = pendingPayments[pid];
+    if (!p) continue;
+    if (now - p.createdAt > PAYMENT_TTL_MS) {
+      delete pendingPayments[pid];
+    }
+  }
+}
+setInterval(cleanupStalePayments, 60 * 1000).unref();
+
+// === Helper: send push to all tokens for an email ===
+async function sendPaymentPush(emailNorm, payment) {
+  const tokens = emailToTokens[emailNorm];
+  if (!tokens || tokens.size === 0) {
+    console.warn(`⚠️ No FCM tokens for ${emailNorm}, cannot send payment push`);
+    return;
+  }
+
+  const registrationTokens = Array.from(tokens);
+
+  const msg = {
+    tokens: registrationTokens,
+    data: {
+      type: 'payment_approval',
+      paymentId: payment.paymentId,
+      amountCents: String(payment.amountCents),
+      currency: payment.currency,
+      description: payment.description
+    },
+    notification: {
+      title: 'Payment Approval Required',
+      body: `${payment.description} – ${(payment.amountCents / 100).toFixed(2)} ${payment.currency}`
+    }
+  };
+
+  try {
+    const resp = await admin.messaging().sendMulticast(msg);
+    console.log(`📲 Payment push → ${emailNorm}: success=${resp.successCount}, failure=${resp.failureCount}`);
+  } catch (err) {
+    console.error('🔥 sendPaymentPush error:', err);
+  }
+}
+
+
+
 function bucketKeyForMessagingId(messagingId) {
   const h = crypto
     .createHash('sha256')
@@ -997,7 +1068,15 @@ app.post('/save-token', (req, res) => {
   }
 
   const emailNorm = normalizeEmail(email);
+
+  // Preserve existing single-token mapping
   userTokens[emailNorm] = deviceToken;
+
+  // NEW: maintain a set of tokens per email for pushes (login, payments, etc.)
+  if (!emailToTokens[emailNorm]) {
+    emailToTokens[emailNorm] = new Set();
+  }
+  emailToTokens[emailNorm].add(deviceToken);
 
   // If the client passes a messagingId (Curve25519 pubkey), map it to this device token.
   if (messagingId.length > 0) {
@@ -1008,10 +1087,11 @@ app.post('/save-token', (req, res) => {
     console.log(`💬 Registered messagingId for ${emailNorm} (len=${messagingId.length})`);
   }
 
-  console.log(`💾 Saved token for ${emailNorm}`);
+  console.log(`💾 Saved token for ${emailNorm}, tokens=${emailToTokens[emailNorm].size}`);
   verifiedEmails[emailNorm] = true;
   res.json({ success: true });
 });
+
 
 
 // ---------------------- Login token verification ----------------------
@@ -2607,6 +2687,186 @@ app.get('/check-decrypt/:txId', (req, res) => {
 
   return res.json({ success: true, found: true, status: tx.status });
 });
+
+
+
+
+// ---------------------- Pay endpoints ----------------------
+
+// POST /pay-start
+// body: { amountCents, currency, description }
+app.post('/pay-start', (req, res) => {
+  try {
+    const amountCents = Number(req.body?.amountCents || 0);
+    const currency    = String(req.body?.currency || 'USD').toUpperCase();
+    const description = String(req.body?.description || 'Payment');
+
+    if (!Number.isFinite(amountCents) || amountCents <= 0) {
+      return res.status(400).json({ success: false, error: 'Invalid amountCents' });
+    }
+
+    const paymentId = `pay_${Date.now()}_${++paymentCounter}`;
+    const challenge = crypto.randomBytes(32).toString('base64url');
+
+    pendingPayments[paymentId] = {
+      paymentId,
+      challenge,
+      amountCents,
+      currency,
+      description,
+      status: 'awaiting_card',   // awaiting_card → pending_approval → approved/denied/expired
+      emailNorm: null,
+      cardEmailNorm: null,
+      createdAt: Date.now()
+    };
+
+    console.log(`💳 /pay-start → paymentId=${paymentId}, amount=${amountCents} ${currency}, desc="${description}"`);
+
+    return res.json({
+      success: true,
+      paymentId,
+      challenge
+    });
+  } catch (err) {
+    console.error('🔥 /pay-start error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+
+// POST /pay-card
+// body: { paymentId, signatureB64 }
+app.post('/pay-card', async (req, res) => {
+  try {
+    const paymentId    = String(req.body?.paymentId || '');
+    const signatureB64 = String(req.body?.signatureB64 || '');
+
+    if (!paymentId || !signatureB64) {
+      return res.status(400).json({ success: false, error: 'paymentId and signatureB64 required' });
+    }
+
+    const payment = pendingPayments[paymentId];
+    if (!payment) {
+      return res.status(404).json({ success: false, error: 'Unknown paymentId' });
+    }
+
+    if (payment.status !== 'awaiting_card') {
+      return res.status(400).json({ success: false, error: `Payment not in awaiting_card state (status=${payment.status})` });
+    }
+
+    const sig = Buffer.from(signatureB64, 'base64');
+    const di  = makeDigestInfoSha256(payment.challenge);
+
+    let matchedEmailNorm = null;
+
+    // userCards[emailNorm] = [ { spkiPem: '...', ... }, ... ]
+    for (const [emailNorm, cards] of Object.entries(userCards)) {
+      if (!Array.isArray(cards)) continue;
+
+      for (const card of cards) {
+        const spkiPem = card.spkiPem || card.publicKeyPem || card.spki;
+        if (!spkiPem) continue;
+
+        try {
+          const pubKey = crypto.createPublicKey(spkiPem);
+          const recovered = crypto.publicDecrypt(
+            { key: pubKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+            sig
+          );
+          if (recovered.equals(di)) {
+            matchedEmailNorm = normalizeEmail(emailNorm);
+            console.log(`💳 /pay-card → signature verified for ${matchedEmailNorm}`);
+            break;
+          }
+        } catch (e) {
+          // try next key
+        }
+      }
+
+      if (matchedEmailNorm) break;
+    }
+
+    if (!matchedEmailNorm) {
+      console.warn('⚠️ /pay-card signature invalid or card not registered');
+      return res.status(400).json({ success: false, error: 'Card signature invalid or card not registered' });
+    }
+
+    payment.status        = 'pending_approval';
+    payment.emailNorm     = matchedEmailNorm;
+    payment.cardEmailNorm = matchedEmailNorm;
+
+    // send push to the account owner asking to approve this payment
+    await sendPaymentPush(matchedEmailNorm, payment);
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('🔥 /pay-card error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+
+// GET /pay-status?paymentId=...
+app.get('/pay-status', (req, res) => {
+  try {
+    const paymentId = String(req.query.paymentId || '');
+    if (!paymentId) {
+      return res.status(400).json({ success: false, error: 'paymentId required' });
+    }
+
+    const payment = pendingPayments[paymentId];
+    if (!payment) {
+      return res.json({ success: true, status: 'expired' });
+    }
+
+    const age = Date.now() - payment.createdAt;
+    if (age > PAYMENT_TTL_MS && payment.status === 'awaiting_card') {
+      payment.status = 'expired';
+    }
+
+    return res.json({ success: true, status: payment.status });
+  } catch (err) {
+    console.error('🔥 /pay-status error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+
+// POST /pay-confirm
+// body: { paymentId, approved: true/false }
+app.post('/pay-confirm', (req, res) => {
+  try {
+    const paymentId = String(req.body?.paymentId || '');
+    const approved  = Boolean(req.body?.approved);
+
+    if (!paymentId) {
+      return res.status(400).json({ success: false, error: 'paymentId required' });
+    }
+
+    const payment = pendingPayments[paymentId];
+    if (!payment) {
+      return res.status(404).json({ success: false, error: 'Unknown paymentId' });
+    }
+
+    if (payment.status !== 'pending_approval') {
+      return res.status(400).json({ success: false, error: `Payment not pending approval (status=${payment.status})` });
+    }
+
+    payment.status = approved ? 'approved' : 'denied';
+    console.log(`✅ /pay-confirm → paymentId=${paymentId} status=${payment.status}`);
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('🔥 /pay-confirm error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+
+
+
+
+
 
 // ---------------------- Session handshake (extension -> phone) ----------------------
 app.post('/post-session-handshake', (req, res) => {

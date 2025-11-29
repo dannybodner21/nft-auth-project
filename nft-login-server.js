@@ -2919,6 +2919,46 @@ app.post('/payment-confirm', (req, res) => {
   return res.json({ success: true });
 });
 
+// at top of file with your other in-memory maps:
+const cardPaymentSessions = Object.create(null);
+
+
+
+app.post('/card-pay-start', (req, res) => {
+  const { amountCents, description, merchantId } = req.body || {};
+
+  if (!amountCents || !description || !merchantId) {
+    return res
+      .status(400)
+      .json({ success: false, error: 'amountCents, description, merchantId required' });
+  }
+
+  const sessionId = crypto.randomUUID();
+  const challenge = crypto.randomBytes(32).toString('base64');
+
+  cardPaymentSessions[sessionId] = {
+    sessionId,
+    amountCents,
+    description,
+    merchantId,
+    challenge,
+    createdAt: Date.now(),
+    status: 'pending',
+    cardHolderEmail: null,
+  };
+
+  console.log(
+    `💳 Created card payment session ${sessionId} for merchant=${merchantId}, amount=${amountCents}`
+  );
+
+  return res.json({
+    success: true,
+    sessionId,
+    challenge,
+  });
+});
+
+
 
 
 

@@ -2791,44 +2791,94 @@ function verifyRsaSignature(spkiPem, challenge, signatureB64) {
 
 
 // POST /pay-start
-// body: { amountCents, currency, description }
-app.post('/pay-start', (req, res) => {
+// body: { email, amountCents, currency, description }
+app.post('/pay-start', async (req, res) => {
   try {
+    const rawEmail    = req.body?.email || '';
+    const emailNorm   = normalizeEmail(rawEmail);
     const amountCents = Number(req.body?.amountCents || 0);
     const currency    = String(req.body?.currency || 'USD').toUpperCase();
     const description = String(req.body?.description || 'Payment');
+
+    if (!emailNorm) {
+      return res.status(400).json({ success: false, error: 'email required' });
+    }
 
     if (!Number.isFinite(amountCents) || amountCents <= 0) {
       return res.status(400).json({ success: false, error: 'Invalid amountCents' });
     }
 
-    const paymentId = `pay_${Date.now()}_${++paymentCounter}`;
-    const challenge = crypto.randomBytes(32).toString('base64url');
+    // lookup device token for this user (same map you use for login/decrypt)
+    const deviceToken = userTokens[emailNorm];
+    if (!deviceToken) {
+      console.warn('⚠️ /pay-start: no device token for', emailNorm);
+      return res.status(400).json({ success: false, error: 'No registered device token' });
+    }
 
-    pendingPayments[paymentId] = {
+    const paymentId = `pay_${Date.now()}_${++paymentCounter}`;
+
+    // store in paymentSessions so /payment-status and /payment-confirm see it
+    paymentSessions[paymentId] = {
       paymentId,
-      challenge,
+      amount: amountCents / 100,
       amountCents,
       currency,
       description,
-      status: 'awaiting_card',   // awaiting_card → pending_approval → approved/denied/expired
-      emailNorm: null,
-      cardEmailNorm: null,
+      ownerEmail: emailNorm,
+      status: 'pending_approval', // phone will flip to approved/denied
       createdAt: Date.now()
     };
 
-    console.log(`💳 /pay-start → paymentId=${paymentId}, amount=${amountCents} ${currency}, desc="${description}"`);
+    console.log(
+      `💳 /pay-start → paymentId=${paymentId}, ` +
+      `amount=${amountCents} (${currency}), desc="${description}", owner=${emailNorm}`
+    );
+
+    // send push to phone to approve/deny
+    const message = {
+      token: deviceToken,
+      notification: {
+        title: 'Payment Approval',
+        body: `${description} - $${(amountCents / 100).toFixed(2)} ${currency}`
+      },
+      data: {
+        // MUST match what your iOS app expects
+        type: 'payment_request',
+        paymentId: paymentId,
+        amount: String(amountCents / 100),
+        currency: currency,
+        vendor: description
+      },
+      android: { priority: 'high' },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            category: 'PAYMENT_APPROVAL'
+          }
+        }
+      }
+    };
+
+    try {
+      const id = await admin.messaging().send(message);
+      console.log(`📲 Payment push sent to ${emailNorm} (msgId=${id})`);
+    } catch (e) {
+      console.error('❌ FCM error (payment_request):', e);
+      paymentSessions[paymentId].status = 'error';
+      return res.status(500).json({ success: false, error: 'Failed to send push notification' });
+    }
 
     return res.json({
       success: true,
-      paymentId,
-      challenge
+      paymentId
     });
   } catch (err) {
     console.error('🔥 /pay-start error:', err);
     return res.status(500).json({ success: false, error: 'Server error' });
   }
 });
+
 
 
 // POST /pay-card

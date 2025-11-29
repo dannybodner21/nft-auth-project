@@ -830,24 +830,34 @@ app.get('/card-key-fp/:email', (req, res) => {
 
 
 
-// In-memory store, adjust to match your existing structure:
+// Make sure these exist near the top of your file:
+//const userCards  = Object.create(null);   // emailNorm -> { spkiPem, linkedAt }
+//const cardOwners = Object.create(null);   // spkiPem   -> emailNorm
+
 app.post('/card-register', (req, res) => {
   try {
-    const rawEmail  = req.body?.email || '';
+    const rawEmail = String(req.body?.email || '').trim();
     const emailNorm = normalizeEmail(rawEmail);
-    const spkiPem   = req.body?.spkiPem || req.body?.publicKeyPem;
 
-    if (!emailNorm || !spkiPem) {
+    // Accept either `spkiPem` or `publicKeyPem` from the client
+    const cardPem = String(req.body?.spkiPem || req.body?.publicKeyPem || '').trim();
+
+    if (!emailNorm || !cardPem) {
       return res.status(400).json({
         success: false,
         error: 'email and publicKeyPem (or spkiPem) required'
       });
     }
 
+    // Store by email → card
     userCards[emailNorm] = {
-      spkiPem,
+      spkiPem: cardPem,
       linkedAt: Date.now()
     };
+
+    // Store reverse mapping card → owner email
+    cardOwners[cardPem] = emailNorm;
+    console.log(`🔐 Registered card for ${emailNorm}`);
 
     console.log('💳 Registered card for', emailNorm);
     return res.json({ success: true });
@@ -856,6 +866,7 @@ app.post('/card-register', (req, res) => {
     return res.status(500).json({ success: false, error: 'server error' });
   }
 });
+
 
 
 
@@ -2921,42 +2932,136 @@ app.post('/payment-confirm', (req, res) => {
 
 // at top of file with your other in-memory maps:
 const cardPaymentSessions = Object.create(null);
+const cardOwners = Object.create(null);  // cardPubKeyPem -> normalizedEmail
 
 
 
 app.post('/card-pay-start', (req, res) => {
-  const { amountCents, description, merchantId } = req.body || {};
+  try {
+    const { amountCents, description, merchantId, cardPubKeyPem, signatureB64, challenge } = req.body || {};
 
-  if (!amountCents || !description || !merchantId) {
-    return res
-      .status(400)
-      .json({ success: false, error: 'amountCents, description, merchantId required' });
+    // Basic validation
+    if (!amountCents || !description || !merchantId || !cardPubKeyPem || !signatureB64 || !challenge) {
+      return res.status(400).json({
+        success: false,
+        error: 'amountCents, description, merchantId, cardPubKeyPem, signatureB64, challenge required'
+      });
+    }
+
+    const ownerEmail = cardOwners[cardPubKeyPem];
+    if (!ownerEmail) {
+      return res.status(404).json({ success: false, error: 'card not registered' });
+    }
+
+    const emailNorm = normalizeEmail(ownerEmail);
+    const deviceToken = userTokens[emailNorm];
+    if (!deviceToken) {
+      return res.status(404).json({ success: false, error: 'no device token for card owner' });
+    }
+
+    // Create a payment session
+    const sessionId = crypto.randomUUID();
+    cardPaymentSessions[sessionId] = {
+      sessionId,
+      amountCents,
+      description,
+      merchantId,
+      cardPubKeyPem,
+      challenge,
+      status: 'pending',
+      createdAt: Date.now()
+    };
+
+    // Send push to card owner (same FCM wiring you already use)
+    const message = {
+      token: deviceToken,
+      notification: {
+        title: 'Payment Approval',
+        body: `${description} - $${(amountCents / 100).toFixed(2)}`
+      },
+      data: {
+        type: 'CARD_PAYMENT',
+        sessionId,
+        amountCents: String(amountCents),
+        description,
+        merchantId
+      },
+      android: { priority: 'high' },
+      apns: {
+        payload: {
+          aps: {
+            category: 'LOGIN_REQUEST', // reuse existing category if you want same buttons
+            sound: 'default'
+          }
+        }
+      }
+    };
+
+    admin
+      .messaging()
+      .send(message)
+      .then((id) => {
+        console.log(`📲 Sent card payment push to ${emailNorm} (session ${sessionId}, msgId=${id})`);
+        res.json({
+          success: true,
+          sessionId
+        });
+      })
+      .catch((err) => {
+        console.error('❌ FCM error for card payment:', err);
+        res.status(500).json({ success: false, error: 'push failed' });
+      });
+  } catch (err) {
+    console.error('❌ /card-pay-start error:', err);
+    res.status(500).json({ success: false, error: 'internal error' });
   }
-
-  const sessionId = crypto.randomUUID();
-  const challenge = crypto.randomBytes(32).toString('base64');
-
-  cardPaymentSessions[sessionId] = {
-    sessionId,
-    amountCents,
-    description,
-    merchantId,
-    challenge,
-    createdAt: Date.now(),
-    status: 'pending',
-    cardHolderEmail: null,
-  };
-
-  console.log(
-    `💳 Created card payment session ${sessionId} for merchant=${merchantId}, amount=${amountCents}`
-  );
-
-  return res.json({
-    success: true,
-    sessionId,
-    challenge,
-  });
 });
+
+app.post('/card-pay-complete', (req, res) => {
+  try {
+    const { sessionId, approved } = req.body || {};
+    if (!sessionId || typeof approved !== 'boolean') {
+      return res.status(400).json({ success: false, error: 'sessionId, approved required' });
+    }
+
+    const sess = cardPaymentSessions[sessionId];
+    if (!sess) {
+      return res.status(404).json({ success: false, error: 'unknown session' });
+    }
+
+    sess.status = approved ? 'approved' : 'denied';
+    sess.completedAt = Date.now();
+
+    console.log(`💳 Payment session ${sessionId} -> ${sess.status}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /card-pay-complete error:', err);
+    res.status(500).json({ success: false, error: 'internal error' });
+  }
+});
+
+app.get('/card-pay-status', (req, res) => {
+  try {
+    const sessionId = req.query.sessionId;
+    if (!sessionId) {
+      return res.status(400).json({ success: false, error: 'sessionId required' });
+    }
+
+    const sess = cardPaymentSessions[sessionId];
+    if (!sess) {
+      return res.status(404).json({ success: false, error: 'unknown session' });
+    }
+
+    res.json({
+      success: true,
+      status: sess.status
+    });
+  } catch (err) {
+    console.error('❌ /card-pay-status error:', err);
+    res.status(500).json({ success: false, error: 'internal error' });
+  }
+});
+
 
 
 

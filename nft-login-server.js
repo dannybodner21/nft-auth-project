@@ -2792,43 +2792,43 @@ function verifyRsaSignature(spkiPem, challenge, signatureB64) {
 
 // POST /pay-start
 // body: { amountCents, currency, description }
-// app.post('/pay-start', (req, res) => {
-//   try {
-//     const amountCents = Number(req.body?.amountCents || 0);
-//     const currency    = String(req.body?.currency || 'USD').toUpperCase();
-//     const description = String(req.body?.description || 'Payment');
+app.post('/pay-start', (req, res) => {
+  try {
+    const amountCents = Number(req.body?.amountCents || 0);
+    const currency    = String(req.body?.currency || 'USD').toUpperCase();
+    const description = String(req.body?.description || 'Payment');
 
-//     if (!Number.isFinite(amountCents) || amountCents <= 0) {
-//       return res.status(400).json({ success: false, error: 'Invalid amountCents' });
-//     }
+    if (!Number.isFinite(amountCents) || amountCents <= 0) {
+      return res.status(400).json({ success: false, error: 'Invalid amountCents' });
+    }
 
-//     const paymentId = `pay_${Date.now()}_${++paymentCounter}`;
-//     const challenge = crypto.randomBytes(32).toString('base64url');
+    const paymentId = `pay_${Date.now()}_${++paymentCounter}`;
+    const challenge = crypto.randomBytes(32).toString('base64url');
 
-//     pendingPayments[paymentId] = {
-//       paymentId,
-//       challenge,
-//       amountCents,
-//       currency,
-//       description,
-//       status: 'awaiting_card',   // awaiting_card → pending_approval → approved/denied/expired
-//       emailNorm: null,
-//       cardEmailNorm: null,
-//       createdAt: Date.now()
-//     };
+    pendingPayments[paymentId] = {
+      paymentId,
+      challenge,
+      amountCents,
+      currency,
+      description,
+      status: 'awaiting_card',   // awaiting_card → pending_approval → approved/denied/expired
+      emailNorm: null,
+      cardEmailNorm: null,
+      createdAt: Date.now()
+    };
 
-//     console.log(`💳 /pay-start → paymentId=${paymentId}, amount=${amountCents} ${currency}, desc="${description}"`);
+    console.log(`💳 /pay-start → paymentId=${paymentId}, amount=${amountCents} ${currency}, desc="${description}"`);
 
-//     return res.json({
-//       success: true,
-//       paymentId,
-//       challenge
-//     });
-//   } catch (err) {
-//     console.error('🔥 /pay-start error:', err);
-//     return res.status(500).json({ success: false, error: 'Server error' });
-//   }
-// });
+    return res.json({
+      success: true,
+      paymentId,
+      challenge
+    });
+  } catch (err) {
+    console.error('🔥 /pay-start error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
 
 
 // POST /pay-card
@@ -3328,6 +3328,59 @@ app.post('/card-payment-request', async (req, res) => {
 
 
 
+// ============================================================
+// POST /card-vendor-tap
+// Body: { email }
+// Vendor tapped a card, extracted email from DO0101,
+// server looks up device token for that email and sends push.
+// ============================================================
+app.post('/card-vendor-tap', async (req, res) => {
+  try {
+    const raw = req.body?.email || '';
+    const emailNorm = normalizeEmail(raw);
+    if (!emailNorm) {
+      return res.status(400).json({ success: false, error: 'email required' });
+    }
+
+    const deviceToken = userTokens[emailNorm];
+    if (!deviceToken) {
+      return res.status(404).json({
+        success: false,
+        error: 'No device token found for this email'
+      });
+    }
+
+    const message = {
+      token: deviceToken,
+      notification: {
+        title: 'Vendor Card Tap',
+        body: `Card belonging to ${emailNorm} was tapped at vendor`
+      },
+      data: {
+        type: 'vendor_card_tap',
+        email: emailNorm
+      },
+      android: { priority: 'high' },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            category: 'VENDOR_CARD_TAP'
+          }
+        }
+      }
+    };
+
+    await admin.messaging().send(message);
+    console.log(`📲 Vendor card tap → push sent to ${emailNorm}`);
+
+    return res.json({ success: true });
+
+  } catch (err) {
+    console.error('❌ /card-vendor-tap error:', err);
+    return res.status(500).json({ success: false, error: 'server error' });
+  }
+});
 
 
 

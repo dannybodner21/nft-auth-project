@@ -623,12 +623,12 @@ function b64urlToStd(b64) {
   return String(b64 || "").replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
 }
 
-function keyInfoFromKeyObject(keyObj) {
-  const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
-  const sha256  = crypto.createHash('sha256').update(spkiDer).digest('base64');
-  const details = keyObj.asymmetricKeyDetails || {};
-  return { alg: keyObj.asymmetricKeyType, modulusBits: details.modulusLength || null, spkiSha256: sha256 };
-}
+// function keyInfoFromKeyObject(keyObj) {
+//   const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
+//   const sha256  = crypto.createHash('sha256').update(spkiDer).digest('base64');
+//   const details = keyObj.asymmetricKeyDetails || {};
+//   return { alg: keyObj.asymmetricKeyType, modulusBits: details.modulusLength || null, spkiSha256: sha256 };
+// }
 
 
 // function b64urlToStd(b64url) {
@@ -830,17 +830,11 @@ app.get('/card-key-fp/:email', (req, res) => {
 
 
 
-// Make sure these exist near the top of your file:
-//const userCards  = Object.create(null);   // emailNorm -> { spkiPem, linkedAt }
-//const cardOwners = Object.create(null);   // spkiPem   -> emailNorm
-
 app.post('/card-register', (req, res) => {
   try {
-    const rawEmail = String(req.body?.email || '').trim();
+    const rawEmail  = String(req.body?.email || '').trim();
     const emailNorm = normalizeEmail(rawEmail);
-
-    // Accept either `spkiPem` or `publicKeyPem` from the client
-    const cardPem = String(req.body?.spkiPem || req.body?.publicKeyPem || '').trim();
+    const cardPem   = String(req.body?.spkiPem || req.body?.publicKeyPem || '').trim();
 
     if (!emailNorm || !cardPem) {
       return res.status(400).json({
@@ -849,17 +843,14 @@ app.post('/card-register', (req, res) => {
       });
     }
 
-    // Store by email → card
     userCards[emailNorm] = {
       spkiPem: cardPem,
       linkedAt: Date.now()
     };
 
-    // Store reverse mapping card → owner email
     cardOwners[cardPem] = emailNorm;
-    console.log(`🔐 Registered card for ${emailNorm}`);
 
-    console.log('💳 Registered card for', emailNorm);
+    console.log(`🔐 Registered card for ${emailNorm}`);
     return res.json({ success: true });
   } catch (err) {
     console.error('🔥 /card-register error:', err);
@@ -870,97 +861,80 @@ app.post('/card-register', (req, res) => {
 
 
 
+
 // DROP-IN REPLACEMENT: /card-verify now prefers the **per-user** key if present; falls back to global env key for legacy.
 app.post('/card-verify', (req, res) => {
-
-  console.log('📥 RAW req.body.challenge:', req.body.challenge);
-  console.log('📥 Challenge length:', String(req.body.challenge || '').length);
-
   try {
-    const rawEmail     = String(req.body?.email || '');
-    const emailNorm    = normalizeEmail(rawEmail);
-    const challenge = String(req.body?.challenge || '');
-    console.log('🔍 After String conversion, challenge length:', challenge.length);
-    console.log('🔍 After String conversion, full challenge:', challenge);
+    const rawEmail   = String(req.body?.email || '').trim();
+    const emailNorm  = normalizeEmail(rawEmail);
+    const challenge  = String(req.body?.challenge || '');
     const signatureB64 = String(req.body?.signatureB64 || '');
-    const scheme       = String(req.body?.scheme || 'PKCS1V15');
-
-    console.log('🔐 /card-verify request:', { emailNorm, challenge: challenge.substring(0, 50), sigLen: signatureB64.length });
 
     if (!emailNorm || !challenge || !signatureB64) {
-      console.log('❌ Missing fields');
-      return res.status(400).json({ success: false, error: 'email, challenge, signatureB64 required' });
-    }
-    if (!challenge.startsWith('nftvault:card-auth|')) {
-      console.log('❌ Bad challenge prefix');
-      return res.status(400).json({ success: false, error: 'bad challenge prefix' });
-    }
-
-    // Must match issued challenge & be fresh
-    const rec = pendingCardChallenges[emailNorm];
-    if (!rec) {
-      console.log('❌ No pending challenge for', emailNorm);
-      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
-    }
-    if (rec.challenge !== challenge) {
-      console.log('❌ Challenge mismatch');
-      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
-    }
-    if (Date.now() > rec.expiresAt) {
-      console.log('❌ Challenge expired');
-      return res.status(400).json({ success: false, error: 'unknown or expired challenge' });
+      return res.status(400).json({
+        success: false,
+        verified: false,
+        error: 'email, challenge, signatureB64 required'
+      });
     }
 
-    // Parse & check email + ts
-    const fields = Object.fromEntries(
-      challenge.split('|').slice(1).map(kv => {
-        const i = kv.indexOf('=');
-        return i === -1 ? [kv, ''] : [kv.slice(0, i), kv.slice(i + 1)];
-      })
+    const cardInfo = userCards[emailNorm];
+    if (!cardInfo || !cardInfo.spkiPem) {
+      return res.status(400).json({
+        success: false,
+        verified: false,
+        error: 'no card registered for this email'
+      });
+    }
+
+    const pending = pendingCardChallenges[emailNorm];
+    if (!pending || pending.challenge !== challenge) {
+      return res.status(400).json({
+        success: false,
+        verified: false,
+        error: 'no matching challenge'
+      });
+    }
+
+    // Optional: expiry check (30s)
+    if (Date.now() - pending.createdAt > 30_000) {
+      delete pendingCardChallenges[emailNorm];
+      return res.status(400).json({
+        success: false,
+        verified: false,
+        error: 'challenge expired'
+      });
+    }
+
+    const publicKeyPem = cardInfo.spkiPem;
+    const sigBuf       = Buffer.from(signatureB64, 'base64');
+
+    const ok = crypto.verify(
+      'sha256',
+      Buffer.from(challenge, 'utf8'),
+      publicKeyPem,
+      sigBuf
     );
-    if (normalizeEmail(fields.email || '') !== emailNorm) {
-      return res.status(400).json({ success: false, error: 'email mismatch' });
+
+    if (!ok) {
+      console.warn(`❌ Card verify failed for ${emailNorm}`);
+      return res.json({ success: true, verified: false });
     }
-    const ts = Number(fields.ts);
-    if (!Number.isFinite(ts)) return res.status(400).json({ success: false, error: 'bad ts' });
-    const now = Math.floor(Date.now() / 1000);
-    const MAX_SKEW = 5 * 60;
-    if (Math.abs(now - ts) > MAX_SKEW) {
-      return res.status(400).json({ success: false, error: 'stale/future challenge', now, ts });
-    }
-
-    // Pick the right key: per-user bound key first; else legacy env key
-    let verifyKey = null;
-    if (cardKeys[emailNorm]?.keyObj) {
-      verifyKey = cardKeys[emailNorm].keyObj;
-    } else if (cardAuthKey) {
-      verifyKey = cardAuthKey;
-    } else {
-      return res.status(503).json({ success: false, error: 'no verification key available' });
-    }
-
-    console.log('🔍 RIGHT BEFORE verifyCardSignature call, challenge:', challenge);
-    console.log('🔍 RIGHT BEFORE verifyCardSignature call, challenge.length:', challenge.length);
-
-    const ok = verifyCardSignature({ publicKey: verifyKey, challenge, signatureB64, scheme });
-    
-    console.log('🔐 Signature verification result:', ok);
-
-    if (!ok) return res.status(400).json({ success: false, verified: false });
 
     delete pendingCardChallenges[emailNorm];
+    console.log(`✅ Card verified for ${emailNorm}`);
 
-    // Start/refresh live session (2h)
-    const TTL_MS = 2 * 60 * 60 * 1000;
-    sessionApprovals[emailNorm] = Date.now() + TTL_MS;
-    console.log(`🔓 Card session approved for ${emailNorm} until ${new Date(sessionApprovals[emailNorm]).toISOString()}`);
-
-    return res.json({ success: true, verified: true, email: emailNorm, ts, nonce: fields.nonce || null, sessionExpiresAt: sessionApprovals[emailNorm] });
-  } catch (e) {
-    console.error('❌ /card-verify error:', e);
-    return res.status(500).json({ success: false, error: 'verify failed' });
+    // You can attach a sessionExpiresAt here if you want
+    return res.json({
+      success: true,
+      verified: true
+    });
+  } catch (err) {
+    console.error('🔥 /card-verify error:', err);
+    return res.status(500).json({ success: false, verified: false, error: 'server error verify' });
   }
 });
+
 
 // === END: per-user card binding ===
 
@@ -1694,16 +1668,40 @@ app.get('/debug', (req, res) => res.json({ success: true, message: 'This is the 
 const activeChallenges = Object.create(null);
 
 app.post('/card-challenge', (req, res) => {
-  const emailNorm = normalizeEmail(req.body?.email || '');
-  if (!emailNorm) {
-    return res.status(400).json({ success: false, error: "email required" });
+  try {
+    const rawEmail  = String(req.body?.email || '').trim();
+    const emailNorm = normalizeEmail(rawEmail);
+
+    if (!emailNorm) {
+      return res.status(400).json({
+        success: false,
+        error: 'email required'
+      });
+    }
+
+    const cardInfo = userCards[emailNorm];
+    if (!cardInfo || !cardInfo.spkiPem) {
+      return res.status(400).json({
+        success: false,
+        error: 'no card registered for this email'
+      });
+    }
+
+    const challenge = crypto.randomBytes(32).toString('base64url');
+
+    pendingCardChallenges[emailNorm] = {
+      challenge,
+      createdAt: Date.now()
+    };
+
+    console.log(`💳 Issued card challenge for ${emailNorm}`);
+    return res.json({ success: true, challenge });
+  } catch (err) {
+    console.error('🔥 /card-challenge error:', err);
+    return res.status(500).json({ success: false, error: 'server error challenge' });
   }
-
-  const challenge = crypto.randomBytes(32).toString('base64');
-  activeChallenges[emailNorm] = challenge;
-
-  res.json({ success: true, challenge });
 });
+
 
 function pemToDer(pem) {
   return Buffer.from(
@@ -1751,10 +1749,10 @@ app.post('/card-register-final', async (req, res) => {
     }
 
     // 3. Store it
-    cardRegistry[emailNorm] = {
-      spkiPem,
-      added: Date.now()
-    };
+    // cardRegistry[emailNorm] = {
+    //   spkiPem,
+    //   added: Date.now()
+    // };
 
     // Challenge is now consumed
     delete activeChallenges[emailNorm];
@@ -2933,6 +2931,7 @@ app.post('/payment-confirm', (req, res) => {
 // at top of file with your other in-memory maps:
 const cardPaymentSessions = Object.create(null);
 const cardOwners = Object.create(null);  // cardPubKeyPem -> normalizedEmail
+
 
 
 

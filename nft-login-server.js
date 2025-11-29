@@ -2693,6 +2693,21 @@ app.get('/check-decrypt/:txId', (req, res) => {
 
 // ---------------------- Pay endpoints ----------------------
 
+// Per-payment session state (in-memory, like pendingLogins)
+const cardPayments = Object.create(null);
+// shape: cardPayments[paymentId] = {
+//   paymentId,
+//   cardKey,       // some identifier for the card (e.g. card public key or app-derived id)
+//   amount,
+//   currency,
+//   vendorId,
+//   status: "pending" | "approved" | "denied",
+//   approved: boolean,
+//   createdAt: number
+// }
+
+
+
 // POST /pay-start
 // body: { amountCents, currency, description }
 app.post('/pay-start', (req, res) => {
@@ -2861,6 +2876,51 @@ app.post('/pay-confirm', (req, res) => {
     return res.status(500).json({ success: false, error: 'Server error' });
   }
 });
+
+app.post('/payment-status', (req, res) => {
+  const { paymentId } = req.body || {};
+  if (!paymentId) {
+    return res.status(400).json({ success: false, error: 'paymentId required' });
+  }
+
+  const p = cardPayments[paymentId];
+  if (!p) {
+    return res.status(404).json({ success: false, error: 'payment not found' });
+  }
+
+  return res.json({
+    success: true,
+    status: p.status,           // "pending" | "approved" | "denied"
+    approved: !!p.approved
+  });
+});
+
+
+app.post('/payment-confirm', (req, res) => {
+  const { paymentId, approved } = req.body || {};
+
+  if (!paymentId || typeof approved !== 'boolean') {
+    return res.status(400).json({
+      success: false,
+      error: 'paymentId and approved (boolean) required'
+    });
+  }
+
+  const p = cardPayments[paymentId];
+  if (!p) {
+    return res.status(404).json({ success: false, error: 'payment not found' });
+  }
+
+  p.status = approved ? 'approved' : 'denied';
+  p.approved = approved;
+
+  console.log(`💳 payment-confirm: ${paymentId} → ${approved ? 'APPROVED' : 'DENIED'}`);
+
+  return res.json({ success: true });
+});
+
+
+
 
 
 

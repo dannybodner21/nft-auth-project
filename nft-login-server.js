@@ -1189,17 +1189,134 @@ const db = {
 };
 
 // ---------------------- Login approval flow ----------------------
+// app.post('/request-login', async (req, res) => {
+//   try {
+//     const emailNorm     = normalizeEmail(req.body?.email || '');
+//     const websiteDomain = req.body?.websiteDomain || null;
+//     const origin        = req.body?.origin || null; // e.g. "https://app.nftauthproject.com"
+
+//     if (!emailNorm) {
+//       return res.status(400).json({ error: 'Email required' });
+//     }
+
+//     const allowed = await checkRateLimit(`ratelimit:login:${emailNorm}`, 10, 60); // 10 per 60s
+//     if (!allowed) {
+//       console.log(`🚫 Rate limited /request-login for ${emailNorm}`);
+//       return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
+//     }
+
+//     const requestId = uuidv4();
+//     const nonce     = crypto.randomBytes(16).toString('hex');
+
+//     // 🔐 Compute a real relying-party origin, even if client only sends websiteDomain
+//     const relyingPartyOrigin =
+//       origin ||
+//       (websiteDomain ? `https://${websiteDomain}` : null);
+
+//     if (!relyingPartyOrigin) {
+//       console.error('❌ /request-login: no origin or websiteDomain provided');
+//       return res.status(400).json({ success: false, error: 'origin_required' });
+//     }
+
+//     // Store core login request state (used later when user approves on phone)
+//     pendingLogins[requestId] = {
+//       email: emailNorm,
+//       websiteDomain,
+//       origin: relyingPartyOrigin,   // 👈 ALWAYS non-null now
+//       nonce,
+//       status: 'pending',
+//       timestamp: Date.now(),
+//       devicePublicKeyJwk: null,
+//       extSession: null
+//     };
+
+//     // --- Nonce-based challenge object for this login (for token minting / verification) ---
+//     const challengeNonce     = crypto.randomBytes(16).toString('hex');
+//     const challengeExpiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes (ms)
+
+//     const hashedEmail = crypto
+//       .createHash('sha256')
+//       .update(emailNorm)
+//       .digest('hex');
+
+//     loginChallenges[challengeNonce] = {
+//       requestId,
+//       emailHash: hashedEmail,
+//       relyingPartyOrigin,      // 👈 keep this for later checks
+//       issuedAt: Date.now(),
+//       challengeExpiresAt       // 👈 name matches what /verify-login-token expects
+//     };
+
+//     const user = await db.getUserByEmail(emailNorm);
+//     const deviceToken = user?.deviceToken;
+//     if (!deviceToken) {
+//       return res.status(404).json({ error: 'No device token registered' });
+//     }
+
+//     const message = {
+//       token: deviceToken,
+//       notification: {
+//         title: 'NFT Auth Request',
+//         body: 'Approve or deny request'
+//       },
+//       data: {
+//         type: 'login_request',
+//         email: emailNorm,
+//         requestId,
+//         nonce,
+//         ...(websiteDomain ? { websiteDomain } : {}),
+//         origin: relyingPartyOrigin
+//       },
+//       android: { priority: 'high' },
+//       apns: {
+//         payload: {
+//           aps: {
+//             sound: 'default',
+//             category: 'LOGIN_REQUEST'
+//           }
+//         }
+//       }
+//     };
+
+//     try {
+//       await admin.messaging().send(message);
+//       console.log(`✅ Push sent to ${emailNorm} (${requestId})`);
+//       return res.json({
+//         success: true,
+//         requestId,
+//         nonce,
+//         challengeNonce,
+//         challengeExpiresAt
+//       });
+//     } catch (error) {
+//       console.error('❌ FCM error:', error);
+//       return res.status(500).json({ success: false, error: 'Failed to send push notification' });
+//     }
+//   } catch (err) {
+//     console.error('❌ /request-login error:', err);
+//     return res.status(500).json({ success: false, error: 'internal_error' });
+//   }
+// });
+
 app.post('/request-login', async (req, res) => {
+  console.log('🔵 /request-login HIT');
+  console.log('🔵 Headers:', JSON.stringify(req.headers, null, 2));
+  console.log('🔵 Body:', JSON.stringify(req.body, null, 2));
+  console.log('🔵 User-Agent:', req.headers['user-agent']);
+  
   try {
     const emailNorm     = normalizeEmail(req.body?.email || '');
     const websiteDomain = req.body?.websiteDomain || null;
-    const origin        = req.body?.origin || null; // e.g. "https://app.nftauthproject.com"
+    const origin        = req.body?.origin || null;
+
+    console.log('🔵 Parsed - email:', emailNorm, 'websiteDomain:', websiteDomain, 'origin:', origin);
 
     if (!emailNorm) {
+      console.log('🔴 No email provided');
       return res.status(400).json({ error: 'Email required' });
     }
 
-    const allowed = await checkRateLimit(`ratelimit:login:${emailNorm}`, 10, 60); // 10 per 60s
+    const allowed = await checkRateLimit(`ratelimit:login:${emailNorm}`, 10, 60);
     if (!allowed) {
       console.log(`🚫 Rate limited /request-login for ${emailNorm}`);
       return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
@@ -1208,21 +1325,21 @@ app.post('/request-login', async (req, res) => {
     const requestId = uuidv4();
     const nonce     = crypto.randomBytes(16).toString('hex');
 
-    // 🔐 Compute a real relying-party origin, even if client only sends websiteDomain
     const relyingPartyOrigin =
       origin ||
       (websiteDomain ? `https://${websiteDomain}` : null);
+
+    console.log('🔵 relyingPartyOrigin:', relyingPartyOrigin);
 
     if (!relyingPartyOrigin) {
       console.error('❌ /request-login: no origin or websiteDomain provided');
       return res.status(400).json({ success: false, error: 'origin_required' });
     }
 
-    // Store core login request state (used later when user approves on phone)
     pendingLogins[requestId] = {
       email: emailNorm,
       websiteDomain,
-      origin: relyingPartyOrigin,   // 👈 ALWAYS non-null now
+      origin: relyingPartyOrigin,
       nonce,
       status: 'pending',
       timestamp: Date.now(),
@@ -1230,9 +1347,8 @@ app.post('/request-login', async (req, res) => {
       extSession: null
     };
 
-    // --- Nonce-based challenge object for this login (for token minting / verification) ---
     const challengeNonce     = crypto.randomBytes(16).toString('hex');
-    const challengeExpiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes (ms)
+    const challengeExpiresAt = Date.now() + 5 * 60 * 1000;
 
     const hashedEmail = crypto
       .createHash('sha256')
@@ -1242,16 +1358,23 @@ app.post('/request-login', async (req, res) => {
     loginChallenges[challengeNonce] = {
       requestId,
       emailHash: hashedEmail,
-      relyingPartyOrigin,      // 👈 keep this for later checks
+      relyingPartyOrigin,
       issuedAt: Date.now(),
-      challengeExpiresAt       // 👈 name matches what /verify-login-token expects
+      challengeExpiresAt
     };
 
+    console.log('🔵 Looking up user for email:', emailNorm);
     const user = await db.getUserByEmail(emailNorm);
+    console.log('🔵 User found:', user ? 'yes' : 'no');
+    console.log('🔵 Device token exists:', user?.deviceToken ? 'yes' : 'no');
+    
     const deviceToken = user?.deviceToken;
     if (!deviceToken) {
+      console.log('🔴 No device token for user');
       return res.status(404).json({ error: 'No device token registered' });
     }
+
+    console.log('🔵 Device token (first 20 chars):', deviceToken.substring(0, 20) + '...');
 
     const message = {
       token: deviceToken,
@@ -1278,9 +1401,12 @@ app.post('/request-login', async (req, res) => {
       }
     };
 
+    console.log('🔵 Sending FCM message...');
+    
     try {
-      await admin.messaging().send(message);
+      const fcmResponse = await admin.messaging().send(message);
       console.log(`✅ Push sent to ${emailNorm} (${requestId})`);
+      console.log('✅ FCM Response:', fcmResponse);
       return res.json({
         success: true,
         requestId,
@@ -1289,7 +1415,8 @@ app.post('/request-login', async (req, res) => {
         challengeExpiresAt
       });
     } catch (error) {
-      console.error('❌ FCM error:', error);
+      console.error('❌ FCM error:', error.code, error.message);
+      console.error('❌ FCM full error:', JSON.stringify(error, null, 2));
       return res.status(500).json({ success: false, error: 'Failed to send push notification' });
     }
   } catch (err) {
@@ -1300,52 +1427,125 @@ app.post('/request-login', async (req, res) => {
 
 
 
-// app.post('/confirm-login', (req, res) => {
-//   const { requestId, approved, devicePublicKeyJwk } = req.body || {};
-//   const request = pendingLogins[requestId];
-//   if (!request) return res.status(404).json({ success: false, error: 'Request not found' });
-
-//   request.status = approved ? 'approved' : 'denied';
-//   if (approved && devicePublicKeyJwk && devicePublicKeyJwk.x && devicePublicKeyJwk.y) {
-//     request.devicePublicKeyJwk = devicePublicKeyJwk;
-//     console.log(`📎 Stored devicePublicKeyJwk for ${requestId} (x.len=${devicePublicKeyJwk.x.length})`);
-//   } else if (approved) {
-//     console.warn(`⚠️ Approved but missing/invalid devicePublicKeyJwk for ${requestId}`);
-//   }
-//   res.json({ success: true, message: `Login ${approved ? 'approved' : 'denied'}` });
-// });
 
 
 // Phone → approves or denies a login request
 // Body: { requestId, approved, deviceFpr? }
 // Body: { requestId, approved: true/false, deviceHash? }
+// app.post('/confirm-login', (req, res) => {
+//   try {
+//     const requestId = String(req.body?.requestId || '').trim();
+//     const approved  = !!req.body?.approved;
+//     const devicePublicKeyJwk = req.body?.devicePublicKeyJwk || null;
+
+//     if (!requestId) {
+//       return res.status(400).json({ success: false, error: 'requestId required' });
+//     }
+
+//     const login = pendingLogins[requestId];
+//     if (!login) {
+//       return res.status(404).json({ success: false, error: 'login_not_found' });
+//     }
+
+//     if (login.status !== 'pending') {
+//       return res.status(409).json({ success: false, error: 'login_not_pending' });
+//     }
+
+//     // If mobile says "deny", just record and return
+//     if (!approved) {
+//       login.status = 'denied';
+//       login.deniedAt = Date.now();
+//       return res.json({ success: true, approved: false });
+//     }
+
+//     const { email: emailNorm, origin, nonce } = login;
+
+//     if (!origin) {
+//       console.error('❌ /confirm-login: missing origin on pending login', requestId);
+//       return res.status(400).json({ success: false, error: 'missing_origin' });
+//     }
+//     if (!emailNorm || !nonce) {
+//       console.error('❌ /confirm-login: missing email/nonce on pending login', requestId);
+//       return res.status(400).json({ success: false, error: 'missing_email_or_nonce' });
+//     }
+
+//     // Optionally store device key JWK (for future session / key binding)
+//     if (devicePublicKeyJwk) {
+//       login.devicePublicKeyJwk = devicePublicKeyJwk;
+//     }
+
+//     // 🔐 Issue origin-bound, nonce-bound login token
+//     let loginToken;
+//     try {
+//       loginToken = makeLoginToken({
+//         emailNorm,
+//         origin,
+//         deviceHash: null, // or a real deviceHash if you have it
+//         nonce
+//       });
+//     } catch (e) {
+//       console.error('❌ /confirm-login makeLoginToken failed:', e.message || e);
+//       return res.status(500).json({ success: false, error: 'token_issue_failed' });
+//     }
+
+//     login.status      = 'approved';
+//     login.approvedAt  = Date.now();
+//     login.loginToken  = loginToken;
+
+//     return res.json({
+//       success:  true,
+//       approved: true,
+//       requestId,
+//       token:    loginToken
+//     });
+//   } catch (err) {
+//     console.error('❌ /confirm-login error:', err);
+//     return res.status(500).json({ success: false, error: 'internal_error' });
+//   }
+// });
+
 app.post('/confirm-login', (req, res) => {
+  console.log('🟢 /confirm-login HIT');
+  console.log('🟢 Headers:', JSON.stringify(req.headers, null, 2));
+  console.log('🟢 Body:', JSON.stringify(req.body, null, 2));
+  
   try {
     const requestId = String(req.body?.requestId || '').trim();
     const approved  = !!req.body?.approved;
     const devicePublicKeyJwk = req.body?.devicePublicKeyJwk || null;
 
+    console.log('🟢 Parsed - requestId:', requestId, 'approved:', approved);
+    console.log('🟢 devicePublicKeyJwk:', devicePublicKeyJwk ? 'present' : 'null');
+
     if (!requestId) {
+      console.log('🔴 No requestId provided');
       return res.status(400).json({ success: false, error: 'requestId required' });
     }
 
     const login = pendingLogins[requestId];
+    console.log('🟢 Pending login found:', login ? 'yes' : 'no');
+    
     if (!login) {
+      console.log('🔴 Login not found for requestId:', requestId);
       return res.status(404).json({ success: false, error: 'login_not_found' });
     }
 
+    console.log('🟢 Login status:', login.status);
+    
     if (login.status !== 'pending') {
+      console.log('🔴 Login not pending, current status:', login.status);
       return res.status(409).json({ success: false, error: 'login_not_pending' });
     }
 
-    // If mobile says "deny", just record and return
     if (!approved) {
+      console.log('🟡 Login denied by user');
       login.status = 'denied';
       login.deniedAt = Date.now();
       return res.json({ success: true, approved: false });
     }
 
     const { email: emailNorm, origin, nonce } = login;
+    console.log('🟢 Login data - email:', emailNorm, 'origin:', origin, 'nonce:', nonce);
 
     if (!origin) {
       console.error('❌ /confirm-login: missing origin on pending login', requestId);
@@ -1356,20 +1556,22 @@ app.post('/confirm-login', (req, res) => {
       return res.status(400).json({ success: false, error: 'missing_email_or_nonce' });
     }
 
-    // Optionally store device key JWK (for future session / key binding)
     if (devicePublicKeyJwk) {
       login.devicePublicKeyJwk = devicePublicKeyJwk;
+      console.log('🟢 Stored devicePublicKeyJwk');
     }
 
-    // 🔐 Issue origin-bound, nonce-bound login token
+    console.log('🟢 Generating login token...');
+    
     let loginToken;
     try {
       loginToken = makeLoginToken({
         emailNorm,
         origin,
-        deviceHash: null, // or a real deviceHash if you have it
+        deviceHash: null,
         nonce
       });
+      console.log('🟢 Login token generated successfully');
     } catch (e) {
       console.error('❌ /confirm-login makeLoginToken failed:', e.message || e);
       return res.status(500).json({ success: false, error: 'token_issue_failed' });
@@ -1378,6 +1580,8 @@ app.post('/confirm-login', (req, res) => {
     login.status      = 'approved';
     login.approvedAt  = Date.now();
     login.loginToken  = loginToken;
+
+    console.log('✅ Login approved for', emailNorm, 'requestId:', requestId);
 
     return res.json({
       success:  true,
@@ -1390,7 +1594,6 @@ app.post('/confirm-login', (req, res) => {
     return res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
-
 
 
 

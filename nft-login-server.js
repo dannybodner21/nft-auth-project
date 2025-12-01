@@ -460,6 +460,7 @@ app.use(cors({
     'https://nftauthproject-two.webflow.io',
     'https://nftauthproject-one.webflow.io',
     'https://nftauthproject.com',
+    'https://www.nftauthproject.como',
     'http://localhost:3000',
     'http://localhost:8080',
     'http://127.0.0.1:3000',

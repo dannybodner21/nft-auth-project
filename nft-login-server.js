@@ -460,7 +460,7 @@ app.use(cors({
     'https://nftauthproject-two.webflow.io',
     'https://nftauthproject-one.webflow.io',
     'https://nftauthproject.com',
-    'https://www.nftauthproject.como',
+    'https://www.nftauthproject.com',
     'http://localhost:3000',
     'http://localhost:8080',
     'http://127.0.0.1:3000',
@@ -473,17 +473,24 @@ app.use(cors({
 
 app.use(express.json());
 
-// CORS — allow Chrome extensions; native apps / SW send no Origin
+// Extra CORS for Chrome extension only
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   const isExtension = typeof origin === 'string' && origin.startsWith('chrome-extension://');
+
   if (isExtension) {
+    // Allow the extension explicitly
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(200);
+    }
   }
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+
+  // For non-extension origins, let cors() handle OPTIONS
   next();
 });
 

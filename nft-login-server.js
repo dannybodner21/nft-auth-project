@@ -1077,6 +1077,89 @@ app.post('/burn-and-remint', async (req, res) => {
 
 
 
+// ========== Email verification endpoints ==================
+
+// TTL: 10 minutes
+const EMAIL_CODE_TTL_MS = 10 * 60 * 1000;
+
+// Send code to email (dev: logged to console)
+app.post('/send-email-code', async (req, res) => {
+  try {
+    const rawEmail  = String(req.body?.email || '').trim();
+    const emailNorm = normalizeEmail(rawEmail);
+
+    if (!emailNorm) {
+      return res.status(400).json({ success: false, error: 'email required' });
+    }
+
+    // Optional per-email rate limit (max 5 codes per 10 min)
+    const ok = await checkRateLimit(`ratelimit:emailcode:${emailNorm}`, 5, 600);
+    if (!ok) {
+      return res.status(429).json({ success: false, error: 'too_many_codes' });
+    }
+
+    const code = makeCode6();
+    pendingEmailCodes[emailNorm] = {
+      code,
+      createdAt: Date.now()
+    };
+
+    console.log(`📧 Email verification code for ${emailNorm}: ${code}`);
+
+    // TODO: hook real email sender instead of console.log
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('🔥 /send-email-code error:', err);
+    return res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
+
+// Verify code
+app.post('/verify-email-code', (req, res) => {
+  try {
+    const rawEmail  = String(req.body?.email || '').trim();
+    const emailNorm = normalizeEmail(rawEmail);
+    const code      = String(req.body?.code || '').trim();
+
+    if (!emailNorm || !code) {
+      return res.status(400).json({ success: false, error: 'email and code required' });
+    }
+
+    const entry = pendingEmailCodes[emailNorm];
+    if (!entry) {
+      return res.status(400).json({ success: false, error: 'no_code_for_email' });
+    }
+
+    if (Date.now() - entry.createdAt > EMAIL_CODE_TTL_MS) {
+      delete pendingEmailCodes[emailNorm];
+      return res.status(400).json({ success: false, error: 'code_expired' });
+    }
+
+    if (entry.code !== code) {
+      return res.status(400).json({ success: false, error: 'invalid_code' });
+    }
+
+    // success
+    delete pendingEmailCodes[emailNorm];
+    verifiedEmails[emailNorm] = true;
+
+    console.log(`✅ Email verified: ${emailNorm}`);
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('🔥 /verify-email-code error:', err);
+    return res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
+
+
+// === END: Email verification endpoints ==================
+
+
+
+
+
+
 
 
 // ---------------------- Token registration ----------------------

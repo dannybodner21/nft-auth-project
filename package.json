@@ -27,6 +27,7 @@
     "firebase-admin": "^13.4.0",
     "ioredis": "^5.8.2",
     "jsonwebtoken": "^9.0.2",
+    "nodemailer": "^7.0.11",
     "uuid": "^11.1.0"
   }
 }

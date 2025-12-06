@@ -351,63 +351,57 @@ const CARD_PUBKEY_PEM_INLINE    = process.env.CARD_PUBKEY_PEM || "";           /
 
 
 // --- Email (SMTP) config for verification codes ---
-const SMTP_HOST = process.env.SMTP_HOST || "";
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_USER = process.env.SMTP_USER || "";
-const SMTP_PASS = process.env.SMTP_PASS || "";
-const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
-const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
+// const SMTP_HOST = process.env.SMTP_HOST || "";
+// const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+// const SMTP_USER = process.env.SMTP_USER || "";
+// const SMTP_PASS = process.env.SMTP_PASS || "";
+// const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
+// const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
 
-let mailTransport = null;
+// let mailTransport = null;
 
-// Debug what the server actually sees from Render
-console.log('[SMTP] boot config:', {
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  secure: SMTP_SECURE,
-  hasUser: !!SMTP_USER,
-  hasPass: !!SMTP_PASS,
-  from: SMTP_FROM,
-});
 
-if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
-  mailTransport = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS
-    }
-  });
 
-  mailTransport.verify().then(() => {
-    console.log("✅ SMTP mail transport ready");
-  }).catch(err => {
-    console.error("❌ SMTP verify failed:", err.message);
-    //mailTransport = null;
-  });
+
+
+
+const { Resend } = require('resend');
+
+let resend = null;
+if (process.env.RESEND_API_KEY) {
+  resend = new Resend(process.env.RESEND_API_KEY);
+  console.log("📧 Resend initialized");
 } else {
-  console.warn("⚠️ SMTP not fully configured; set SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM");
+  console.log("⚠️ RESEND_API_KEY missing");
 }
 
-async function sendVerificationEmail(emailNorm, code) {
-  console.log(`📧 Email verification code for ${emailNorm}: ${code}`);
-
-  if (!mailTransport) {
-    console.error('❌ sendVerificationEmail: mailTransport is null');
-    throw new Error('mail transport not configured');
+async function sendVerificationEmail(to, code) {
+  if (!resend) {
+    console.error("❌ Resend not initialized");
+    return false;
   }
 
-  const info = await mailTransport.sendMail({
-    from: SMTP_FROM,
-    to: emailNorm,
-    subject: 'Your NFTAuth Project verification code',
-    text: `Your verification code is: ${code}\n\nThis code expires in 10 minutes.`,
-  });
+  try {
+    const resp = await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || "no-reply@nftauthproject.com",
+      to,
+      subject: "Your NFTAuth verification code",
+      text: `Your verification code is: ${code}`,
+    });
 
-  console.log('✉️ Verification email sent, messageId:', info.messageId);
+    console.log("📩 Resend response:", resp);
+    return true;
+
+  } catch (err) {
+    console.error("❌ Resend send error:", err);
+    return false;
+  }
 }
+
+
+
+
+
 
 
 
@@ -1030,9 +1024,13 @@ app.post('/send-email-code', async (req, res) => {
     console.log(`📧 Email verification code for ${emailNorm}: ${code}`);
 
     // actually send the email
-    await sendVerificationEmail(rawEmail, code);
+    const ok = await sendVerificationEmail(emailNorm, code);
+    if (!ok) {
+      return res.status(500).json({ success: false, error: "email send failed" });
+    }
 
     return res.json({ success: true });
+    
   } catch (err) {
     console.error('🔥 /send-email-code error:', err);
     return res.status(500).json({

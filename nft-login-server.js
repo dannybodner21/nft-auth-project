@@ -352,10 +352,10 @@ const CARD_PUBKEY_PEM_INLINE    = process.env.CARD_PUBKEY_PEM || "";           /
 
 // --- Email (SMTP) config for verification codes ---
 const SMTP_HOST = process.env.SMTP_HOST || "";
-const SMTP_PORT = parseInt(process.env.SMTP_PORT || "587", 10);
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_USER = process.env.SMTP_USER || "";
 const SMTP_PASS = process.env.SMTP_PASS || "";
-const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER || "no-reply@nftauthproject.com";
+const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
 const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
 
 let mailTransport = null;
@@ -363,8 +363,8 @@ let mailTransport = null;
 if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
   mailTransport = nodemailer.createTransport({
     host: SMTP_HOST,
-    port: Number(SMTP_PORT),
-    secure: SMTP_SECURE === "true",   // <-- use the env var, NOT port logic
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
     auth: {
       user: SMTP_USER,
       pass: SMTP_PASS

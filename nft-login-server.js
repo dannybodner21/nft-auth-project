@@ -356,6 +356,7 @@ const SMTP_PORT = parseInt(process.env.SMTP_PORT || "587", 10);
 const SMTP_USER = process.env.SMTP_USER || "";
 const SMTP_PASS = process.env.SMTP_PASS || "";
 const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER || "no-reply@nftauthproject.com";
+const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
 
 let mailTransport = null;
 

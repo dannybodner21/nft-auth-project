@@ -28,6 +28,7 @@
     "ioredis": "^5.8.2",
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^7.0.11",
+    "resend": "^6.4.2",
     "uuid": "^11.1.0"
   }
 }

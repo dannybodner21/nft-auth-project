@@ -367,7 +367,7 @@ console.log('[SMTP] boot config:', {
   secure: SMTP_SECURE,
   hasUser: !!SMTP_USER,
   hasPass: !!SMTP_PASS,
-  from: FROM_EMAIL,
+  from: SMTP_FROM,
 });
 
 if (SMTP_HOST && SMTP_USER && SMTP_PASS) {

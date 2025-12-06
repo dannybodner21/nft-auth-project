@@ -402,18 +402,6 @@ async function sendVerificationEmail(to, code) {
 
 
 
-// ---------------------- Load Testing ----------------------
-app.get("/load-test", (req, res) => {
-  res.status(200).send("OK");
-});
-
-
-// ---------------------- End: Load Testing -----------------
-
-
-
-
-
 // ---------------------- Helpers ----------------------
 const normalizeEmail = (s) => String(s || '').trim().toLowerCase();
 
@@ -585,6 +573,18 @@ if (process.env.FIREBASE_CONFIG) {
 
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+
+
+
+// ---------------------- Load Testing ----------------------
+app.get("/load-test", (req, res) => {
+  res.status(200).send("OK");
+});
+
+
+// ---------------------- End: Load Testing -----------------
+
+
 
 // ---------------------- Card public key load ----------------------
 function keyInfoFromKeyObject(keyObj) {

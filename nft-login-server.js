@@ -362,8 +362,8 @@ let mailTransport = null;
 if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
   mailTransport = nodemailer.createTransport({
     host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465, // true if using 465
+    port: Number(SMTP_PORT),
+    secure: SMTP_SECURE === "true",   // <-- use the env var, NOT port logic
     auth: {
       user: SMTP_USER,
       pass: SMTP_PASS

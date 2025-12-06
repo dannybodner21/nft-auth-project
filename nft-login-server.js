@@ -402,6 +402,15 @@ async function sendVerificationEmail(to, code) {
 
 
 
+// ---------------------- Load Testing ----------------------
+app.get("/load-test", (req, res) => {
+  res.status(200).send("OK");
+});
+
+
+// ---------------------- End: Load Testing -----------------
+
+
 
 
 
@@ -1030,7 +1039,7 @@ app.post('/send-email-code', async (req, res) => {
     }
 
     return res.json({ success: true });
-    
+
   } catch (err) {
     console.error('🔥 /send-email-code error:', err);
     return res.status(500).json({
@@ -4136,6 +4145,9 @@ app.get('/runtime', async (req, res) => {
 
 // ---------------------- Start ----------------------
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`NFT Login server running on port ${PORT}`);
 });
+
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;

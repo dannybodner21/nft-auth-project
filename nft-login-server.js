@@ -6,8 +6,8 @@ const admin = require('firebase-admin');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-
 const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET || 'CHANGE_ME_IN_PROD';
 const AUTH_JWT_TTL_SECONDS = 5 * 60; // 5 minutes
@@ -348,6 +348,59 @@ const DEVICE_PEPPER             = process.env.DEVICE_COMMITMENT_PEPPER;
 // Card auth public key (choose ONE source; path preferred)
 const CARD_AUTH_PUBKEY_PEM_PATH = process.env.CARD_AUTH_PUBKEY_PEM_PATH || ""; // file path to PEM (SPKI)
 const CARD_PUBKEY_PEM_INLINE    = process.env.CARD_PUBKEY_PEM || "";           // inline PEM (SPKI)
+
+
+// --- Email (SMTP) config for verification codes ---
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || "587", 10);
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER || "no-reply@nftauthproject.com";
+
+let mailTransport = null;
+
+if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
+  mailTransport = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_PORT === 465, // true if using 465
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS
+    }
+  });
+
+  mailTransport.verify().then(() => {
+    console.log("✅ SMTP mail transport ready");
+  }).catch(err => {
+    console.error("❌ SMTP verify failed:", err.message);
+    mailTransport = null;
+  });
+} else {
+  console.warn("⚠️ SMTP not fully configured; set SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM");
+}
+
+async function sendVerificationEmail(toEmail, code) {
+  if (!mailTransport) {
+    throw new Error("mail transport not configured");
+  }
+
+  const mailOptions = {
+    from: SMTP_FROM,
+    to: toEmail,
+    subject: "Your NFTAuth Project verification code",
+    text: `Your NFTAuth Project verification code is: ${code}\n\nThis code will expire in 10 minutes.`,
+    html: `
+      <p>Your NFTAuth Project verification code is:</p>
+      <p style="font-size:24px;font-weight:bold;">${code}</p>
+      <p>This code will expire in 10 minutes.</p>
+    `
+  };
+
+  const info = await mailTransport.sendMail(mailOptions);
+  console.log("📧 Verification email sent:", info.messageId, "to", toEmail);
+}
+
 
 // ---------------------- Helpers ----------------------
 const normalizeEmail = (s) => String(s || '').trim().toLowerCase();
@@ -1089,30 +1142,36 @@ app.post('/send-email-code', async (req, res) => {
     const emailNorm = normalizeEmail(rawEmail);
 
     if (!emailNorm) {
-      return res.status(400).json({ success: false, error: 'email required' });
-    }
-
-    // Optional per-email rate limit (max 5 codes per 10 min)
-    const ok = await checkRateLimit(`ratelimit:emailcode:${emailNorm}`, 5, 600);
-    if (!ok) {
-      return res.status(429).json({ success: false, error: 'too_many_codes' });
+      return res.status(400).json({
+        success: false,
+        error: 'email required'
+      });
     }
 
     const code = makeCode6();
+    const now  = Date.now();
+
+    // store code in memory with 10-minute TTL
     pendingEmailCodes[emailNorm] = {
       code,
-      createdAt: Date.now()
+      createdAt: now
     };
 
     console.log(`📧 Email verification code for ${emailNorm}: ${code}`);
 
-    // TODO: hook real email sender instead of console.log
+    // actually send the email
+    await sendVerificationEmail(rawEmail, code);
+
     return res.json({ success: true });
   } catch (err) {
     console.error('🔥 /send-email-code error:', err);
-    return res.status(500).json({ success: false, error: 'server_error' });
+    return res.status(500).json({
+      success: false,
+      error: 'failed_to_send_email_code'
+    });
   }
 });
+
 
 // Verify code
 app.post('/verify-email-code', (req, res) => {
@@ -1122,35 +1181,52 @@ app.post('/verify-email-code', (req, res) => {
     const code      = String(req.body?.code || '').trim();
 
     if (!emailNorm || !code) {
-      return res.status(400).json({ success: false, error: 'email and code required' });
+      return res.status(400).json({
+        success: false,
+        error: 'email and code required'
+      });
     }
 
-    const entry = pendingEmailCodes[emailNorm];
-    if (!entry) {
-      return res.status(400).json({ success: false, error: 'no_code_for_email' });
+    const rec = pendingEmailCodes[emailNorm];
+    if (!rec) {
+      return res.status(400).json({
+        success: false,
+        error: 'no_code_for_email'
+      });
     }
 
-    if (Date.now() - entry.createdAt > EMAIL_CODE_TTL_MS) {
+    // 10 minute TTL
+    if (Date.now() - rec.createdAt > 10 * 60 * 1000) {
       delete pendingEmailCodes[emailNorm];
-      return res.status(400).json({ success: false, error: 'code_expired' });
+      return res.status(400).json({
+        success: false,
+        error: 'code_expired'
+      });
     }
 
-    if (entry.code !== code) {
-      return res.status(400).json({ success: false, error: 'invalid_code' });
+    if (rec.code !== code) {
+      return res.status(400).json({
+        success: false,
+        error: 'invalid_code'
+      });
     }
 
-    // success
-    delete pendingEmailCodes[emailNorm];
+    // success: mark verified & wipe
     verifiedEmails[emailNorm] = true;
+    delete pendingEmailCodes[emailNorm];
 
     console.log(`✅ Email verified: ${emailNorm}`);
 
     return res.json({ success: true });
   } catch (err) {
     console.error('🔥 /verify-email-code error:', err);
-    return res.status(500).json({ success: false, error: 'server_error' });
+    return res.status(500).json({
+      success: false,
+      error: 'verify_email_internal_error'
+    });
   }
 });
+
 
 
 // === END: Email verification endpoints ==================

@@ -360,6 +360,14 @@ const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true
 
 let mailTransport = null;
 
+console.log("🔍 SMTP DEBUG:");
+console.log("  SMTP_HOST =", process.env.SMTP_HOST);
+console.log("  SMTP_PORT =", process.env.SMTP_PORT);
+console.log("  SMTP_SECURE =", process.env.SMTP_SECURE);
+console.log("  SMTP_USER =", process.env.SMTP_USER);
+console.log("  SMTP_PASS =", process.env.SMTP_PASS ? "(present)" : "(missing)");
+console.log("  FROM_EMAIL =", process.env.FROM_EMAIL);
+
 if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
   mailTransport = nodemailer.createTransport({
     host: SMTP_HOST,

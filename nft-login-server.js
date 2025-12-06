@@ -360,13 +360,15 @@ const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true
 
 let mailTransport = null;
 
-console.log("🔍 SMTP DEBUG:");
-console.log("  SMTP_HOST =", process.env.SMTP_HOST);
-console.log("  SMTP_PORT =", process.env.SMTP_PORT);
-console.log("  SMTP_SECURE =", process.env.SMTP_SECURE);
-console.log("  SMTP_USER =", process.env.SMTP_USER);
-console.log("  SMTP_PASS =", process.env.SMTP_PASS ? "(present)" : "(missing)");
-console.log("  FROM_EMAIL =", process.env.FROM_EMAIL);
+// Debug what the server actually sees from Render
+console.log('[SMTP] boot config:', {
+  host: SMTP_HOST,
+  port: SMTP_PORT,
+  secure: SMTP_SECURE,
+  hasUser: !!SMTP_USER,
+  hasPass: !!SMTP_PASS,
+  from: FROM_EMAIL,
+});
 
 if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
   mailTransport = nodemailer.createTransport({
@@ -383,32 +385,30 @@ if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
     console.log("✅ SMTP mail transport ready");
   }).catch(err => {
     console.error("❌ SMTP verify failed:", err.message);
-    mailTransport = null;
+    //mailTransport = null;
   });
 } else {
   console.warn("⚠️ SMTP not fully configured; set SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM");
 }
 
-async function sendVerificationEmail(toEmail, code) {
+async function sendVerificationEmail(emailNorm, code) {
+  console.log(`📧 Email verification code for ${emailNorm}: ${code}`);
+
   if (!mailTransport) {
-    throw new Error("mail transport not configured");
+    console.error('❌ sendVerificationEmail: mailTransport is null');
+    throw new Error('mail transport not configured');
   }
 
-  const mailOptions = {
+  const info = await mailTransport.sendMail({
     from: SMTP_FROM,
-    to: toEmail,
-    subject: "Your NFTAuth Project verification code",
-    text: `Your NFTAuth Project verification code is: ${code}\n\nThis code will expire in 10 minutes.`,
-    html: `
-      <p>Your NFTAuth Project verification code is:</p>
-      <p style="font-size:24px;font-weight:bold;">${code}</p>
-      <p>This code will expire in 10 minutes.</p>
-    `
-  };
+    to: emailNorm,
+    subject: 'Your NFTAuth Project verification code',
+    text: `Your verification code is: ${code}\n\nThis code expires in 10 minutes.`,
+  });
 
-  const info = await mailTransport.sendMail(mailOptions);
-  console.log("📧 Verification email sent:", info.messageId, "to", toEmail);
+  console.log('✉️ Verification email sent, messageId:', info.messageId);
 }
+
 
 
 // ---------------------- Helpers ----------------------

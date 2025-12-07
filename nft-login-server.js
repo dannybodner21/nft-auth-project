@@ -941,65 +941,107 @@ app.post('/verify-recovery', async (req, res) => {
 
 app.post('/burn-and-remint', async (req, res) => {
   try {
-    const emailNorm = normalizeEmail(req.body?.email || '');
+    const emailNorm  = normalizeEmail(req.body?.email || '');
     const newAddress = String(req.body?.newAddress || '').toLowerCase();
-    const deviceId = String(req.body?.deviceId || '');
-    
+    const deviceId   = String(req.body?.deviceId || '');
+
     if (!emailNorm || !newAddress || !deviceId) {
-      return res.status(400).json({ success: false, error: 'email, newAddress, and deviceId required' });
+      return res.status(400).json({ success:false, error:'email, newAddress, deviceId required' });
     }
-    
     if (!isAddress(newAddress)) {
-      return res.status(400).json({ success: false, error: 'Invalid new address' });
+      return res.status(400).json({ success:false, error:'Invalid newAddress' });
     }
-    
-    // Just mint new NFT to new address
-    // The old NFT will still exist but user won't have access to old device
-    // In production, you'd call the reissue function on the contract
+
     const userIdHash = commitUserId(emailNorm);
+    const oldTokenId = await personaAuth.tokenByUser(userIdHash);
+
+    // 🔥 1) Burn old token if exists
+    if (oldTokenId > 0) {
+      const revokeTx = await personaAuth
+        .connect(revokerSigner)     // signer with REVOKER_ROLE
+        .revoke(oldTokenId);
+      await revokeTx.wait(1);
+      console.log(`🔥 Burned old NFT ${oldTokenId} for ${emailNorm}`);
+    }
+
+    // ✅ 2) Mint replacement token
     const deviceHash = commitDevice(deviceId);
 
-    const domain = { name: "PersonaAuth", version: "1", chainId: 137, verifyingContract: CONTRACT_ADDRESS };
-    const types  = { MintAuth: [
-      { name: "to",          type: "address" },
-      { name: "userIdHash",  type: "bytes32" },
-      { name: "deviceHash",  type: "bytes32" },
-      { name: "salt",        type: "bytes32" },
-      { name: "deadline",    type: "uint256" },
-    ]};
+    const domain = { name: "PersonaAuth", version:"1", chainId:137, verifyingContract: CONTRACT_ADDRESS };
+    const types = { MintAuth: [
+      { name:"to", type:"address" },
+      { name:"userIdHash", type:"bytes32" },
+      { name:"deviceHash", type:"bytes32" },
+      { name:"salt", type:"bytes32" },
+      { name:"deadline", type:"uint256" },
+    ] };
 
-    const salt     = ethers.utils.hexlify(ethers.utils.randomBytes(32));
-    const deadline = Math.floor(Date.now() / 1000) + 10 * 60;
+    const salt = ethers.utils.hexlify(ethers.utils.randomBytes(32));
+    const deadline = Math.floor(Date.now()/1000) + 600;
 
     const minter = new ethers.Wallet(MINTER_PRIVATE_KEY);
-    const signature = await minter._signTypedData(domain, types, { to: newAddress, userIdHash, deviceHash, salt, deadline });
-
-    const fee = await getAggressiveFees(provider);
-    const tx = await personaAuth.mintWithSig(newAddress, userIdHash, deviceHash, salt, deadline, signature, {
-      maxFeePerGas:         fee.maxFeePerGas,
-      maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+    const sig = await minter._signTypedData(domain, types, {
+      to:newAddress, userIdHash, deviceHash, salt, deadline
     });
-    
-    console.log(`🔥 Recovery: minted new NFT for ${emailNorm} to ${newAddress}, tx: ${tx.hash}`);
-    
-    if (typeof tx.wait === 'function') await tx.wait(1);
-    else await provider.waitForTransaction(tx.hash, 1);
-    
-    res.json({ success: true, txHash: tx.hash });
-  } catch (e) {
-    console.error('❌ /burn-and-remint error:', e);
-    const msg = (e?.reason || e?.error?.message || String(e)).toLowerCase();
-    if (msg.includes('identity already issued')) {
-      // Old NFT still exists - need to use reissue instead
-      return res.status(400).json({ success: false, error: 'Identity already exists, old NFT must be revoked first' });
-    }
-    res.status(500).json({ success: false, error: 'burn and remint failed' });
+
+    const fees = await getAggressiveFees(provider);
+
+    const mintTx = await personaAuth.mintWithSig(
+      newAddress, userIdHash, deviceHash, salt, deadline, sig,
+      { maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas }
+    );
+    await mintTx.wait(1);
+
+    console.log(`♻️ Recovery mint complete for ${emailNorm}, tx: ${mintTx.hash}`);
+
+    return res.json({ success:true, txHash:mintTx.hash });
+  } catch (err) {
+    console.error("❌ burn-and-remint error:", err);
+    return res.status(500).json({ success:false, error:"burn_and_remint_failed" });
   }
 });
+
 
 // === END: Account recovery through seed phrase ==================
 
 
+
+// ========== Fully delete an account endpoint ==================
+
+app.post('/burn-and-reset-account', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.body?.email || '');
+    if (!emailNorm) {
+      return res.status(400).json({ success:false, error:"email required" });
+    }
+
+    const userIdHash = commitUserId(emailNorm);
+    const tokenId = await personaAuth.tokenByUser(userIdHash);
+
+    // 🔥 Burn NFT if present
+    if (tokenId > 0) {
+      const tx = await personaAuth.connect(revokerSigner).revoke(tokenId);
+      await tx.wait(1);
+      console.log(`🔥 Reset: burned token ${tokenId} for ${emailNorm}`);
+    }
+
+    // 🧹 Clear server state
+    delete verifiedEmails[emailNorm];
+    delete userTokens[emailNorm];
+    delete pendingEmailCodes[emailNorm];
+    delete linkedHardware[emailNorm];   // if you have this map
+    delete deviceFingerprints[emailNorm]; // if you store device bindings
+
+    console.log(`🧹 Cleared all backend state for ${emailNorm}`);
+
+    return res.json({ success:true, reset:true });
+  } catch (err) {
+    console.error("❌ burn-and-reset-account error:", err);
+    return res.status(500).json({ success:false, error:"reset_failed" });
+  }
+});
+
+// ================== END: Account deletion ======================
 
 
 

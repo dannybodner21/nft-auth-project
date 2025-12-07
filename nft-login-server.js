@@ -646,7 +646,8 @@ if (RPC_URL && CONTRACT_ADDRESS && DEPLOYER_PRIVATE_KEY && MINTER_PRIVATE_KEY &&
     "function tokenByUser(bytes32 userIdHash) view returns (uint256)",
     "function ownerOf(uint256 tokenId) view returns (address)",
     "function balanceOf(address owner) view returns (uint256)",
-    "function locked(uint256 tokenId) view returns (bool)"
+    "function locked(uint256 tokenId) view returns (bool)",
+    "function revoke(uint256 tokenId) external"
 ];
   personaAuth = new ethers.Contract(CONTRACT_ADDRESS, personaAuthAbi, relayerSigner);
 } else {

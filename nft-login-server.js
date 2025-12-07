@@ -1010,36 +1010,101 @@ app.post('/burn-and-remint', async (req, res) => {
 
 app.post('/burn-and-reset-account', async (req, res) => {
   try {
-    const emailNorm = normalizeEmail(req.body?.email || '');
-    if (!emailNorm) {
-      return res.status(400).json({ success:false, error:"email required" });
+    const rawEmail  = String(req.body?.email || '').trim();
+    const emailNorm = normalizeEmail(rawEmail);
+
+    if (!emailNorm || !emailNorm.includes('@')) {
+      return res.status(400).json({
+        success: false,
+        error: 'valid email required'
+      });
     }
 
+    if (!personaAuth) {
+      return res.status(503).json({
+        success: false,
+        error: 'Contract not configured'
+      });
+    }
+
+    console.log(`🔥 burn-and-reset-account for ${emailNorm}`);
+
+    // 1) Find tokenId by userIdHash
     const userIdHash = commitUserId(emailNorm);
-    const tokenId = await personaAuth.tokenByUser(userIdHash);
 
-    // 🔥 Burn NFT if present
-    if (tokenId > 0) {
-      const tx = await personaAuth.connect(revokerSigner).revoke(tokenId);
-      await tx.wait(1);
-      console.log(`🔥 Reset: burned token ${tokenId} for ${emailNorm}`);
+    let tokenId;
+    try {
+      tokenId = await personaAuth.tokenByUser(userIdHash);
+    } catch (e) {
+      console.error('❌ tokenByUser failed:', e);
+      return res.status(500).json({
+        success: false,
+        error: 'tokenByUser_failed'
+      });
     }
 
-    // 🧹 Clear server state
-    delete verifiedEmails[emailNorm];
-    delete userTokens[emailNorm];
-    delete pendingEmailCodes[emailNorm];
-    delete linkedHardware[emailNorm];   // if you have this map
-    delete deviceFingerprints[emailNorm]; // if you store device bindings
+    const idNum = tokenId?.toString?.() || String(tokenId || '0');
+    const numericId = BigInt(idNum);
 
-    console.log(`🧹 Cleared all backend state for ${emailNorm}`);
+    // 2) If there is an active token, revoke it
+    if (numericId !== 0n) {
+      console.log(`🔎 Found tokenId ${numericId} for ${emailNorm}, revoking…`);
 
-    return res.json({ success:true, reset:true });
+      const fee = await getAggressiveFees(provider);
+
+      const tx = await personaAuth.revoke(numericId, {
+        maxFeePerGas:         fee.maxFeePerGas,
+        maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+      });
+
+      console.log(`⛓️  revoke(${numericId}) → ${tx.hash}`);
+
+      if (typeof tx.wait === 'function') {
+        await tx.wait(1);
+      } else {
+        await provider.waitForTransaction(tx.hash, 1);
+      }
+
+      console.log(`✅ Revoked token ${numericId} for ${emailNorm}`);
+    } else {
+      console.log(`ℹ️ No active token for ${emailNorm}, skipping revoke`);
+    }
+
+    // 3) Clear all backend state for this email
+    try {
+      if (userTokens[emailNorm]) {
+        delete userTokens[emailNorm];
+      }
+      if (verifiedEmails[emailNorm]) {
+        delete verifiedEmails[emailNorm];
+      }
+      if (pendingEmailCodes[emailNorm]) {
+        delete pendingEmailCodes[emailNorm];
+      }
+      // If you have any other per-email maps, clear them here.
+      // e.g. card mappings, device registries, etc.
+    } catch (e) {
+      console.error('⚠️ Error clearing backend state for', emailNorm, e);
+      // not fatal, continue
+    }
+
+    console.log(`🧹 Cleared backend state for ${emailNorm}`);
+
+    return res.json({
+      success: true,
+      reset: true
+    });
   } catch (err) {
-    console.error("❌ burn-and-reset-account error:", err);
-    return res.status(500).json({ success:false, error:"reset_failed" });
+    console.error('❌ burn-and-reset-account error:', err);
+    const msg = (err?.reason || err?.error?.message || String(err));
+    return res.status(500).json({
+      success: false,
+      error: 'burn_and_reset_failed',
+      details: msg
+    });
   }
 });
+
 
 // ================== END: Account deletion ======================
 

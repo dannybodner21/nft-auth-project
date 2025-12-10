@@ -668,6 +668,14 @@ let sessionApprovals = {};       // { email: expiryMs }
 let pendingCardChallenges = {};  // { emailNorm: { challenge, expiresAt } }
 const loginChallenges = Object.create(null); // nonce → challenge record
 
+const deviceSigningKeys = Object.create(null);  // emailNorm -> { publicKeyPem, publicKeyJwk, registeredAt }
+const userSecuritySettings = Object.create(null); // emailNorm -> { requireHardware: bool, cardPublicKeyPem: string|null }
+
+
+// DOOR LOCK
+const doorRequests = {}; 
+// key: requestId -> { email, doorId, status, createdAt }
+
 
 // E2EE messaging: in-memory, deliver-once queues keyed by recipient messaging ID
 // messagesByRecipient[recipientMessagingId] = [ { id, ts, senderMessagingId, ciphertextB64 } ]
@@ -688,6 +696,7 @@ let messagingRouting = {};
 //   endedAt?: number,
 //   lastUpdate: number
 // }
+
 const callsById = Object.create(null);
 
 const pendingEmailCodes = {};
@@ -705,17 +714,6 @@ function b64urlToStd(b64) {
   return String(b64 || "").replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
 }
 
-// function keyInfoFromKeyObject(keyObj) {
-//   const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
-//   const sha256  = crypto.createHash('sha256').update(spkiDer).digest('base64');
-//   const details = keyObj.asymmetricKeyDetails || {};
-//   return { alg: keyObj.asymmetricKeyType, modulusBits: details.modulusLength || null, spkiSha256: sha256 };
-// }
-
-
-// function b64urlToStd(b64url) {
-//   return b64url.replace(/-/g, '+').replace(/_/g, '/').replace(/(?<![=])$/,'').padEnd(Math.ceil(b64url.length/4)*4, '=');
-// }
 
 function verifyCardSignature({ publicKey, challenge, signatureB64 }) {
   const msg = Buffer.from(challenge, 'utf8');
@@ -763,69 +761,415 @@ module.exports = { verifyCardSignature };
 
 
 
-// Inspect what key is bound for an email (debug)
-app.get('/card-key-fp/:email', (req, res) => {
-  const emailNorm = normalizeEmail(req.params.email || '');
-  const rec = cardKeys[emailNorm] || null;
-  if (!rec) return res.json({ success: true, bound: false });
-  return res.json({ success: true, bound: true, spkiSha256: rec.spkiSha256 });
+
+
+
+// -----------------------------------------------------------------------------
+// HELPER: Verify P-256 ECDSA signature (ES256)
+// -----------------------------------------------------------------------------
+function verifyES256Signature(publicKeyPem, message, signatureB64url) {
+  try {
+    // Convert base64url to standard base64
+    let sig = signatureB64url
+      .replace(/-/g, '+')
+      .replace(/_/g, '/');
+    const pad = (4 - sig.length % 4) % 4;
+    if (pad) sig += '='.repeat(pad);
+    
+    const sigBuffer = Buffer.from(sig, 'base64');
+    const msgBuffer = Buffer.from(message, 'utf8');
+    
+    // P-256 signature is 64 bytes (r || s), convert to DER for Node.js
+    if (sigBuffer.length !== 64) {
+      console.warn('⚠️ Unexpected signature length:', sigBuffer.length);
+      return false;
+    }
+    
+    const r = sigBuffer.slice(0, 32);
+    const s = sigBuffer.slice(32, 64);
+    const derSig = ecdsaRawToDer(r, s);
+    
+    const verify = crypto.createVerify('SHA256');
+    verify.update(msgBuffer);
+    verify.end();
+    
+    return verify.verify(publicKeyPem, derSig);
+  } catch (e) {
+    console.error('❌ verifyES256Signature error:', e.message);
+    return false;
+  }
+}
+
+// Convert raw ECDSA signature (r || s) to DER format
+function ecdsaRawToDer(r, s) {
+  // Remove leading zeros but ensure positive (add 0x00 if high bit set)
+  const fixInt = (buf) => {
+    let i = 0;
+    while (i < buf.length - 1 && buf[i] === 0) i++;
+    let trimmed = buf.slice(i);
+    if (trimmed[0] & 0x80) {
+      trimmed = Buffer.concat([Buffer.from([0x00]), trimmed]);
+    }
+    return trimmed;
+  };
+  
+  const rFixed = fixInt(r);
+  const sFixed = fixInt(s);
+  
+  const rDer = Buffer.concat([Buffer.from([0x02, rFixed.length]), rFixed]);
+  const sDer = Buffer.concat([Buffer.from([0x02, sFixed.length]), sFixed]);
+  
+  const seq = Buffer.concat([rDer, sDer]);
+  return Buffer.concat([Buffer.from([0x30, seq.length]), seq]);
+}
+
+// -----------------------------------------------------------------------------
+// HELPER: Convert JWK to PEM
+// -----------------------------------------------------------------------------
+function jwkToPem(jwk) {
+  if (jwk.kty !== 'EC' || jwk.crv !== 'P-256') {
+    throw new Error('Only P-256 EC keys supported');
+  }
+  
+  const b64urlDecode = (s) => {
+    let str = s.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = (4 - str.length % 4) % 4;
+    if (pad) str += '='.repeat(pad);
+    return Buffer.from(str, 'base64');
+  };
+  
+  const x = b64urlDecode(jwk.x);
+  const y = b64urlDecode(jwk.y);
+  
+  if (x.length !== 32 || y.length !== 32) {
+    throw new Error('Invalid P-256 key coordinates');
+  }
+  
+  // Build uncompressed point: 0x04 || x || y
+  const point = Buffer.concat([Buffer.from([0x04]), x, y]);
+  
+  // P-256 SPKI structure
+  const ecPublicKeyOID = Buffer.from([0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]);
+  const prime256v1OID = Buffer.from([0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]);
+  
+  const algorithmSeq = Buffer.concat([
+    Buffer.from([0x30, ecPublicKeyOID.length + prime256v1OID.length]),
+    ecPublicKeyOID,
+    prime256v1OID
+  ]);
+  
+  const bitString = Buffer.concat([
+    Buffer.from([0x03, point.length + 1, 0x00]),
+    point
+  ]);
+  
+  const spki = Buffer.concat([
+    Buffer.from([0x30, algorithmSeq.length + bitString.length]),
+    algorithmSeq,
+    bitString
+  ]);
+  
+  const b64 = spki.toString('base64').match(/.{1,64}/g).join('\n');
+  return `-----BEGIN PUBLIC KEY-----\n${b64}\n-----END PUBLIC KEY-----`;
+}
+
+
+
+
+// =========================== LOGIN APP ENDPOINTS =============================
+
+// ---------------------- Token registration ----------------------
+app.post('/save-token', (req, res) => {
+  const { email, deviceToken } = req.body || {};
+  const messagingId = String(req.body?.messagingId || '').trim();
+
+  if (!email || !deviceToken) {
+    return res.status(400).json({ error: 'Email and deviceToken required' });
+  }
+
+  const emailNorm = normalizeEmail(email);
+
+  // Preserve existing single-token mapping
+  userTokens[emailNorm] = deviceToken;
+
+  // NEW: maintain a set of tokens per email for pushes (login, payments, etc.)
+  if (!emailToTokens[emailNorm]) {
+    emailToTokens[emailNorm] = new Set();
+  }
+  emailToTokens[emailNorm].add(deviceToken);
+
+  // If the client passes a messagingId (Curve25519 pubkey), map it to this device token.
+  if (messagingId.length > 0) {
+    messagingRouting[messagingId] = {
+      email: emailNorm,
+      deviceToken
+    };
+    console.log(`💬 Registered messagingId for ${emailNorm} (len=${messagingId.length})`);
+  }
+
+  console.log(`💾 Saved token for ${emailNorm}, tokens=${emailToTokens[emailNorm].size}`);
+  verifiedEmails[emailNorm] = true;
+  res.json({ success: true });
 });
 
-
-
-
-// Card registration: link card public key to user email and global card registry
-app.post('/card-register', (req, res) => {
+// Pre-registration check - make sure email is not already registered
+app.get('/identity-status', async (req, res) => {
   try {
-    const rawEmail  = req.body?.email || '';
-    const emailNorm = normalizeEmail(rawEmail);
-    const spkiPem   = req.body?.spkiPem || req.body?.publicKeyPem;
-
-    if (!emailNorm || !spkiPem) {
-      console.warn('⚠️ /card-register missing fields', req.body);
-      return res.status(400).json({
-        success: false,
-        error: 'email and publicKeyPem (or spkiPem) required'
-      });
+    const emailNorm = normalizeEmail(req.query?.email || '');
+    if (!emailNorm || !emailNorm.includes('@')) {
+      return res.status(400).json({ success:false, error:'valid email required' });
     }
-
-    const fingerprint = spkiFingerprintFromPem(spkiPem);
-    if (!fingerprint) {
-      return res.status(400).json({
-        success: false,
-        error: 'invalid public key'
-      });
-    }
-
-    // Per-user list of cards
-    if (!userCards[emailNorm]) userCards[emailNorm] = [];
-    userCards[emailNorm].push({
-      fingerprint,
-      spkiPem,
-      linkedAt: Date.now()
-    });
-
-    // Global registry used by /card-payment-request
-    cardRegistry[fingerprint] = {
-      emailNorm,
-      spkiPem,
-      linkedAt: Date.now()
-    };
-
-    console.log(`💳 /card-register → card ${fingerprint.slice(0, 16)}… for ${emailNorm}`);
-    return res.json({ success: true, fingerprint });
+    const out = await probeIdentityRegistered(emailNorm);
+    return res.json({ success:true, registered: out.registered });
   } catch (err) {
-    console.error('❌ /card-register error:', err);
-    return res.status(500).json({ success: false, error: 'internal_error' });
+    console.error('❌ /identity-status:', err);
+    return res.status(500).json({ success:false, error:'identity_status_failed' });
   }
 });
 
+// ========== Email verification endpoints ==================
 
+// TTL: 10 minutes
+const EMAIL_CODE_TTL_MS = 10 * 60 * 1000;
 
+// Send code to email (dev: logged to console)
+app.post('/send-email-code', async (req, res) => {
+  try {
+    const rawEmail  = String(req.body?.email || '').trim();
+    const emailNorm = normalizeEmail(rawEmail);
 
+    if (!emailNorm) {
+      return res.status(400).json({
+        success: false,
+        error: 'email required'
+      });
+    }
 
+    const code = makeCode6();
+    const now  = Date.now();
 
-// DROP-IN REPLACEMENT: /card-verify now prefers the **per-user** key if present; falls back to global env key for legacy.
+    // store code in memory with 10-minute TTL
+    pendingEmailCodes[emailNorm] = {
+      code,
+      createdAt: now
+    };
+
+    console.log(`📧 Email verification code for ${emailNorm}: ${code}`);
+
+    // actually send the email
+    const ok = await sendVerificationEmail(emailNorm, code);
+    if (!ok) {
+      return res.status(500).json({ success: false, error: "email send failed" });
+    }
+
+    return res.json({ success: true });
+
+  } catch (err) {
+    console.error('🔥 /send-email-code error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'failed_to_send_email_code'
+    });
+  }
+});
+
+// Verify code
+app.post('/verify-email-code', (req, res) => {
+  try {
+    const rawEmail  = String(req.body?.email || '').trim();
+    const emailNorm = normalizeEmail(rawEmail);
+    const code      = String(req.body?.code || '').trim();
+
+    if (!emailNorm || !code) {
+      return res.status(400).json({
+        success: false,
+        error: 'email and code required'
+      });
+    }
+
+    const rec = pendingEmailCodes[emailNorm];
+    if (!rec) {
+      return res.status(400).json({
+        success: false,
+        error: 'no_code_for_email'
+      });
+    }
+
+    // 10 minute TTL
+    if (Date.now() - rec.createdAt > 10 * 60 * 1000) {
+      delete pendingEmailCodes[emailNorm];
+      return res.status(400).json({
+        success: false,
+        error: 'code_expired'
+      });
+    }
+
+    if (rec.code !== code) {
+      return res.status(400).json({
+        success: false,
+        error: 'invalid_code'
+      });
+    }
+
+    // success: mark verified & wipe
+    verifiedEmails[emailNorm] = true;
+    delete pendingEmailCodes[emailNorm];
+
+    console.log(`✅ Email verified: ${emailNorm}`);
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('🔥 /verify-email-code error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'verify_email_internal_error'
+    });
+  }
+});
+
+// === END: Email verification endpoints ==================
+
+// Back-compat alias
+app.post('/mint-persona', async (req, res) => {
+  try {
+    if (!personaAuth) return res.status(503).json({ success: false, error: 'Contract not configured' });
+
+    const emailNorm = normalizeEmail(req.body?.email || '');
+    const deviceFpr = String(req.body?.deviceFpr || '');
+    const to = String(req.body?.to || '');
+    if (!emailNorm || !deviceFpr || !to) return res.status(400).json({ success: false, error: 'email, deviceFpr, to required' });
+    if (!isAddress(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
+
+    const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
+    if (!token) return res.status(403).json({ success: false, error: 'No registered device token for this email' });
+
+    const userIdHash = commitUserId(emailNorm);
+    const deviceHash = commitDevice(deviceFpr);
+
+    const domain = { name: "PersonaAuth", version: "1", chainId: 137, verifyingContract: CONTRACT_ADDRESS };
+    const types  = { MintAuth: [
+      { name: "to",          type: "address" },
+      { name: "userIdHash",  type: "bytes32" },
+      { name: "deviceHash",  type: "bytes32" },
+      { name: "salt",        type: "bytes32" },
+      { name: "deadline",    type: "uint256" },
+    ]};
+
+    const salt     = ethers.utils.hexlify(ethers.utils.randomBytes(32));
+    const deadline = Math.floor(Date.now() / 1000) + 10 * 60;
+
+    const minter = new ethers.Wallet(MINTER_PRIVATE_KEY);
+    const signature = await minter._signTypedData(domain, types, { to, userIdHash, deviceHash, salt, deadline });
+
+    const fee = await getAggressiveFees(provider);
+    const tx = await personaAuth.mintWithSig(to, userIdHash, deviceHash, salt, deadline, signature, {
+      maxFeePerGas:         fee.maxFeePerGas,
+      maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+    });
+    console.log(`⛓️  mintWithSig → ${tx.hash}`);
+
+    if (typeof tx.wait === 'function') await tx.wait(1);
+    else await provider.waitForTransaction(tx.hash, 1);
+
+    let tokenId = null;
+    try {
+      const tid = await personaAuth.tokenOf(to);
+      tokenId = tid?.toString?.() || String(tid);
+    } catch {}
+
+    return res.json({ success: true, txHash: tx.hash, confirmed: true, tokenId });
+  } catch (err) {
+    console.error('❌ /mint-persona error:', err);
+    const msg = (err?.reason || err?.error?.message || String(err)).toLowerCase();
+    if (msg.includes('identity already issued')) {
+      return res.status(200).json({ success: true, minted: false, alreadyRegistered: true });
+    }
+    return res.status(500).json({ success: false, error: String(err.message || err) });
+  }
+});
+
+// --- READ+VERIFY: strict match on email/deviceFpr (commitments) ---
+app.post('/nft-owned-verify', async (req, res) => {
+  try {
+    if (!provider || !CONTRACT_ADDRESS) {
+      return res.status(503).json({ success: false, error: 'Read contract not configured' });
+    }
+
+    const address   = String(req.body?.address || '').trim();
+    const emailRaw  = req.body?.email || null;
+    const deviceFpr = req.body?.deviceFpr || null;
+
+    if (!address || !ethers.utils.isAddress(address)) {
+      return res.status(400).json({ success: false, error: 'Valid address required' });
+    }
+
+    const emailNorm = emailRaw ? normalizeEmail(emailRaw) : '';
+
+    const result = await verifyPersonaBinding({ emailNorm, address, deviceFpr });
+
+    // Map helper result → legacy response shape
+    if (!result.ok) {
+      if (result.reason === 'no_nft' || result.reason === 'no_token_mapping') {
+        // Address has no persona NFT
+        return res.json({ success: true, owned: false, matched: false });
+      }
+      if (result.reason === 'mismatch') {
+        // NFT exists but does not match email/deviceFpr
+        return res.json({ success: true, owned: true, matched: false });
+      }
+      // Generic error
+      console.error('❌ /nft-owned-verify helper error:', result);
+      return res.status(500).json({ success: false, error: 'verify failed' });
+    }
+
+    // All good: NFT exists and matches bindings
+    return res.json({
+      success: true,
+      owned: true,
+      matched: true,
+      tokenId: result.tokenId || null
+    });
+  } catch (e) {
+    console.error('❌ /nft-owned-verify:', e);
+    return res.status(500).json({ success: false, error: 'verify failed' });
+  }
+});
+
+// --- Card challenge (to be signed by the card's Authentication key) ---
+
+const activeChallenges = Object.create(null);
+
+app.post('/card-challenge', (req, res) => {
+  try {
+    // email is OPTIONAL here – vendor flow won’t send one
+    const rawEmail  = String(req.body?.email || '').trim();
+    const emailNorm = rawEmail ? normalizeEmail(rawEmail) : '';
+
+    const challenge = crypto.randomBytes(32).toString('base64url');
+
+    if (emailNorm) {
+      // login app path: tie challenge to email for later /card-verify
+      pendingCardChallenges[emailNorm] = {
+        challenge,
+        createdAt: Date.now()
+      };
+      console.log(`💳 Issued card challenge for ${emailNorm}`);
+    } else {
+      // vendor path: no email, no state, just give them a challenge
+      console.log('💳 Issued card challenge (no email, vendor flow)');
+    }
+
+    return res.json({ success: true, challenge });
+  } catch (err) {
+    console.error('🔥 /card-challenge error:', err);
+    // DO NOT throw weird “server error challenge” at the client anymore
+    return res.status(500).json({
+      success: false,
+      error: 'card challenge internal error'
+    });
+  }
+});
+
 app.post('/card-verify', (req, res) => {
   try {
     const rawEmail   = String(req.body?.email || '').trim();
@@ -898,8 +1242,769 @@ app.post('/card-verify', (req, res) => {
   }
 });
 
+app.post('/confirm-login', (req, res) => {
+  console.log('🟢 /confirm-login HIT');
+  console.log('🟢 Headers:', JSON.stringify(req.headers, null, 2));
+  console.log('🟢 Body:', JSON.stringify(req.body, null, 2));
+  
+  try {
+    const requestId = String(req.body?.requestId || '').trim();
+    const approved  = !!req.body?.approved;
+    const devicePublicKeyJwk = req.body?.devicePublicKeyJwk || null;
+
+    console.log('🟢 Parsed - requestId:', requestId, 'approved:', approved);
+    console.log('🟢 devicePublicKeyJwk:', devicePublicKeyJwk ? 'present' : 'null');
+
+    if (!requestId) {
+      console.log('🔴 No requestId provided');
+      return res.status(400).json({ success: false, error: 'requestId required' });
+    }
+
+    const login = pendingLogins[requestId];
+    console.log('🟢 Pending login found:', login ? 'yes' : 'no');
+    
+    if (!login) {
+      console.log('🔴 Login not found for requestId:', requestId);
+      return res.status(404).json({ success: false, error: 'login_not_found' });
+    }
+
+    console.log('🟢 Login status:', login.status);
+    
+    if (login.status !== 'pending') {
+      console.log('🔴 Login not pending, current status:', login.status);
+      return res.status(409).json({ success: false, error: 'login_not_pending' });
+    }
+
+    if (!approved) {
+      console.log('🟡 Login denied by user');
+      login.status = 'denied';
+      login.deniedAt = Date.now();
+      return res.json({ success: true, approved: false });
+    }
+
+    const { email: emailNorm, origin, nonce } = login;
+    console.log('🟢 Login data - email:', emailNorm, 'origin:', origin, 'nonce:', nonce);
+
+    if (!origin) {
+      console.error('❌ /confirm-login: missing origin on pending login', requestId);
+      return res.status(400).json({ success: false, error: 'missing_origin' });
+    }
+    if (!emailNorm || !nonce) {
+      console.error('❌ /confirm-login: missing email/nonce on pending login', requestId);
+      return res.status(400).json({ success: false, error: 'missing_email_or_nonce' });
+    }
+
+    if (devicePublicKeyJwk) {
+      login.devicePublicKeyJwk = devicePublicKeyJwk;
+      console.log('🟢 Stored devicePublicKeyJwk');
+    }
+
+    console.log('🟢 Generating login token...');
+    
+    let loginToken;
+    try {
+      loginToken = makeLoginToken({
+        emailNorm,
+        origin,
+        deviceHash: null,
+        nonce
+      });
+      console.log('🟢 Login token generated successfully');
+    } catch (e) {
+      console.error('❌ /confirm-login makeLoginToken failed:', e.message || e);
+      return res.status(500).json({ success: false, error: 'token_issue_failed' });
+    }
+
+    login.status      = 'approved';
+    login.approvedAt  = Date.now();
+    login.loginToken  = loginToken;
+
+    console.log('✅ Login approved for', emailNorm, 'requestId:', requestId);
+
+    return res.json({
+      success:  true,
+      approved: true,
+      requestId,
+      token:    loginToken
+    });
+  } catch (err) {
+    console.error('❌ /confirm-login error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+app.post('/get-credentials', (req, res) => {
+  const emailNorm = normalizeEmail(req.body?.email || '');
+  if (!emailNorm) return res.status(400).json({ success: false, error: 'Missing email' });
+
+  const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
+  if (!token) return res.status(403).json({ success: false, error: 'No registered device token' });
+
+  // Require live session or verified email before returning vault contents
+  const hasLiveSession = sessionApprovals[emailNorm] && Date.now() < sessionApprovals[emailNorm];
+  if (!verifiedEmails[emailNorm] && !hasLiveSession) {
+    return res.status(403).json({ success: false, error: 'Session locked or expired' });
+  }
+
+  const creds = userCredentials[emailNorm] || [];
+  console.log(`📤 Returned ${creds.length} credentials for ${emailNorm}`);
+  return res.json({
+    success: true,
+    credentials: creds,
+    sessionExpiresAt: hasLiveSession ? sessionApprovals[emailNorm] : null
+  });
+});
+
+app.post('/confirm-decrypt', (req, res) => {
+  const { txId, approved, data } = req.body || {};
+  const tx = pendingDecrypts[txId];
+  if (!tx) return res.status(404).json({ success: false, error: 'Tx not found' });
+
+  tx.status = approved ? 'approved' : 'denied';
+  if (approved) {
+    if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing data' });
+    }
+    tx.payload  = { username: data.username, password: data.password };
+    tx.expiresAt = Date.now() + 60_000;
+  }
+  res.json({ success: true });
+});
+
+// new endpoints after hardening
+
+// =============================================================================
+// ENDPOINT 1: POST /register-device-key
+// Called during registration after email verification.
+// Stores the device's Secure Enclave public key.
+// =============================================================================
+app.post('/register-device-key', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.body?.email || '');
+    const publicKeyJwk = req.body?.publicKeyJwk;
+    
+    if (!emailNorm || !publicKeyJwk) {
+      return res.status(400).json({ success: false, error: 'email and publicKeyJwk required' });
+    }
+    
+    // Validate JWK structure
+    if (publicKeyJwk.kty !== 'EC' || publicKeyJwk.crv !== 'P-256' || !publicKeyJwk.x || !publicKeyJwk.y) {
+      return res.status(400).json({ success: false, error: 'Invalid JWK: must be P-256 EC key' });
+    }
+    
+    // Convert to PEM for signature verification
+    let publicKeyPem;
+    try {
+      publicKeyPem = jwkToPem(publicKeyJwk);
+    } catch (e) {
+      return res.status(400).json({ success: false, error: 'Failed to convert JWK: ' + e.message });
+    }
+    
+    // Rate limit
+    const allowed = await checkRateLimit(`ratelimit:register-key:${emailNorm}`, 5, 300);
+    if (!allowed) {
+      return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 300 });
+    }
+    
+    // Require email to be recently verified (within last 10 minutes)
+    if (!verifiedEmails[emailNorm]) {
+      return res.status(403).json({ success: false, error: 'Email not verified' });
+    }
+    
+    // Store the key
+    deviceSigningKeys[emailNorm] = {
+      publicKeyPem,
+      publicKeyJwk,
+      registeredAt: Date.now()
+    };
+    
+    // Initialize security settings
+    if (!userSecuritySettings[emailNorm]) {
+      userSecuritySettings[emailNorm] = {
+        requireHardware: false,
+        cardPublicKeyPem: null
+      };
+    }
+    
+    console.log(`🔐 Registered device signing key for ${emailNorm}`);
+    
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /register-device-key error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+// =============================================================================
+// ENDPOINT 2: POST /save-token (HARDENED)
+// Now requires a valid device signature to register FCM token.
+// =============================================================================
+app.post('/save-token-secure', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.body?.email || '');
+    const deviceToken = String(req.body?.deviceToken || '').trim();
+    const timestamp = Number(req.body?.timestamp || 0);
+    const signature = String(req.body?.signature || '').trim();
+    const messagingId = String(req.body?.messagingId || '').trim();
+    
+    if (!emailNorm || !deviceToken) {
+      return res.status(400).json({ success: false, error: 'email and deviceToken required' });
+    }
+    
+    // For NEW registrations (no key yet), allow without signature if email was just verified
+    const deviceKey = deviceSigningKeys[emailNorm];
+    
+    if (!deviceKey) {
+      // First-time registration: email must be verified
+      if (!verifiedEmails[emailNorm]) {
+        return res.status(403).json({ success: false, error: 'Email not verified' });
+      }
+      // Allow token save during initial registration flow
+      console.log(`📱 First-time token save for ${emailNorm} (no device key yet)`);
+    } else {
+      // Existing user: require signature
+      if (!timestamp || !signature) {
+        return res.status(400).json({ success: false, error: 'timestamp and signature required' });
+      }
+      
+      // Verify timestamp is recent (within 5 minutes)
+      const now = Date.now();
+      if (Math.abs(now - timestamp) > 5 * 60 * 1000) {
+        return res.status(400).json({ success: false, error: 'timestamp too old or in future' });
+      }
+      
+      // Verify signature over: email|deviceToken|timestamp
+      const message = `${emailNorm}|${deviceToken}|${timestamp}`;
+      const valid = verifyES256Signature(deviceKey.publicKeyPem, message, signature);
+      
+      if (!valid) {
+        console.warn(`⚠️ Invalid signature for /save-token from ${emailNorm}`);
+        return res.status(403).json({ success: false, error: 'invalid_signature' });
+      }
+    }
+    
+    // Store the token
+    userTokens[emailNorm] = deviceToken;
+    
+    if (!emailToTokens[emailNorm]) {
+      emailToTokens[emailNorm] = new Set();
+    }
+    emailToTokens[emailNorm].add(deviceToken);
+    
+    if (messagingId.length > 0) {
+      messagingRouting[messagingId] = { email: emailNorm, deviceToken };
+    }
+    
+    console.log(`💾 Saved token for ${emailNorm}`);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /save-token-secure error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+// =============================================================================
+// ENDPOINT 3: POST /confirm-login (HARDENED)
+// Now requires cryptographic proof from the device.
+// =============================================================================
+app.post('/confirm-login-secure', (req, res) => {
+  try {
+    const requestId = String(req.body?.requestId || '').trim();
+    const approved = !!req.body?.approved;
+    const timestamp = Number(req.body?.timestamp || 0);
+    const signature = String(req.body?.signature || '').trim();
+    const cardSignature = req.body?.cardSignature || null; // Optional: for hardware requirement
+    
+    if (!requestId) {
+      return res.status(400).json({ success: false, error: 'requestId required' });
+    }
+    
+    const login = pendingLogins[requestId];
+    if (!login) {
+      return res.status(404).json({ success: false, error: 'login_not_found' });
+    }
+    
+    if (login.status !== 'pending') {
+      return res.status(409).json({ success: false, error: 'login_not_pending' });
+    }
+    
+    const emailNorm = login.email;
+    
+    // DENIAL: No signature required (anyone can deny their own request)
+    if (!approved) {
+      login.status = 'denied';
+      login.deniedAt = Date.now();
+      console.log(`🚫 Login denied for ${emailNorm} (requestId: ${requestId})`);
+      return res.json({ success: true, approved: false });
+    }
+    
+    // APPROVAL: Requires cryptographic proof
+    
+    // 1. Get device signing key
+    const deviceKey = deviceSigningKeys[emailNorm];
+    if (!deviceKey) {
+      console.error(`❌ No device key for ${emailNorm}`);
+      return res.status(403).json({ success: false, error: 'no_device_key' });
+    }
+    
+    // 2. Validate required fields
+    if (!timestamp || !signature) {
+      return res.status(400).json({ success: false, error: 'timestamp and signature required for approval' });
+    }
+    
+    // 3. Verify timestamp is recent (within 2 minutes)
+    const now = Date.now();
+    if (Math.abs(now - timestamp) > 2 * 60 * 1000) {
+      return res.status(400).json({ success: false, error: 'timestamp_expired' });
+    }
+    
+    // 4. Verify device signature over: requestId|nonce|timestamp
+    const nonce = login.nonce;
+    const message = `${requestId}|${nonce}|${timestamp}`;
+    const validDeviceSig = verifyES256Signature(deviceKey.publicKeyPem, message, signature);
+    
+    if (!validDeviceSig) {
+      console.warn(`⚠️ Invalid device signature for login ${requestId}`);
+      return res.status(403).json({ success: false, error: 'invalid_device_signature' });
+    }
+    
+    // 5. Check hardware requirement (server-side enforced)
+    const settings = userSecuritySettings[emailNorm] || {};
+    if (settings.requireHardware) {
+      if (!settings.cardPublicKeyPem) {
+        return res.status(400).json({ success: false, error: 'hardware_required_but_no_card_registered' });
+      }
+      
+      if (!cardSignature) {
+        return res.status(400).json({ success: false, error: 'hardware_signature_required' });
+      }
+      
+      // Verify card signature over same message
+      const validCardSig = verifyRsaSignature(settings.cardPublicKeyPem, message, cardSignature);
+      if (!validCardSig) {
+        console.warn(`⚠️ Invalid card signature for login ${requestId}`);
+        return res.status(403).json({ success: false, error: 'invalid_card_signature' });
+      }
+      
+      console.log(`🔐 Hardware card verified for ${emailNorm}`);
+    }
+    
+    // 6. All checks passed - issue token
+    const origin = login.origin;
+    if (!origin) {
+      return res.status(400).json({ success: false, error: 'missing_origin' });
+    }
+    
+    let loginToken;
+    try {
+      loginToken = makeLoginToken({
+        emailNorm,
+        origin,
+        deviceHash: null,
+        nonce
+      });
+    } catch (e) {
+      console.error('❌ makeLoginToken failed:', e);
+      return res.status(500).json({ success: false, error: 'token_issue_failed' });
+    }
+    
+    login.status = 'approved';
+    login.approvedAt = Date.now();
+    login.loginToken = loginToken;
+    
+    console.log(`✅ Login approved for ${emailNorm} (requestId: ${requestId})`);
+    
+    return res.json({
+      success: true,
+      approved: true,
+      requestId,
+      token: loginToken
+    });
+  } catch (err) {
+    console.error('❌ /confirm-login-secure error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+// =============================================================================
+// ENDPOINT 4: POST /register-card (NEW)
+// Registers the hardware card's public key with the server.
+// Requires device signature for authentication.
+// =============================================================================
+app.post('/register-card', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.body?.email || '');
+    const cardPublicKeyPem = String(req.body?.cardPublicKeyPem || '').trim();
+    const timestamp = Number(req.body?.timestamp || 0);
+    const signature = String(req.body?.signature || '').trim();
+    
+    if (!emailNorm || !cardPublicKeyPem) {
+      return res.status(400).json({ success: false, error: 'email and cardPublicKeyPem required' });
+    }
+    
+    // Verify device signature
+    const deviceKey = deviceSigningKeys[emailNorm];
+    if (!deviceKey) {
+      return res.status(403).json({ success: false, error: 'no_device_key' });
+    }
+    
+    if (!timestamp || !signature) {
+      return res.status(400).json({ success: false, error: 'timestamp and signature required' });
+    }
+    
+    const now = Date.now();
+    if (Math.abs(now - timestamp) > 5 * 60 * 1000) {
+      return res.status(400).json({ success: false, error: 'timestamp_expired' });
+    }
+    
+    // Verify signature over: email|cardPublicKeyPem|timestamp
+    const message = `${emailNorm}|${cardPublicKeyPem}|${timestamp}`;
+    const valid = verifyES256Signature(deviceKey.publicKeyPem, message, signature);
+    
+    if (!valid) {
+      return res.status(403).json({ success: false, error: 'invalid_signature' });
+    }
+    
+    // Validate the card public key format
+    try {
+      crypto.createPublicKey(cardPublicKeyPem);
+    } catch (e) {
+      return res.status(400).json({ success: false, error: 'invalid card public key format' });
+    }
+    
+    // Store the card key
+    if (!userSecuritySettings[emailNorm]) {
+      userSecuritySettings[emailNorm] = { requireHardware: false, cardPublicKeyPem: null };
+    }
+    userSecuritySettings[emailNorm].cardPublicKeyPem = cardPublicKeyPem;
+    
+    // Also update the cardRegistry for payment flows
+    const fingerprint = spkiFingerprintFromPem(cardPublicKeyPem);
+    if (fingerprint) {
+      cardRegistry[fingerprint] = {
+        emailNorm,
+        spkiPem: cardPublicKeyPem,
+        linkedAt: Date.now()
+      };
+    }
+    
+    console.log(`💳 Registered card for ${emailNorm}`);
+    
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /register-card error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+// =============================================================================
+// ENDPOINT 5: POST /set-security-settings
+// Update security settings (e.g., requireHardware).
+// Server-side storage means it's enforced even if phone is compromised.
+// =============================================================================
+app.post('/set-security-settings', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.body?.email || '');
+    const requireHardware = !!req.body?.requireHardware;
+    const timestamp = Number(req.body?.timestamp || 0);
+    const signature = String(req.body?.signature || '').trim();
+    
+    if (!emailNorm) {
+      return res.status(400).json({ success: false, error: 'email required' });
+    }
+    
+    // Verify device signature
+    const deviceKey = deviceSigningKeys[emailNorm];
+    if (!deviceKey) {
+      return res.status(403).json({ success: false, error: 'no_device_key' });
+    }
+    
+    if (!timestamp || !signature) {
+      return res.status(400).json({ success: false, error: 'timestamp and signature required' });
+    }
+    
+    const now = Date.now();
+    if (Math.abs(now - timestamp) > 5 * 60 * 1000) {
+      return res.status(400).json({ success: false, error: 'timestamp_expired' });
+    }
+    
+    const message = `${emailNorm}|requireHardware=${requireHardware}|${timestamp}`;
+    const valid = verifyES256Signature(deviceKey.publicKeyPem, message, signature);
+    
+    if (!valid) {
+      return res.status(403).json({ success: false, error: 'invalid_signature' });
+    }
+    
+    // Cannot enable hardware requirement without a registered card
+    if (requireHardware) {
+      const settings = userSecuritySettings[emailNorm];
+      if (!settings?.cardPublicKeyPem) {
+        return res.status(400).json({ success: false, error: 'cannot_require_hardware_without_card' });
+      }
+    }
+    
+    // Update settings
+    if (!userSecuritySettings[emailNorm]) {
+      userSecuritySettings[emailNorm] = { requireHardware: false, cardPublicKeyPem: null };
+    }
+    userSecuritySettings[emailNorm].requireHardware = requireHardware;
+    
+    console.log(`⚙️ Security settings updated for ${emailNorm}: requireHardware=${requireHardware}`);
+    
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /set-security-settings error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+// =============================================================================
+// ENDPOINT 6: GET /get-security-settings
+// Retrieve current security settings for a user.
+// =============================================================================
+app.get('/get-security-settings', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.query?.email || '');
+    
+    if (!emailNorm) {
+      return res.status(400).json({ success: false, error: 'email required' });
+    }
+    
+    const settings = userSecuritySettings[emailNorm] || {
+      requireHardware: false,
+      cardPublicKeyPem: null
+    };
+    
+    return res.json({
+      success: true,
+      requireHardware: settings.requireHardware,
+      hasCardRegistered: !!settings.cardPublicKeyPem
+    });
+  } catch (err) {
+    console.error('❌ /get-security-settings error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ========================= END: LOGIN APP ENDPOINTS ==========================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Inspect what key is bound for an email (debug)
+app.get('/card-key-fp/:email', (req, res) => {
+  const emailNorm = normalizeEmail(req.params.email || '');
+  const rec = cardKeys[emailNorm] || null;
+  if (!rec) return res.json({ success: true, bound: false });
+  return res.json({ success: true, bound: true, spkiSha256: rec.spkiSha256 });
+});
+
+
+
+
+// Card registration: link card public key to user email and global card registry
+app.post('/card-register', (req, res) => {
+  try {
+    const rawEmail  = req.body?.email || '';
+    const emailNorm = normalizeEmail(rawEmail);
+    const spkiPem   = req.body?.spkiPem || req.body?.publicKeyPem;
+
+    if (!emailNorm || !spkiPem) {
+      console.warn('⚠️ /card-register missing fields', req.body);
+      return res.status(400).json({
+        success: false,
+        error: 'email and publicKeyPem (or spkiPem) required'
+      });
+    }
+
+    const fingerprint = spkiFingerprintFromPem(spkiPem);
+    if (!fingerprint) {
+      return res.status(400).json({
+        success: false,
+        error: 'invalid public key'
+      });
+    }
+
+    // Per-user list of cards
+    if (!userCards[emailNorm]) userCards[emailNorm] = [];
+    userCards[emailNorm].push({
+      fingerprint,
+      spkiPem,
+      linkedAt: Date.now()
+    });
+
+    // Global registry used by /card-payment-request
+    cardRegistry[fingerprint] = {
+      emailNorm,
+      spkiPem,
+      linkedAt: Date.now()
+    };
+
+    console.log(`💳 /card-register → card ${fingerprint.slice(0, 16)}… for ${emailNorm}`);
+    return res.json({ success: true, fingerprint });
+  } catch (err) {
+    console.error('❌ /card-register error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+
+
+
+
+
+
+
 
 // === END: per-user card binding ===
+
+
+
+
+
+
+
+
+
+
+
+
+
+// --------------------- Door Lock Endpoints -----------------------
+
+function makeRequestId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+app.post('/door/start', (req, res) => {
+  try {
+    const rawEmail = req.body?.email || '';
+    const doorId   = req.body?.doorId || 'front';
+
+    if (!rawEmail) {
+      return res.status(400).json({
+        success: false,
+        error: 'email required'
+      });
+    }
+
+    // if you have normalizeEmail() already, use it
+    const emailNorm = normalizeEmail ? normalizeEmail(rawEmail) : rawEmail.trim().toLowerCase();
+
+    const requestId = makeRequestId();
+    const now = Date.now();
+
+    doorRequests[requestId] = {
+      requestId,
+      email: emailNorm,
+      doorId,
+      status: 'pending',   // will later become 'approved' / 'denied' / 'expired'
+      createdAt: now
+    };
+
+    console.log('🚪 Door unlock START', {
+      requestId,
+      email: emailNorm,
+      doorId
+    });
+
+    // TODO (later step): send push to phone here
+
+    return res.json({
+      success: true,
+      requestId,
+      status: 'pending'
+    });
+  } catch (err) {
+    console.error('door/start error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'internal_error'
+    });
+  }
+});
+
+app.post('/door/confirm', (req, res) => {
+  try {
+    const requestId = req.body?.requestId;
+    const approved  = req.body?.approved;
+
+    if (!requestId || typeof approved !== 'boolean') {
+      return res.status(400).json({
+        success: false,
+        error: 'requestId and approved=true/false required'
+      });
+    }
+
+    const reqObj = doorRequests[requestId];
+    if (!reqObj) {
+      return res.status(404).json({
+        success: false,
+        error: 'request not found'
+      });
+    }
+
+    reqObj.status = approved ? 'approved' : 'denied';
+    reqObj.respondedAt = Date.now();
+
+    console.log('🔐 Door unlock CONFIRM', {
+      requestId,
+      approved
+    });
+
+    // TODO (later): actually send unlock command to hardware controller
+
+    return res.json({ success: true, status: reqObj.status });
+  } catch (err) {
+    console.error('door/confirm error:', err);
+    return res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+// =================== END: Door Lock Endpoints ====================
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1111,110 +2216,6 @@ app.post('/burn-and-reset-account', async (req, res) => {
 
 
 
-// ========== Email verification endpoints ==================
-
-// TTL: 10 minutes
-const EMAIL_CODE_TTL_MS = 10 * 60 * 1000;
-
-// Send code to email (dev: logged to console)
-app.post('/send-email-code', async (req, res) => {
-  try {
-    const rawEmail  = String(req.body?.email || '').trim();
-    const emailNorm = normalizeEmail(rawEmail);
-
-    if (!emailNorm) {
-      return res.status(400).json({
-        success: false,
-        error: 'email required'
-      });
-    }
-
-    const code = makeCode6();
-    const now  = Date.now();
-
-    // store code in memory with 10-minute TTL
-    pendingEmailCodes[emailNorm] = {
-      code,
-      createdAt: now
-    };
-
-    console.log(`📧 Email verification code for ${emailNorm}: ${code}`);
-
-    // actually send the email
-    const ok = await sendVerificationEmail(emailNorm, code);
-    if (!ok) {
-      return res.status(500).json({ success: false, error: "email send failed" });
-    }
-
-    return res.json({ success: true });
-
-  } catch (err) {
-    console.error('🔥 /send-email-code error:', err);
-    return res.status(500).json({
-      success: false,
-      error: 'failed_to_send_email_code'
-    });
-  }
-});
-
-
-// Verify code
-app.post('/verify-email-code', (req, res) => {
-  try {
-    const rawEmail  = String(req.body?.email || '').trim();
-    const emailNorm = normalizeEmail(rawEmail);
-    const code      = String(req.body?.code || '').trim();
-
-    if (!emailNorm || !code) {
-      return res.status(400).json({
-        success: false,
-        error: 'email and code required'
-      });
-    }
-
-    const rec = pendingEmailCodes[emailNorm];
-    if (!rec) {
-      return res.status(400).json({
-        success: false,
-        error: 'no_code_for_email'
-      });
-    }
-
-    // 10 minute TTL
-    if (Date.now() - rec.createdAt > 10 * 60 * 1000) {
-      delete pendingEmailCodes[emailNorm];
-      return res.status(400).json({
-        success: false,
-        error: 'code_expired'
-      });
-    }
-
-    if (rec.code !== code) {
-      return res.status(400).json({
-        success: false,
-        error: 'invalid_code'
-      });
-    }
-
-    // success: mark verified & wipe
-    verifiedEmails[emailNorm] = true;
-    delete pendingEmailCodes[emailNorm];
-
-    console.log(`✅ Email verified: ${emailNorm}`);
-
-    return res.json({ success: true });
-  } catch (err) {
-    console.error('🔥 /verify-email-code error:', err);
-    return res.status(500).json({
-      success: false,
-      error: 'verify_email_internal_error'
-    });
-  }
-});
-
-
-
-// === END: Email verification endpoints ==================
 
 
 
@@ -1223,39 +2224,7 @@ app.post('/verify-email-code', (req, res) => {
 
 
 
-// ---------------------- Token registration ----------------------
-app.post('/save-token', (req, res) => {
-  const { email, deviceToken } = req.body || {};
-  const messagingId = String(req.body?.messagingId || '').trim();
 
-  if (!email || !deviceToken) {
-    return res.status(400).json({ error: 'Email and deviceToken required' });
-  }
-
-  const emailNorm = normalizeEmail(email);
-
-  // Preserve existing single-token mapping
-  userTokens[emailNorm] = deviceToken;
-
-  // NEW: maintain a set of tokens per email for pushes (login, payments, etc.)
-  if (!emailToTokens[emailNorm]) {
-    emailToTokens[emailNorm] = new Set();
-  }
-  emailToTokens[emailNorm].add(deviceToken);
-
-  // If the client passes a messagingId (Curve25519 pubkey), map it to this device token.
-  if (messagingId.length > 0) {
-    messagingRouting[messagingId] = {
-      email: emailNorm,
-      deviceToken
-    };
-    console.log(`💬 Registered messagingId for ${emailNorm} (len=${messagingId.length})`);
-  }
-
-  console.log(`💾 Saved token for ${emailNorm}, tokens=${emailToTokens[emailNorm].size}`);
-  verifiedEmails[emailNorm] = true;
-  res.json({ success: true });
-});
 
 
 
@@ -1341,115 +2310,11 @@ const db = {
   }
 };
 
+
+
+
+
 // ---------------------- Login approval flow ----------------------
-// app.post('/request-login', async (req, res) => {
-//   try {
-//     const emailNorm     = normalizeEmail(req.body?.email || '');
-//     const websiteDomain = req.body?.websiteDomain || null;
-//     const origin        = req.body?.origin || null; // e.g. "https://app.nftauthproject.com"
-
-//     if (!emailNorm) {
-//       return res.status(400).json({ error: 'Email required' });
-//     }
-
-//     const allowed = await checkRateLimit(`ratelimit:login:${emailNorm}`, 10, 60); // 10 per 60s
-//     if (!allowed) {
-//       console.log(`🚫 Rate limited /request-login for ${emailNorm}`);
-//       return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
-//     }
-
-//     const requestId = uuidv4();
-//     const nonce     = crypto.randomBytes(16).toString('hex');
-
-//     // 🔐 Compute a real relying-party origin, even if client only sends websiteDomain
-//     const relyingPartyOrigin =
-//       origin ||
-//       (websiteDomain ? `https://${websiteDomain}` : null);
-
-//     if (!relyingPartyOrigin) {
-//       console.error('❌ /request-login: no origin or websiteDomain provided');
-//       return res.status(400).json({ success: false, error: 'origin_required' });
-//     }
-
-//     // Store core login request state (used later when user approves on phone)
-//     pendingLogins[requestId] = {
-//       email: emailNorm,
-//       websiteDomain,
-//       origin: relyingPartyOrigin,   // 👈 ALWAYS non-null now
-//       nonce,
-//       status: 'pending',
-//       timestamp: Date.now(),
-//       devicePublicKeyJwk: null,
-//       extSession: null
-//     };
-
-//     // --- Nonce-based challenge object for this login (for token minting / verification) ---
-//     const challengeNonce     = crypto.randomBytes(16).toString('hex');
-//     const challengeExpiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes (ms)
-
-//     const hashedEmail = crypto
-//       .createHash('sha256')
-//       .update(emailNorm)
-//       .digest('hex');
-
-//     loginChallenges[challengeNonce] = {
-//       requestId,
-//       emailHash: hashedEmail,
-//       relyingPartyOrigin,      // 👈 keep this for later checks
-//       issuedAt: Date.now(),
-//       challengeExpiresAt       // 👈 name matches what /verify-login-token expects
-//     };
-
-//     const user = await db.getUserByEmail(emailNorm);
-//     const deviceToken = user?.deviceToken;
-//     if (!deviceToken) {
-//       return res.status(404).json({ error: 'No device token registered' });
-//     }
-
-//     const message = {
-//       token: deviceToken,
-//       notification: {
-//         title: 'NFT Auth Request',
-//         body: 'Approve or deny request'
-//       },
-//       data: {
-//         type: 'login_request',
-//         email: emailNorm,
-//         requestId,
-//         nonce,
-//         ...(websiteDomain ? { websiteDomain } : {}),
-//         origin: relyingPartyOrigin
-//       },
-//       android: { priority: 'high' },
-//       apns: {
-//         payload: {
-//           aps: {
-//             sound: 'default',
-//             category: 'LOGIN_REQUEST'
-//           }
-//         }
-//       }
-//     };
-
-//     try {
-//       await admin.messaging().send(message);
-//       console.log(`✅ Push sent to ${emailNorm} (${requestId})`);
-//       return res.json({
-//         success: true,
-//         requestId,
-//         nonce,
-//         challengeNonce,
-//         challengeExpiresAt
-//       });
-//     } catch (error) {
-//       console.error('❌ FCM error:', error);
-//       return res.status(500).json({ success: false, error: 'Failed to send push notification' });
-//     }
-//   } catch (err) {
-//     console.error('❌ /request-login error:', err);
-//     return res.status(500).json({ success: false, error: 'internal_error' });
-//   }
-// });
 
 app.post('/request-login', async (req, res) => {
   console.log('🔵 /request-login HIT');
@@ -1582,171 +2447,7 @@ app.post('/request-login', async (req, res) => {
 
 
 
-// Phone → approves or denies a login request
-// Body: { requestId, approved, deviceFpr? }
-// Body: { requestId, approved: true/false, deviceHash? }
-// app.post('/confirm-login', (req, res) => {
-//   try {
-//     const requestId = String(req.body?.requestId || '').trim();
-//     const approved  = !!req.body?.approved;
-//     const devicePublicKeyJwk = req.body?.devicePublicKeyJwk || null;
 
-//     if (!requestId) {
-//       return res.status(400).json({ success: false, error: 'requestId required' });
-//     }
-
-//     const login = pendingLogins[requestId];
-//     if (!login) {
-//       return res.status(404).json({ success: false, error: 'login_not_found' });
-//     }
-
-//     if (login.status !== 'pending') {
-//       return res.status(409).json({ success: false, error: 'login_not_pending' });
-//     }
-
-//     // If mobile says "deny", just record and return
-//     if (!approved) {
-//       login.status = 'denied';
-//       login.deniedAt = Date.now();
-//       return res.json({ success: true, approved: false });
-//     }
-
-//     const { email: emailNorm, origin, nonce } = login;
-
-//     if (!origin) {
-//       console.error('❌ /confirm-login: missing origin on pending login', requestId);
-//       return res.status(400).json({ success: false, error: 'missing_origin' });
-//     }
-//     if (!emailNorm || !nonce) {
-//       console.error('❌ /confirm-login: missing email/nonce on pending login', requestId);
-//       return res.status(400).json({ success: false, error: 'missing_email_or_nonce' });
-//     }
-
-//     // Optionally store device key JWK (for future session / key binding)
-//     if (devicePublicKeyJwk) {
-//       login.devicePublicKeyJwk = devicePublicKeyJwk;
-//     }
-
-//     // 🔐 Issue origin-bound, nonce-bound login token
-//     let loginToken;
-//     try {
-//       loginToken = makeLoginToken({
-//         emailNorm,
-//         origin,
-//         deviceHash: null, // or a real deviceHash if you have it
-//         nonce
-//       });
-//     } catch (e) {
-//       console.error('❌ /confirm-login makeLoginToken failed:', e.message || e);
-//       return res.status(500).json({ success: false, error: 'token_issue_failed' });
-//     }
-
-//     login.status      = 'approved';
-//     login.approvedAt  = Date.now();
-//     login.loginToken  = loginToken;
-
-//     return res.json({
-//       success:  true,
-//       approved: true,
-//       requestId,
-//       token:    loginToken
-//     });
-//   } catch (err) {
-//     console.error('❌ /confirm-login error:', err);
-//     return res.status(500).json({ success: false, error: 'internal_error' });
-//   }
-// });
-
-app.post('/confirm-login', (req, res) => {
-  console.log('🟢 /confirm-login HIT');
-  console.log('🟢 Headers:', JSON.stringify(req.headers, null, 2));
-  console.log('🟢 Body:', JSON.stringify(req.body, null, 2));
-  
-  try {
-    const requestId = String(req.body?.requestId || '').trim();
-    const approved  = !!req.body?.approved;
-    const devicePublicKeyJwk = req.body?.devicePublicKeyJwk || null;
-
-    console.log('🟢 Parsed - requestId:', requestId, 'approved:', approved);
-    console.log('🟢 devicePublicKeyJwk:', devicePublicKeyJwk ? 'present' : 'null');
-
-    if (!requestId) {
-      console.log('🔴 No requestId provided');
-      return res.status(400).json({ success: false, error: 'requestId required' });
-    }
-
-    const login = pendingLogins[requestId];
-    console.log('🟢 Pending login found:', login ? 'yes' : 'no');
-    
-    if (!login) {
-      console.log('🔴 Login not found for requestId:', requestId);
-      return res.status(404).json({ success: false, error: 'login_not_found' });
-    }
-
-    console.log('🟢 Login status:', login.status);
-    
-    if (login.status !== 'pending') {
-      console.log('🔴 Login not pending, current status:', login.status);
-      return res.status(409).json({ success: false, error: 'login_not_pending' });
-    }
-
-    if (!approved) {
-      console.log('🟡 Login denied by user');
-      login.status = 'denied';
-      login.deniedAt = Date.now();
-      return res.json({ success: true, approved: false });
-    }
-
-    const { email: emailNorm, origin, nonce } = login;
-    console.log('🟢 Login data - email:', emailNorm, 'origin:', origin, 'nonce:', nonce);
-
-    if (!origin) {
-      console.error('❌ /confirm-login: missing origin on pending login', requestId);
-      return res.status(400).json({ success: false, error: 'missing_origin' });
-    }
-    if (!emailNorm || !nonce) {
-      console.error('❌ /confirm-login: missing email/nonce on pending login', requestId);
-      return res.status(400).json({ success: false, error: 'missing_email_or_nonce' });
-    }
-
-    if (devicePublicKeyJwk) {
-      login.devicePublicKeyJwk = devicePublicKeyJwk;
-      console.log('🟢 Stored devicePublicKeyJwk');
-    }
-
-    console.log('🟢 Generating login token...');
-    
-    let loginToken;
-    try {
-      loginToken = makeLoginToken({
-        emailNorm,
-        origin,
-        deviceHash: null,
-        nonce
-      });
-      console.log('🟢 Login token generated successfully');
-    } catch (e) {
-      console.error('❌ /confirm-login makeLoginToken failed:', e.message || e);
-      return res.status(500).json({ success: false, error: 'token_issue_failed' });
-    }
-
-    login.status      = 'approved';
-    login.approvedAt  = Date.now();
-    login.loginToken  = loginToken;
-
-    console.log('✅ Login approved for', emailNorm, 'requestId:', requestId);
-
-    return res.json({
-      success:  true,
-      approved: true,
-      requestId,
-      token:    loginToken
-    });
-  } catch (err) {
-    console.error('❌ /confirm-login error:', err);
-    return res.status(500).json({ success: false, error: 'internal_error' });
-  }
-});
 
 
 
@@ -1975,20 +2676,7 @@ app.post('/issue-login-token', (req, res) => {
 
 
 
-// Pre-registration check - make sure email is not already registered
-app.get('/identity-status', async (req, res) => {
-  try {
-    const emailNorm = normalizeEmail(req.query?.email || '');
-    if (!emailNorm || !emailNorm.includes('@')) {
-      return res.status(400).json({ success:false, error:'valid email required' });
-    }
-    const out = await probeIdentityRegistered(emailNorm);
-    return res.json({ success:true, registered: out.registered });
-  } catch (err) {
-    console.error('❌ /identity-status:', err);
-    return res.status(500).json({ success:false, error:'identity_status_failed' });
-  }
-});
+
 
 
 // ---------------------- Email verify (dev) ----------------------
@@ -2018,68 +2706,11 @@ app.post('/confirm-email-verify', (req, res) => {
 // ---------------------- Debug ----------------------
 app.get('/debug', (req, res) => res.json({ success: true, message: 'This is the real nft-login-server.js' }));
 
-// --- Card challenge (to be signed by the card's Authentication key) ---
-// app.post('/card-challenge', (req, res) => {
-//   try {
-//     if (!cardAuthKey) return res.status(503).json({ success: false, error: 'card key not loaded' });
-//     const emailNorm = normalizeEmail(req.body?.email || '');
-//     if (!emailNorm || !emailNorm.includes('@')) return res.status(400).json({ success: false, error: 'valid email required' });
 
-//     const now = Math.floor(Date.now() / 1000);
-//     const nonce = crypto.randomBytes(16).toString('hex');
-//     const challenge = `nftvault:card-auth|email=${emailNorm}|ts=${now}|nonce=${nonce}`;
-//     const ttlSec = 120;
 
-//     pendingCardChallenges[emailNorm] = { challenge, expiresAt: Date.now() + ttlSec * 1000 };
 
-//     return res.json({
-//       success: true,
-//       challenge,
-//       expiresAt: now + ttlSec,
-//       spec: {
-//         algo: 'RSA-PKCS1v1_5-SHA256',
-//         encoding: 'UTF-8 bytes of challenge string',
-//         fieldOrder: 'literal string as returned (no JSON canonicalization)'
-//       }
-//     });
-//   } catch (e) {
-//     console.error('❌ /card-challenge:', e);
-//     return res.status(500).json({ success: false, error: 'challenge failed' });
-//   }
-// });
 
-const activeChallenges = Object.create(null);
 
-app.post('/card-challenge', (req, res) => {
-  try {
-    // email is OPTIONAL here – vendor flow won’t send one
-    const rawEmail  = String(req.body?.email || '').trim();
-    const emailNorm = rawEmail ? normalizeEmail(rawEmail) : '';
-
-    const challenge = crypto.randomBytes(32).toString('base64url');
-
-    if (emailNorm) {
-      // login app path: tie challenge to email for later /card-verify
-      pendingCardChallenges[emailNorm] = {
-        challenge,
-        createdAt: Date.now()
-      };
-      console.log(`💳 Issued card challenge for ${emailNorm}`);
-    } else {
-      // vendor path: no email, no state, just give them a challenge
-      console.log('💳 Issued card challenge (no email, vendor flow)');
-    }
-
-    return res.json({ success: true, challenge });
-  } catch (err) {
-    console.error('🔥 /card-challenge error:', err);
-    // DO NOT throw weird “server error challenge” at the client anymore
-    return res.status(500).json({
-      success: false,
-      error: 'card challenge internal error'
-    });
-  }
-});
 
 
 
@@ -2196,39 +2827,9 @@ app.post('/store-credentials', (req, res) => {
 });
 
 
-// app.post('/get-credentials', (req, res) => {
-//   const emailNorm = normalizeEmail(req.body?.email || '');
-//   if (!emailNorm) return res.status(400).json({ error: 'Missing email' });
 
-//   const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
-//   if (!token) return res.status(403).json({ error: 'No registered device token' });
 
-//   const creds = userCredentials[emailNorm] || [];
-//   console.log(`📤 Returned ${creds.length} credentials for ${emailNorm}`);
-//   res.json({ success: true, credentials: creds });
-// });
 
-app.post('/get-credentials', (req, res) => {
-  const emailNorm = normalizeEmail(req.body?.email || '');
-  if (!emailNorm) return res.status(400).json({ success: false, error: 'Missing email' });
-
-  const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
-  if (!token) return res.status(403).json({ success: false, error: 'No registered device token' });
-
-  // Require live session or verified email before returning vault contents
-  const hasLiveSession = sessionApprovals[emailNorm] && Date.now() < sessionApprovals[emailNorm];
-  if (!verifiedEmails[emailNorm] && !hasLiveSession) {
-    return res.status(403).json({ success: false, error: 'Session locked or expired' });
-  }
-
-  const creds = userCredentials[emailNorm] || [];
-  console.log(`📤 Returned ${creds.length} credentials for ${emailNorm}`);
-  return res.json({
-    success: true,
-    credentials: creds,
-    sessionExpiresAt: hasLiveSession ? sessionApprovals[emailNorm] : null
-  });
-});
 
 
 app.post('/delete-credential', (req, res) => {
@@ -2337,94 +2938,6 @@ async function pushToMessagingId(messagingId, data) {
 
 // ---------------------- E2EE Messaging relay (no plaintext stored) ----------------------
 
-// POST /messages/send
-// Body: { senderMessagingId, recipientMessagingId, messageId, timestamp, ciphertextB64 }
-// app.post('/messages/send', async (req, res) => {
-//   try {
-//       const senderMessagingId    = String(req.body?.senderMessagingId || '').trim();
-//       const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
-//       const messageId            = String(req.body?.messageId || '').trim();
-//       const tsRaw                = req.body?.timestamp;
-//       const ciphertextB64        = String(req.body?.ciphertextB64 || '').trim();
-
-//       if (!senderMessagingId || !recipientMessagingId || !messageId || !ciphertextB64) {
-//           return res.status(400).json({ success: false, error: 'Missing fields' });
-//       }
-
-//       // Rate limit: 60 messages per minute per sender
-//       const allowed = await checkRateLimit(`ratelimit:send:${senderMessagingId}`, 60, 60);
-//       if (!allowed) {
-//           console.log(`🚫 Rate limited /messages/send for ${senderMessagingId.slice(0, 16)}…`);
-//           return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
-//       }
-
-//       if (
-//           senderMessagingId.length > 256 ||
-//           recipientMessagingId.length > 256 ||
-//           messageId.length > 128
-//       ) {
-//           return res.status(400).json({ success: false, error: 'Bad id length' });
-//       }
-
-//       const ts = Number(tsRaw) > 0 ? Number(tsRaw) : Date.now();
-
-//       const msg = {
-//           id: messageId,
-//           ts,
-//           senderMessagingId,
-//           ciphertextB64
-//       };
-
-//       // Store message in Redis with 7-day TTL
-//       const msgKey = `pending_msgs:${recipientMessagingId}`;
-//       await redis.rpush(msgKey, JSON.stringify(msg));
-//       await redis.expire(msgKey, 24 * 60 * 60);  // 24 hours TTL
-
-//       // Cap at 200 messages per recipient
-//       const listLen = await redis.llen(msgKey);
-//       if (listLen > 200) {
-//           await redis.ltrim(msgKey, listLen - 200, -1);
-//       }
-
-//       console.log(`📨 Stored message for recipient ${recipientMessagingId.slice(0, 16)}… (queue size=${listLen})`);
-
-//       // ✅ NEW: Get tokens from Redis instead of in-memory object
-//       const tokens = await redis.smembers(`msg_tokens:${recipientMessagingId}`);
-//       console.log(`🔔 Chat push lookup for ${recipientMessagingId.slice(0, 16)}… tokens=${tokens.length}`);
-
-//       if (tokens && tokens.length > 0) {
-//           const baseMsg = {
-//               notification: {
-//                   title: 'NFTAuth Messenger',
-//                   body: 'New encrypted message'
-//               },
-//               data: {
-//                   type: 'message',
-//                   senderMessagingId,
-//                   messageId
-//               }
-//           };
-
-//           for (const token of tokens) {
-//               admin.messaging()
-//                   .send({ token, ...baseMsg })
-//                   .then((id) => {
-//                       console.log(`📨 FCM chat push sent to ${token.slice(0, 12)}…: ${id}`);
-//                   })
-//                   .catch((err) => {
-//                       console.warn('⚠️ FCM chat push failed:', err.message || err);
-//                   });
-//           }
-//       } else {
-//           console.log(`ℹ️ No registered messaging tokens for ${recipientMessagingId.slice(0, 16)}…`);
-//       }
-
-//       return res.json({ success: true });
-//   } catch (err) {
-//       console.error('❌ /messages/send crashed:', err);
-//       return res.status(500).json({ success: false, error: 'internal_error' });
-//   }
-// });
 
 // POST /messages/send
 app.post('/messages/send', async (req, res) => {
@@ -2516,45 +3029,6 @@ app.post('/messages/send', async (req, res) => {
 
 
 
-// app.post('/messages/ack', async (req, res) => {
-//   try {
-//     const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
-//     const messageIds = req.body?.messageIds;
-
-//     if (!recipientMessagingId || !Array.isArray(messageIds) || messageIds.length === 0) {
-//       return res.status(400).json({ success: false, error: 'recipientMessagingId and messageIds[] required' });
-//     }
-
-//     const key = `pending_msgs:${recipientMessagingId}`;
-    
-//     // Get all messages
-//     const rawMessages = await redis.lrange(key, 0, -1);
-    
-//     // Filter out acknowledged ones
-//     const remaining = rawMessages.filter(m => {
-//       try {
-//         const parsed = JSON.parse(m);
-//         return !messageIds.includes(parsed.id);
-//       } catch {
-//         return false;
-//       }
-//     });
-
-//     // Replace list with remaining messages
-//     await redis.del(key);
-//     if (remaining.length > 0) {
-//       await redis.rpush(key, ...remaining);
-//       await redis.expire(ackedKey, 24 * 60 * 60);  // 24 hours TTL
-//     }
-
-//     console.log(`✅ ACK ${messageIds.length} messages for ${recipientMessagingId.slice(0, 16)}… (${remaining.length} remaining)`);
-
-//     return res.json({ success: true, acknowledged: messageIds.length });
-//   } catch (err) {
-//     console.error('❌ /messages/ack error:', err);
-//     return res.status(500).json({ success: false, error: 'internal_error' });
-//   }
-// });
 
 app.post('/messages/ack', async (req, res) => {
   try {
@@ -2599,45 +3073,7 @@ app.post('/messages/ack', async (req, res) => {
 
 
 
-// POST /messages/sync
-// Body: { recipientMessagingId }
-// Returns and *clears* all queued messages for that recipient
-// app.post('/messages/sync', async (req, res) => {
-//   try {
-//     const recipientMessagingId = String(req.body?.recipientMessagingId || '').trim();
-//     if (!recipientMessagingId) {
-//       return res.status(400).json({ success: false, error: 'recipientMessagingId required' });
-//     }
 
-//     // Rate limit: 30 syncs per minute
-//     const allowed = await checkRateLimit(`ratelimit:sync:${recipientMessagingId}`, 30, 60);
-//     if (!allowed) {
-//         console.log(`🚫 Rate limited /messages/sync for ${recipientMessagingId.slice(0, 16)}…`);
-//         return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
-//     }
-
-//     const key = `pending_msgs:${recipientMessagingId}`;
-    
-//     // Get all pending messages (but don't delete)
-//     const rawMessages = await redis.lrange(key, 0, -1);
-    
-//     const messages = rawMessages.map(m => {
-//       try {
-//         return JSON.parse(m);
-//       } catch {
-//         return null;
-//       }
-//     }).filter(Boolean);
-
-//     console.log(`📤 Sync for ${recipientMessagingId.slice(0, 16)}… returned=${messages.length}`);
-
-//     res.setHeader('Cache-Control', 'no-store');
-//     return res.json({ success: true, messages });
-//   } catch (err) {
-//     console.error('❌ /messages/sync error:', err);
-//     return res.status(500).json({ success: false, error: 'internal_error' });
-//   }
-// });
 
 // POST /messages/sync
 // Body: { recipientMessagingId }
@@ -3043,21 +3479,7 @@ app.post('/request-decrypt', async (req, res) => {
   }
 });
 
-app.post('/confirm-decrypt', (req, res) => {
-  const { txId, approved, data } = req.body || {};
-  const tx = pendingDecrypts[txId];
-  if (!tx) return res.status(404).json({ success: false, error: 'Tx not found' });
 
-  tx.status = approved ? 'approved' : 'denied';
-  if (approved) {
-    if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') {
-      return res.status(400).json({ success: false, error: 'Missing data' });
-    }
-    tx.payload  = { username: data.username, password: data.password };
-    tx.expiresAt = Date.now() + 60_000;
-  }
-  res.json({ success: true });
-});
 
 app.get('/check-decrypt/:txId', (req, res) => {
   const tx = pendingDecrypts[req.params.txId];
@@ -3237,102 +3659,7 @@ app.post('/pay-start', async (req, res) => {
 
 
 
-// POST /pay-card
-// body: { paymentId, signatureB64 }
-// app.post('/pay-card', async (req, res) => {
-//   try {
-//     const paymentId    = String(req.body?.paymentId || '');
-//     const signatureB64 = String(req.body?.signatureB64 || '');
 
-//     if (!paymentId || !signatureB64) {
-//       return res.status(400).json({ success: false, error: 'paymentId and signatureB64 required' });
-//     }
-
-//     const payment = pendingPayments[paymentId];
-//     if (!payment) {
-//       return res.status(404).json({ success: false, error: 'Unknown paymentId' });
-//     }
-
-//     if (payment.status !== 'awaiting_card') {
-//       return res.status(400).json({ success: false, error: `Payment not in awaiting_card state (status=${payment.status})` });
-//     }
-
-//     const sig = Buffer.from(signatureB64, 'base64');
-//     const di  = makeDigestInfoSha256(payment.challenge);
-
-//     let matchedEmailNorm = null;
-
-//     // userCards[emailNorm] = [ { spkiPem: '...', ... }, ... ]
-//     for (const [emailNorm, cards] of Object.entries(userCards)) {
-//       if (!Array.isArray(cards)) continue;
-
-//       for (const card of cards) {
-//         const spkiPem = card.spkiPem || card.publicKeyPem || card.spki;
-//         if (!spkiPem) continue;
-
-//         try {
-//           const pubKey = crypto.createPublicKey(spkiPem);
-//           const recovered = crypto.publicDecrypt(
-//             { key: pubKey, padding: crypto.constants.RSA_PKCS1_PADDING },
-//             sig
-//           );
-//           if (recovered.equals(di)) {
-//             matchedEmailNorm = normalizeEmail(emailNorm);
-//             console.log(`💳 /pay-card → signature verified for ${matchedEmailNorm}`);
-//             break;
-//           }
-//         } catch (e) {
-//           // try next key
-//         }
-//       }
-
-//       if (matchedEmailNorm) break;
-//     }
-
-//     if (!matchedEmailNorm) {
-//       console.warn('⚠️ /pay-card signature invalid or card not registered');
-//       return res.status(400).json({ success: false, error: 'Card signature invalid or card not registered' });
-//     }
-
-//     payment.status        = 'pending_approval';
-//     payment.emailNorm     = matchedEmailNorm;
-//     payment.cardEmailNorm = matchedEmailNorm;
-
-//     // send push to the account owner asking to approve this payment
-//     await sendPaymentPush(matchedEmailNorm, payment);
-
-//     return res.json({ success: true });
-//   } catch (err) {
-//     console.error('🔥 /pay-card error:', err);
-//     return res.status(500).json({ success: false, error: 'Server error' });
-//   }
-// });
-
-
-// GET /pay-status?paymentId=...
-// app.get('/pay-status', (req, res) => {
-//   try {
-//     const paymentId = String(req.query.paymentId || '');
-//     if (!paymentId) {
-//       return res.status(400).json({ success: false, error: 'paymentId required' });
-//     }
-
-//     const payment = pendingPayments[paymentId];
-//     if (!payment) {
-//       return res.json({ success: true, status: 'expired' });
-//     }
-
-//     const age = Date.now() - payment.createdAt;
-//     if (age > PAYMENT_TTL_MS && payment.status === 'awaiting_card') {
-//       payment.status = 'expired';
-//     }
-
-//     return res.json({ success: true, status: payment.status });
-//   } catch (err) {
-//     console.error('🔥 /pay-status error:', err);
-//     return res.status(500).json({ success: false, error: 'Server error' });
-//   }
-// });
 
 
 // POST /pay-confirm
@@ -3448,131 +3775,8 @@ const cardOwners = Object.create(null);  // cardPubKeyPem -> normalizedEmail
 
 
 
-// app.post('/card-pay-start', (req, res) => {
-//   try {
-//     const { amountCents, description, merchantId, cardPubKeyPem, signatureB64, challenge } = req.body || {};
 
-//     // Basic validation
-//     if (!amountCents || !description || !merchantId || !cardPubKeyPem || !signatureB64 || !challenge) {
-//       return res.status(400).json({
-//         success: false,
-//         error: 'amountCents, description, merchantId, cardPubKeyPem, signatureB64, challenge required'
-//       });
-//     }
 
-//     const ownerEmail = cardOwners[cardPubKeyPem];
-//     if (!ownerEmail) {
-//       return res.status(404).json({ success: false, error: 'card not registered' });
-//     }
-
-//     const emailNorm = normalizeEmail(ownerEmail);
-//     const deviceToken = userTokens[emailNorm];
-//     if (!deviceToken) {
-//       return res.status(404).json({ success: false, error: 'no device token for card owner' });
-//     }
-
-//     // Create a payment session
-//     const sessionId = crypto.randomUUID();
-//     cardPaymentSessions[sessionId] = {
-//       sessionId,
-//       amountCents,
-//       description,
-//       merchantId,
-//       cardPubKeyPem,
-//       challenge,
-//       status: 'pending',
-//       createdAt: Date.now()
-//     };
-
-//     // Send push to card owner (same FCM wiring you already use)
-//     const message = {
-//       token: deviceToken,
-//       notification: {
-//         title: 'Payment Approval',
-//         body: `${description} - $${(amountCents / 100).toFixed(2)}`
-//       },
-//       data: {
-//         type: 'CARD_PAYMENT',
-//         sessionId,
-//         amountCents: String(amountCents),
-//         description,
-//         merchantId
-//       },
-//       android: { priority: 'high' },
-//       apns: {
-//         payload: {
-//           aps: {
-//             category: 'LOGIN_REQUEST', // reuse existing category if you want same buttons
-//             sound: 'default'
-//           }
-//         }
-//       }
-//     };
-
-//     admin
-//       .messaging()
-//       .send(message)
-//       .then((id) => {
-//         console.log(`📲 Sent card payment push to ${emailNorm} (session ${sessionId}, msgId=${id})`);
-//         res.json({
-//           success: true,
-//           sessionId
-//         });
-//       })
-//       .catch((err) => {
-//         console.error('❌ FCM error for card payment:', err);
-//         res.status(500).json({ success: false, error: 'push failed' });
-//       });
-//   } catch (err) {
-//     console.error('❌ /card-pay-start error:', err);
-//     res.status(500).json({ success: false, error: 'internal error' });
-//   }
-// });
-
-// app.post('/card-pay-complete', (req, res) => {
-//   try {
-//     const { sessionId, approved } = req.body || {};
-//     if (!sessionId || typeof approved !== 'boolean') {
-//       return res.status(400).json({ success: false, error: 'sessionId, approved required' });
-//     }
-
-//     const sess = cardPaymentSessions[sessionId];
-//     if (!sess) {
-//       return res.status(404).json({ success: false, error: 'unknown session' });
-//     }
-
-//     sess.status = approved ? 'approved' : 'denied';
-//     sess.completedAt = Date.now();
-
-//     console.log(`💳 Payment session ${sessionId} -> ${sess.status}`);
-//     res.json({ success: true });
-//   } catch (err) {
-//     console.error('❌ /card-pay-complete error:', err);
-//     res.status(500).json({ success: false, error: 'internal error' });
-//   }
-// });
-
-// app.get('/card-pay-status', (req, res) => {
-//   try {
-//     const sessionId = req.query.sessionId;
-//     if (!sessionId) {
-//       return res.status(400).json({ success: false, error: 'sessionId required' });
-//     }
-
-//     const sess = cardPaymentSessions[sessionId];
-//     if (!sess) {
-//       return res.status(404).json({ success: false, error: 'unknown session' });
-//     }
-
-//     res.json({
-//       success: true,
-//       status: sess.status
-//     });
-//   } catch (err) {
-//     console.error('❌ /card-pay-status error:', err);
-//     res.status(500).json({ success: false, error: 'internal error' });
-//   }
-// });
 
 // ============================================================
 // POST /card-payment-challenge
@@ -4023,64 +4227,7 @@ app.post('/mint-nft', async (req, res) => {
   }
 });
 
-// Back-compat alias
-app.post('/mint-persona', async (req, res) => {
-  try {
-    if (!personaAuth) return res.status(503).json({ success: false, error: 'Contract not configured' });
 
-    const emailNorm = normalizeEmail(req.body?.email || '');
-    const deviceFpr = String(req.body?.deviceFpr || '');
-    const to = String(req.body?.to || '');
-    if (!emailNorm || !deviceFpr || !to) return res.status(400).json({ success: false, error: 'email, deviceFpr, to required' });
-    if (!isAddress(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
-
-    const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
-    if (!token) return res.status(403).json({ success: false, error: 'No registered device token for this email' });
-
-    const userIdHash = commitUserId(emailNorm);
-    const deviceHash = commitDevice(deviceFpr);
-
-    const domain = { name: "PersonaAuth", version: "1", chainId: 137, verifyingContract: CONTRACT_ADDRESS };
-    const types  = { MintAuth: [
-      { name: "to",          type: "address" },
-      { name: "userIdHash",  type: "bytes32" },
-      { name: "deviceHash",  type: "bytes32" },
-      { name: "salt",        type: "bytes32" },
-      { name: "deadline",    type: "uint256" },
-    ]};
-
-    const salt     = ethers.utils.hexlify(ethers.utils.randomBytes(32));
-    const deadline = Math.floor(Date.now() / 1000) + 10 * 60;
-
-    const minter = new ethers.Wallet(MINTER_PRIVATE_KEY);
-    const signature = await minter._signTypedData(domain, types, { to, userIdHash, deviceHash, salt, deadline });
-
-    const fee = await getAggressiveFees(provider);
-    const tx = await personaAuth.mintWithSig(to, userIdHash, deviceHash, salt, deadline, signature, {
-      maxFeePerGas:         fee.maxFeePerGas,
-      maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
-    });
-    console.log(`⛓️  mintWithSig → ${tx.hash}`);
-
-    if (typeof tx.wait === 'function') await tx.wait(1);
-    else await provider.waitForTransaction(tx.hash, 1);
-
-    let tokenId = null;
-    try {
-      const tid = await personaAuth.tokenOf(to);
-      tokenId = tid?.toString?.() || String(tid);
-    } catch {}
-
-    return res.json({ success: true, txHash: tx.hash, confirmed: true, tokenId });
-  } catch (err) {
-    console.error('❌ /mint-persona error:', err);
-    const msg = (err?.reason || err?.error?.message || String(err)).toLowerCase();
-    if (msg.includes('identity already issued')) {
-      return res.status(200).json({ success: true, minted: false, alreadyRegistered: true });
-    }
-    return res.status(500).json({ success: false, error: String(err.message || err) });
-  }
-});
 
 // Read-only: does this address own a PersonaAuth NFT?
 app.get('/has-nft/:address', async (req, res) => {
@@ -4131,90 +4278,9 @@ app.get('/nft-owned', async (req, res) => {
   }
 });
 
-// --- READ+VERIFY: strict match on email/deviceFpr (commitments) ---
-// app.post('/nft-owned-verify', async (req, res) => {
-//   try {
-//     if (!provider || !CONTRACT_ADDRESS) return res.status(503).json({ success: false, error: 'Read contract not configured' });
-//     const address = String(req.body?.address || '').trim();
-//     const email   = req.body?.email || null;
-//     const deviceFpr = req.body?.deviceFpr || null;
-//     if (!address || !ethers.utils.isAddress(address)) return res.status(400).json({ success: false, error: 'Valid address required' });
 
-//     const readAbi = [
-//       "function balanceOf(address owner) view returns (uint256)",
-//       "function tokenOf(address user) view returns (uint256)",
-//       "function identityOf(uint256 tokenId) view returns (bytes32 userIdHash, bytes32 deviceHash, bool valid)"
-//     ];
-//     const personaRead = new ethers.Contract(CONTRACT_ADDRESS, readAbi, provider);
 
-//     const bal = await personaRead.balanceOf(address);
-//     const owned = bal.gt ? bal.gt(0) : (BigInt(bal) > 0n);
-//     if (!owned) return res.json({ success: true, owned: false, matched: false });
 
-//     const tokenId = await personaRead.tokenOf(address);
-//     const tidStr = tokenId?.toString?.() || String(tokenId || "0");
-//     if (tidStr === "0") return res.json({ success: true, owned: true, matched: false });
-
-//     const id = await personaRead.identityOf(tokenId);
-//     const onUser   = id.userIdHash || id[0];
-//     const onDevice = id.deviceHash || id[1];
-
-//     const emailOk  = email  ? (commitUserId(email).toLowerCase()   === String(onUser).toLowerCase())   : true;
-//     const deviceOk = deviceFpr ? (commitDevice(deviceFpr).toLowerCase() === String(onDevice).toLowerCase()) : true;
-
-//     return res.json({ success: true, owned: true, matched: !!(emailOk && deviceOk) });
-//   } catch (e) {
-//     console.error('❌ /nft-owned-verify:', e);
-//     return res.status(500).json({ success: false, error: 'verify failed' });
-//   }
-// });
-
-// --- READ+VERIFY: strict match on email/deviceFpr (commitments) ---
-app.post('/nft-owned-verify', async (req, res) => {
-  try {
-    if (!provider || !CONTRACT_ADDRESS) {
-      return res.status(503).json({ success: false, error: 'Read contract not configured' });
-    }
-
-    const address   = String(req.body?.address || '').trim();
-    const emailRaw  = req.body?.email || null;
-    const deviceFpr = req.body?.deviceFpr || null;
-
-    if (!address || !ethers.utils.isAddress(address)) {
-      return res.status(400).json({ success: false, error: 'Valid address required' });
-    }
-
-    const emailNorm = emailRaw ? normalizeEmail(emailRaw) : '';
-
-    const result = await verifyPersonaBinding({ emailNorm, address, deviceFpr });
-
-    // Map helper result → legacy response shape
-    if (!result.ok) {
-      if (result.reason === 'no_nft' || result.reason === 'no_token_mapping') {
-        // Address has no persona NFT
-        return res.json({ success: true, owned: false, matched: false });
-      }
-      if (result.reason === 'mismatch') {
-        // NFT exists but does not match email/deviceFpr
-        return res.json({ success: true, owned: true, matched: false });
-      }
-      // Generic error
-      console.error('❌ /nft-owned-verify helper error:', result);
-      return res.status(500).json({ success: false, error: 'verify failed' });
-    }
-
-    // All good: NFT exists and matches bindings
-    return res.json({
-      success: true,
-      owned: true,
-      matched: true,
-      tokenId: result.tokenId || null
-    });
-  } catch (e) {
-    console.error('❌ /nft-owned-verify:', e);
-    return res.status(500).json({ success: false, error: 'verify failed' });
-  }
-});
 
 
 // GET /tx-receipt?hash=0x...

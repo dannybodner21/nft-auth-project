@@ -1,8 +1,12 @@
 // nft-login-server.js
 
 
-require('dotenv').config();
-//try { require('dotenv').config(); } catch (e) { /* dotenv not required in production */ }
+//require('dotenv').config();
+
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
+
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const admin = require('firebase-admin');

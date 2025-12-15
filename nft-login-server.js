@@ -12,7 +12,6 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
 
 // Structured security logging
 const { 

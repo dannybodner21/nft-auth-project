@@ -10,17 +10,20 @@ const path = require('path');
 // CONFIGURATION
 // ============================================================================
 
-const LOG_DIR = process.env.LOG_DIR || '/var/log/nftauth';
+const LOG_DIR = process.env.LOG_DIR || './logs';
 const LOG_SECRET = process.env.LOG_HMAC_SECRET || 'CHANGE_ME_IN_PROD';
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+const IS_RENDER = !!process.env.RENDER;
 
-// Ensure log directory exists
-try {
-  if (!fs.existsSync(LOG_DIR)) {
-    fs.mkdirSync(LOG_DIR, { recursive: true });
+// Ensure log directory exists (skip on Render - they capture stdout)
+if (!IS_RENDER) {
+  try {
+    if (!fs.existsSync(LOG_DIR)) {
+      fs.mkdirSync(LOG_DIR, { recursive: true });
+    }
+  } catch (e) {
+    console.error('Failed to create log directory:', LOG_DIR, e.message);
   }
-} catch (e) {
-  console.error('Failed to create log directory:', LOG_DIR, e.message);
 }
 
 // ============================================================================
@@ -162,7 +165,7 @@ const logger = winston.createLogger({
 });
 
 // Add file transport in production
-if (process.env.NODE_ENV === 'production') {
+if (process.env.NODE_ENV === 'production' && !IS_RENDER) {
   // Security events (append-only, tamper-evident)
   logger.add(new winston.transports.File({
     filename: path.join(LOG_DIR, 'security.log'),

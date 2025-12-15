@@ -1,8 +1,6 @@
 // nft-login-server.js
 
-
 //require('dotenv').config();
-
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
@@ -15,6 +13,19 @@ const fs = require('fs');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
+
+// Structured security logging
+const { 
+  logger, 
+  logSecurityEvent, 
+  logAuthAttempt, 
+  logRateLimitHit, 
+  logTokenIssued, 
+  logPaymentEvent,
+  requestLogger,
+  hashEmail,
+  truncateIP 
+} = require('./security-logger');
 
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET || 'CHANGE_ME_IN_PROD';
 const AUTH_JWT_TTL_SECONDS = 5 * 60; // 5 minutes
@@ -382,60 +393,6 @@ function sanitizeError(error, fallback = 'internal_error') {
   return fallback;
 }
 
-// Alert on anomalous patterns with automatic revocation
-async function logSecurityEvent(eventType, details) {
-  const event = {
-    timestamp: new Date().toISOString(),
-    type: eventType,
-    ...details
-  };
-  
-  console.log(`🚨 SECURITY EVENT: ${JSON.stringify(event)}`);
-  
-  // Store in Redis for review (keep 24 hours)
-  const key = `security_events:${Date.now()}`;
-  await redis.set(key, JSON.stringify(event), 'EX', 86400);
-  
-  // Track event counts per IP/email for pattern detection
-  if (details.ip) {
-    const ipEventCount = await redis.incr(`security_count:ip:${details.ip}`);
-    if (ipEventCount === 1) await redis.expire(`security_count:ip:${details.ip}`, 3600);
-    
-    // Alert if too many events from same IP
-    if (ipEventCount >= 10) {
-      console.log(`🔴 ALERT: High security event count from IP ${details.ip}: ${ipEventCount} events in last hour`);
-    }
-  }
-  
-  if (details.email) {
-    const emailEventCount = await redis.incr(`security_count:email:${details.email}`);
-    if (emailEventCount === 1) await redis.expire(`security_count:email:${details.email}`, 3600);
-    
-    // Alert if too many events for same email
-    if (emailEventCount >= 5) {
-      console.log(`🔴 ALERT: High security event count for email ${details.email}: ${emailEventCount} events in last hour`);
-      
-      // Auto-revoke on severe anomaly patterns
-      if (emailEventCount >= 10) {
-        revokeAllTokensForEmail(details.email, `auto_revoke:${eventType}`);
-        console.log(`🔴 AUTO-REVOKED: All tokens for ${details.email} due to anomaly pattern`);
-      }
-    }
-  }
-  
-  // Immediate revocation for critical events
-  const criticalEvents = ['nonce_replay_attempt', 'invalid_device_signature', 'recovery_address_mismatch'];
-  if (criticalEvents.includes(eventType) && details.email) {
-    const criticalCount = await redis.incr(`critical_count:${details.email}`);
-    if (criticalCount === 1) await redis.expire(`critical_count:${details.email}`, 3600);
-    
-    // 3 critical events = immediate revocation
-    if (criticalCount >= 3) {
-      revokeAllTokensForEmail(details.email, `critical_events:${eventType}`);
-      console.log(`🔴 CRITICAL AUTO-REVOKED: All tokens for ${details.email}`);
-    }
-  }
-}
 
 // === Ethers wiring (v5/v6 compatible) ===
 const { ethers } = require('ethers');
@@ -689,11 +646,14 @@ app.use(async (req, res, next) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
   const allowed = await checkRateLimit(`ratelimit:ip:${ip}`, 200, 60);
   if (!allowed) {
-      console.log(`🚫 Global rate limit for IP ${ip}`);
+      logRateLimitHit('global', ip, req);
       return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 60 });
   }
   next();
 });
+
+// Request logging middleware
+app.use(requestLogger);
 
 
 // 🔐 Firebase Admin
@@ -755,13 +715,17 @@ try {
     cardAuthKey = obj;
     cardAuthKeyInfo = keyInfoFromKeyObject(obj);
     pathKeyInfo = cardAuthKeyInfo;
-    console.log(`🔐 Card key (path) loaded: alg=${cardAuthKeyInfo.alg}, bits=${cardAuthKeyInfo.modulusBits}, spki=${cardAuthKeyInfo.spkiSha256}`);
+
+    logger.info('Card key loaded from path', { alg: cardAuthKeyInfo.alg, bits: cardAuthKeyInfo.modulusBits });
+  
   } else if (CARD_PUBKEY_PEM_INLINE) {
     const obj = crypto.createPublicKey(CARD_PUBKEY_PEM_INLINE);
     cardAuthKey = obj;
     cardAuthKeyInfo = keyInfoFromKeyObject(obj);
     envKeyInfo = cardAuthKeyInfo;
-    console.log(`🔐 Card key (env) loaded: alg=${cardAuthKeyInfo.alg}, bits=${cardAuthKeyInfo.modulusBits}, spki=${cardAuthKeyInfo.spkiSha256}`);
+
+    logger.info('Card key loaded from env', { alg: cardAuthKeyInfo.alg, bits: cardAuthKeyInfo.modulusBits });
+  
   } else {
     console.warn('⚠️ No CARD_AUTH_PUBKEY_PEM_PATH or CARD_PUBKEY_PEM; card-based unlock disabled');
   }
@@ -1207,7 +1171,7 @@ app.post('/save-token', (req, res) => {
     console.log(`💬 Registered messagingId for ${emailNorm} (len=${messagingId.length})`);
   }
 
-  console.log(`💾 Saved token for ${emailNorm}, tokens=${emailToTokens[emailNorm].size}`);
+  logger.debug('Token saved', { email: hashEmail(emailNorm) });
   verifiedEmails[emailNorm] = true;
   res.json({ success: true });
 });
@@ -1262,7 +1226,8 @@ app.post('/send-email-code', async (req, res) => {
       createdAt: now
     };
 
-    console.log(`📧 Email verification code for ${emailNorm}: ${code}`);
+    logger.debug('Email verification code generated', { email: hashEmail(emailNorm) });
+    logSecurityEvent('email_code_sent', { email: emailNorm }, req);
 
     // actually send the email
     const ok = await sendVerificationEmail(emailNorm, code);
@@ -1320,11 +1285,7 @@ app.post('/verify-email-code', async (req, res) => {
     }
 
     if (rec.code !== code) {
-      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-      await logSecurityEvent('invalid_email_code', {
-        ip,
-        email: emailNorm
-      });
+      await logSecurityEvent('invalid_email_code', { email: emailNorm }, req);
       return res.status(400).json({
         success: false,
         error: 'invalid_code'
@@ -1335,7 +1296,7 @@ app.post('/verify-email-code', async (req, res) => {
     verifiedEmails[emailNorm] = true;
     delete pendingEmailCodes[emailNorm];
 
-    console.log(`✅ Email verified: ${emailNorm}`);
+    logger.info('Email verified', { email: hashEmail(emailNorm) });
 
     return res.json({ success: true });
   } catch (err) {
@@ -1490,10 +1451,14 @@ app.post('/card-challenge', async (req, res) => {
         createdAt: Date.now(),
         expiresAt: Date.now() + 30 * 1000  // 30 seconds
       };
-      console.log(`💳 Issued card challenge for ${emailNorm}`);
+
+      logger.debug('Card challenge issued', { email: hashEmail(emailNorm) });
+      logSecurityEvent('challenge_issued', { email: emailNorm, type: 'card' }, req);
+
     } else {
       // vendor path: no email, no state, just give them a challenge
-      console.log('💳 Issued card challenge (no email, vendor flow)');
+      logger.debug('Card challenge issued (vendor flow)');
+      logSecurityEvent('challenge_issued', { type: 'card_vendor' }, req);
     }
 
     return res.json({ success: true, challenge });
@@ -1587,16 +1552,13 @@ app.post('/card-verify', async (req, res) => {
     }
 
     if (!verified) {
-      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-      await logSecurityEvent('invalid_card_verify', {
-        ip,
-        email: emailNorm
-      });
+      await logSecurityEvent('invalid_card_verify', { email: emailNorm }, req);
       return res.json({ success: true, verified: false });
     }
 
     delete pendingCardChallenges[emailNorm];
-    console.log(`✅ Card verified for ${emailNorm} (fingerprint: ${matchedFingerprint?.slice(0, 16) || 'unknown'}…)`);
+    logger.info('Card verified', { email: hashEmail(emailNorm) });
+    logSecurityEvent('card_verified', { email: emailNorm }, req);
 
     return res.json({
       success: true,
@@ -1804,9 +1766,11 @@ app.post('/register-device-key', async (req, res) => {
       };
     }
     
-    console.log(`🔐 Registered device signing key for ${emailNorm}`);
-    
+    logger.info('Device signing key registered', { email: hashEmail(emailNorm) });
+    logSecurityEvent('device_key_registered', { email: emailNorm }, req);
+
     return res.json({ success: true });
+
   } catch (err) {
     console.error('❌ /register-device-key error:', err);
     return res.status(500).json({ success: false, error: 'internal_error' });
@@ -1889,6 +1853,7 @@ app.post('/save-token-secure', async (req, res) => {
 // login
 app.post('/confirm-login-secure', async (req, res) => {
   try {
+
     const requestId = String(req.body?.requestId || '').trim();
     const approved = !!req.body?.approved;
     const timestamp = Number(req.body?.timestamp || 0);
@@ -1900,7 +1865,7 @@ app.post('/confirm-login-secure', async (req, res) => {
     }
     
     const login = pendingLogins[requestId];
-    if (!login) {
+    if (!login) {      
       return res.status(404).json({ success: false, error: 'login_not_found' });
     }
     
@@ -1920,7 +1885,7 @@ app.post('/confirm-login-secure', async (req, res) => {
     if (!approved) {
       login.status = 'denied';
       login.deniedAt = Date.now();
-      console.log(`🚫 Login denied for ${emailNorm} (requestId: ${requestId})`);
+      logAuthAttempt(false, { email: emailNorm, requestId, reason: 'user_denied' }, req);
       return res.json({ success: true, approved: false });
     }
     
@@ -1946,13 +1911,9 @@ app.post('/confirm-login-secure', async (req, res) => {
 
     // Check if nonce was already used
     const nonce = login.nonce;
+
     if (usedNonces.has(nonce)) {
-      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-      await logSecurityEvent('nonce_replay_attempt', {
-        ip,
-        email: emailNorm,
-        requestId
-      });
+      await logSecurityEvent('nonce_replay_attempt', { email: emailNorm, requestId }, req);
       return res.status(400).json({ 
           success: false, 
           error: 'nonce_replay_detected',
@@ -1971,12 +1932,7 @@ app.post('/confirm-login-secure', async (req, res) => {
     const validDeviceSig = verifyES256Signature(deviceKey.publicKeyPem, message, signature);
     
     if (!validDeviceSig) {
-      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-      await logSecurityEvent('invalid_device_signature', {
-        ip,
-        email: emailNorm,
-        requestId
-      });
+      await logSecurityEvent('invalid_device_signature', { email: emailNorm, requestId }, req);
       return res.status(403).json({ success: false, error: 'invalid_device_signature' });
     }
     
@@ -1994,28 +1950,18 @@ app.post('/confirm-login-secure', async (req, res) => {
       // Verify card signature over same message
       const validCardSig = verifyRsaSignature(settings.cardPublicKeyPem, message, cardSignature);
       if (!validCardSig) {
-        const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-        await logSecurityEvent('invalid_card_signature', {
-          ip,
-          email: emailNorm,
-          requestId
-        });
+        await logSecurityEvent('invalid_card_signature', { email: emailNorm, requestId }, req);
         return res.status(403).json({ success: false, error: 'invalid_card_signature' });
       }
-      
-      console.log(`🔐 Hardware card verified for ${emailNorm}`);
+
+      logger.info('Hardware card verified', { email: hashEmail(emailNorm) });
+
     }
 
     // 5.5 Verify NFT ownership (server-side, validated, cached)
     const nftCheck = await verifyNFTOwnership(emailNorm);
     if (!nftCheck.owned) {
-      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-      await logSecurityEvent('nft_ownership_failed', {
-        ip,
-        email: emailNorm,
-        reason: nftCheck.reason,
-        tokenId: nftCheck.tokenId
-      });
+      await logSecurityEvent('nft_ownership_failed', { email: emailNorm, reason: nftCheck.reason }, req);
       return res.status(403).json({ 
         success: false, 
         error: 'nft_ownership_failed',
@@ -2053,14 +1999,16 @@ app.post('/confirm-login-secure', async (req, res) => {
     login.approvedAt = Date.now();
     login.loginToken = loginToken;
     
-    console.log(`✅ Login approved for ${emailNorm} (requestId: ${requestId})`);
-    
+    logger.info('Login approved', { email: hashEmail(emailNorm), requestId });
+    logAuthAttempt(true, { email: emailNorm, requestId }, req);
+
     return res.json({
       success: true,
       approved: true,
       requestId,
       token: loginToken
     });
+
   } catch (err) {
     console.error('❌ /confirm-login-secure error:', err);
     return res.status(500).json({ success: false, error: 'internal_error' });
@@ -2130,9 +2078,11 @@ app.post('/register-card', async (req, res) => {
       };
     }
     
-    console.log(`💳 Registered card for ${emailNorm}`);
-    
+    logger.info('Card registered', { email: hashEmail(emailNorm) });
+    logSecurityEvent('card_registered', { email: emailNorm }, req);
+
     return res.json({ success: true });
+
   } catch (err) {
     console.error('❌ /register-card error:', err);
     return res.status(500).json({ success: false, error: 'internal_error' });
@@ -2409,9 +2359,11 @@ app.post('/payment-confirm', (req, res) => {
     session.status      = approved ? 'approved' : 'denied';
     session.confirmedAt = Date.now();
 
-    console.log(`💳 Payment ${paymentId}: ${session.status} by ${session.ownerEmail}`);
+    logger.info('Payment confirmed', { paymentId, status: session.status, email: hashEmail(session.ownerEmail) });
+    logPaymentEvent(approved, { paymentId, email: session.ownerEmail }, req);
 
     return res.json({ success: true });
+
   } catch (err) {
     console.error('❌ /payment-confirm error:', err);
     return res.status(500).json({ success: false, error: 'Server error' });
@@ -3294,12 +3246,7 @@ app.post('/verify-recovery', async (req, res) => {
     const valid = owner.toLowerCase() === address.toLowerCase();
     
     if (!valid) {
-      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-      await logSecurityEvent('recovery_address_mismatch', {
-        ip,
-        email: emailNorm,
-        providedAddress: address
-      });
+      await logSecurityEvent('recovery_address_mismatch', { email: emailNorm }, req);
     }
     
     res.json({ success: true, valid });
@@ -3408,7 +3355,7 @@ app.post('/burn-and-reset-account', async (req, res) => {
       });
     }
 
-    console.log(`🔥 burn-and-reset-account for ${emailNorm}`);
+    logger.info('Account reset requested', { email: hashEmail(emailNorm) });
 
     // 1) Find tokenId by userIdHash
     const userIdHash = commitUserId(emailNorm);
@@ -3472,12 +3419,14 @@ app.post('/burn-and-reset-account', async (req, res) => {
       // not fatal, continue
     }
 
-    console.log(`🧹 Cleared backend state for ${emailNorm}`);
+    logger.info('Account reset completed', { email: hashEmail(emailNorm) });
+    logSecurityEvent('account_reset', { email: emailNorm }, req);
 
     return res.json({
       success: true,
       reset: true
     });
+
   } catch (err) {
     console.error('❌ burn-and-reset-account error:', err);
     const msg = (err?.reason || err?.error?.message || String(err));
@@ -4104,9 +4053,9 @@ app.post('/request-login', async (req, res) => {
     console.log('🔵 Sending FCM message...');
     
     try {
-      const fcmResponse = await admin.messaging().send(message);
-      console.log(`✅ Push sent to ${emailNorm} (${requestId})`);
-      console.log('✅ FCM Response:', fcmResponse);
+      await admin.messaging().send(message);
+      logger.info('Login push sent', { email: hashEmail(emailNorm), requestId });
+      logSecurityEvent('login_requested', { email: emailNorm, requestId }, req);
       return res.json({
         success: true,
         requestId,

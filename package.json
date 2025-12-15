@@ -23,6 +23,8 @@
   "dependencies": {
     "@openzeppelin/contracts": "^5.4.0",
     "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.0",
     "express": "^5.2.1",
     "firebase-admin": "^13.6.0",
     "ioredis": "^5.8.2",
@@ -30,7 +32,6 @@
     "nodemailer": "^7.0.11",
     "resend": "^6.4.2",
     "uuid": "^11.1.0",
-    "dotenv": "^16.4.5",
-    "ethers": "^6.13.0"
+    "winston": "^3.19.0"
   }
 }

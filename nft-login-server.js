@@ -846,7 +846,7 @@ function verifyCardSignature({ publicKey, challenge, signatureB64 }) {
   try {
     const ok = crypto.verify('RSA-SHA256', msg, publicKey, sig);
     if (ok) {
-      console.log('✅ Verified (PKCS1v1_5 + SHA-256)');
+      logger.debug('Card signature verified', { method: 'PKCS1v1_5' });
       return true;
     }
   } catch (e) {
@@ -862,14 +862,14 @@ function verifyCardSignature({ publicKey, challenge, signatureB64 }) {
       sig
     );
     if (ok) {
-      console.log('✅ Verified (RSA-PSS + SHA-256, saltLength=32)');
+      logger.debug('Card signature verified', { method: 'RSA-PSS' });
       return true;
     }
   } catch (e) {
     // ignore
   }
 
-  console.log('❌ Signature did not verify with PKCS1v1_5 or PSS');
+  logger.debug('Card signature verification failed');
   return false;
 }
 
@@ -898,7 +898,7 @@ function spkiFingerprintFromPem(spkiPem) {
     const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
     return crypto.createHash('sha256').update(spkiDer).digest('hex');
   } catch (e) {
-    console.error('spkiFingerprintFromPem error:', e.message);
+    logger.error('SPKI fingerprint error', { error: e.message });
     return null;
   }
 }
@@ -937,7 +937,7 @@ function verifyRsaSignature(spkiPem, challenge, signatureB64) {
 // Validated NFT ownership check with short-TTL caching
 async function verifyNFTOwnership(emailNorm, forceRefresh = false) {
   if (!personaAuth) {
-    console.warn('⚠️ verifyNFTOwnership: contract not configured');
+    logger.warn('NFT ownership check skipped - contract not configured');
     return { owned: false, reason: 'contract_not_configured' };
   }
 
@@ -976,7 +976,7 @@ async function verifyNFTOwnership(emailNorm, forceRefresh = false) {
     if (!isValid) {
       const result = { owned: false, tokenId: tokenIdStr, valid: false, reason: 'token_revoked' };
       nftOwnershipCache.set(emailNorm, { ...result, cachedAt: Date.now() });
-      console.log(`⚠️ NFT ${tokenIdStr} for ${emailNorm} is revoked/invalid`);
+      logger.warn('NFT revoked/invalid', { email: hashEmail(emailNorm), tokenId: tokenIdStr });
       return result;
     }
     
@@ -986,12 +986,12 @@ async function verifyNFTOwnership(emailNorm, forceRefresh = false) {
     return result;
     
   } catch (err) {
-    console.error('❌ verifyNFTOwnership error:', err);
+    logger.error('NFT ownership check error', { error: err.message });
     
     // On error, check cache even if stale (better than failing)
     const staleCache = nftOwnershipCache.get(emailNorm);
     if (staleCache) {
-      console.warn('⚠️ Using stale cache due to RPC error');
+      logger.warn('Using stale NFT cache due to RPC error');
       return { ...staleCache, fromCache: true, stale: true };
     }
     
@@ -1037,7 +1037,7 @@ function verifyES256Signature(publicKeyPem, message, signatureB64url) {
     
     // P-256 signature is 64 bytes (r || s), convert to DER for Node.js
     if (sigBuffer.length !== 64) {
-      console.warn('⚠️ Unexpected signature length:', sigBuffer.length);
+      logger.warn('Unexpected signature length', { length: sigBuffer.length });
       return false;
     }
     
@@ -1051,7 +1051,7 @@ function verifyES256Signature(publicKeyPem, message, signatureB64url) {
     
     return verify.verify(publicKeyPem, derSig);
   } catch (e) {
-    console.error('❌ verifyES256Signature error:', e.message);
+    logger.error('ES256 signature verification error', { error: e.message });
     return false;
   }
 }
@@ -1133,7 +1133,9 @@ function jwkToPem(jwk) {
 
 
 
-
+app.get('/', (req, res) => {
+  res.json({ status: 'ok' });
+});
 
 // XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 // XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
@@ -1168,7 +1170,7 @@ app.post('/save-token', (req, res) => {
       email: emailNorm,
       deviceToken
     };
-    console.log(`💬 Registered messagingId for ${emailNorm} (len=${messagingId.length})`);
+    logger.debug('MessagingId registered', { email: hashEmail(emailNorm) });
   }
 
   logger.debug('Token saved', { email: hashEmail(emailNorm) });
@@ -1187,7 +1189,7 @@ app.get('/identity-status', async (req, res) => {
     const out = await probeIdentityRegistered(emailNorm);
     return res.json({ success:true, registered: out.registered });
   } catch (err) {
-    console.error('❌ /identity-status:', err);
+    logger.error('Identity status check failed', { error: err.message });
     return res.status(500).json({ success:false, error:'identity_status_failed' });
   }
 });
@@ -1322,7 +1324,7 @@ app.post('/mint-persona', async (req, res) => {
     if (!emailNorm || !deviceFpr || !to) return res.status(400).json({ success: false, error: 'email, deviceFpr, to required' });
     if (!isAddress(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
 
-    const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
+    const token = userTokens[emailNorm] || null;
     if (!token) return res.status(403).json({ success: false, error: 'No registered device token for this email' });
 
     const userIdHash = commitUserId(emailNorm);
@@ -1348,7 +1350,7 @@ app.post('/mint-persona', async (req, res) => {
       maxFeePerGas:         fee.maxFeePerGas,
       maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
     });
-    console.log(`⛓️  mintWithSig → ${tx.hash}`);
+    logger.info('Mint transaction sent', { txHash: tx.hash });
 
     if (typeof tx.wait === 'function') await tx.wait(1);
     else await provider.waitForTransaction(tx.hash, 1);
@@ -1570,98 +1572,6 @@ app.post('/card-verify', async (req, res) => {
   }
 });
 
-// door, pay, login, kyc, chat, vault
-// app.post('/confirm-login', (req, res) => {
-//   console.log('🟢 /confirm-login HIT');
-//   console.log('🟢 Headers:', JSON.stringify(req.headers, null, 2));
-//   console.log('🟢 Body:', JSON.stringify(req.body, null, 2));
-  
-//   try {
-//     const requestId = String(req.body?.requestId || '').trim();
-//     const approved  = !!req.body?.approved;
-//     const devicePublicKeyJwk = req.body?.devicePublicKeyJwk || null;
-
-//     console.log('🟢 Parsed - requestId:', requestId, 'approved:', approved);
-//     console.log('🟢 devicePublicKeyJwk:', devicePublicKeyJwk ? 'present' : 'null');
-
-//     if (!requestId) {
-//       console.log('🔴 No requestId provided');
-//       return res.status(400).json({ success: false, error: 'requestId required' });
-//     }
-
-//     const login = pendingLogins[requestId];
-//     console.log('🟢 Pending login found:', login ? 'yes' : 'no');
-    
-//     if (!login) {
-//       console.log('🔴 Login not found for requestId:', requestId);
-//       return res.status(404).json({ success: false, error: 'login_not_found' });
-//     }
-
-//     console.log('🟢 Login status:', login.status);
-    
-//     if (login.status !== 'pending') {
-//       console.log('🔴 Login not pending, current status:', login.status);
-//       return res.status(409).json({ success: false, error: 'login_not_pending' });
-//     }
-
-//     if (!approved) {
-//       console.log('🟡 Login denied by user');
-//       login.status = 'denied';
-//       login.deniedAt = Date.now();
-//       return res.json({ success: true, approved: false });
-//     }
-
-//     const { email: emailNorm, origin, nonce } = login;
-//     console.log('🟢 Login data - email:', emailNorm, 'origin:', origin, 'nonce:', nonce);
-
-//     if (!origin) {
-//       console.error('❌ /confirm-login: missing origin on pending login', requestId);
-//       return res.status(400).json({ success: false, error: 'missing_origin' });
-//     }
-//     if (!emailNorm || !nonce) {
-//       console.error('❌ /confirm-login: missing email/nonce on pending login', requestId);
-//       return res.status(400).json({ success: false, error: 'missing_email_or_nonce' });
-//     }
-
-//     if (devicePublicKeyJwk) {
-//       login.devicePublicKeyJwk = devicePublicKeyJwk;
-//       console.log('🟢 Stored devicePublicKeyJwk');
-//     }
-
-//     console.log('🟢 Generating login token...');
-    
-//     let loginToken;
-//     try {
-//       loginToken = makeLoginToken({
-//         emailNorm,
-//         origin,
-//         deviceHash: null,
-//         nonce
-//       });
-//       console.log('🟢 Login token generated successfully');
-//     } catch (e) {
-//       console.error('❌ /confirm-login makeLoginToken failed:', e.message || e);
-//       return res.status(500).json({ success: false, error: 'token_issue_failed' });
-//     }
-
-//     login.status      = 'approved';
-//     login.approvedAt  = Date.now();
-//     login.loginToken  = loginToken;
-
-//     console.log('✅ Login approved for', emailNorm, 'requestId:', requestId);
-
-//     return res.json({
-//       success:  true,
-//       approved: true,
-//       requestId,
-//       token:    loginToken
-//     });
-//   } catch (err) {
-//     console.error('❌ /confirm-login error:', err);
-//     return res.status(500).json({ success: false, error: 'internal_error' });
-//   }
-// });
-
 app.post('/confirm-login', (req, res) => {
   return res.status(410).json({ 
     success: false, 
@@ -1675,7 +1585,7 @@ app.post('/get-credentials', (req, res) => {
   const emailNorm = normalizeEmail(req.body?.email || '');
   if (!emailNorm) return res.status(400).json({ success: false, error: 'Missing email' });
 
-  const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
+  const token = userTokens[emailNorm] || null;
   if (!token) return res.status(403).json({ success: false, error: 'No registered device token' });
 
   // Require live session or verified email before returning vault contents
@@ -1685,7 +1595,7 @@ app.post('/get-credentials', (req, res) => {
   }
 
   const creds = userCredentials[emailNorm] || [];
-  console.log(`📤 Returned ${creds.length} credentials for ${emailNorm}`);
+  logger.debug('Credentials retrieved', { email: hashEmail(emailNorm), count: creds.length });
   return res.json({
     success: true,
     credentials: creds,
@@ -1803,7 +1713,7 @@ app.post('/save-token-secure', async (req, res) => {
         return res.status(403).json({ success: false, error: 'Email not verified' });
       }
       // Allow token save during initial registration flow
-      console.log(`📱 First-time token save for ${emailNorm} (no device key yet)`);
+      logger.debug('First-time token save', { email: hashEmail(emailNorm) });
     } else {
       // Existing user: require signature
       if (!timestamp || !signature) {
@@ -1838,7 +1748,7 @@ app.post('/save-token-secure', async (req, res) => {
       messagingRouting[messagingId] = { email: emailNorm, deviceToken };
     }
     
-    console.log(`💾 Saved token for ${emailNorm}`);
+    logger.debug('Token saved', { email: hashEmail(emailNorm) });
     return res.json({ success: true });
   } catch (err) {
     console.error('❌ /save-token-secure error:', err);
@@ -2142,7 +2052,7 @@ app.post('/set-security-settings', async (req, res) => {
     }
     userSecuritySettings[emailNorm].requireHardware = requireHardware;
     
-    console.log(`⚙️ Security settings updated for ${emailNorm}: requireHardware=${requireHardware}`);
+    logger.info('Security settings updated', { email: hashEmail(emailNorm), requireHardware });
     
     return res.json({ success: true });
   } catch (err) {
@@ -3376,7 +3286,7 @@ app.post('/burn-and-reset-account', async (req, res) => {
 
     // 2) If there is an active token, revoke it
     if (numericId !== 0n) {
-      console.log(`🔎 Found tokenId ${numericId} for ${emailNorm}, revoking…`);
+      logger.info('Revoking token', { email: hashEmail(emailNorm), tokenId: String(numericId) });
 
       const fee = await getAggressiveFees(provider);
 
@@ -3385,7 +3295,7 @@ app.post('/burn-and-reset-account', async (req, res) => {
         maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
       });
 
-      console.log(`⛓️  revoke(${numericId}) → ${tx.hash}`);
+      logger.info('Revoke transaction sent', { tokenId: String(numericId), txHash: tx.hash });
 
       if (typeof tx.wait === 'function') {
         await tx.wait(1);
@@ -3393,12 +3303,12 @@ app.post('/burn-and-reset-account', async (req, res) => {
         await provider.waitForTransaction(tx.hash, 1);
       }
 
-      console.log(`✅ Revoked token ${numericId} for ${emailNorm}`);
+      logger.info('Token revoked', { email: hashEmail(emailNorm), tokenId: String(numericId) });
       
       // Invalidate NFT cache
       nftOwnershipCache.delete(emailNorm);
     } else {
-      console.log(`ℹ️ No active token for ${emailNorm}, skipping revoke`);
+      logger.debug('No active token to revoke', { email: hashEmail(emailNorm) });
     }
 
     // 3) Clear all backend state for this email
@@ -3442,7 +3352,7 @@ app.post('/burn-and-reset-account', async (req, res) => {
 
 const db = {
   getUserByEmail: async (email) => {
-    const token = userTokens[normalizeEmail(email)] || process.env.TEST_PUSH_TOKEN;
+    const token = userTokens[normalizeEmail(email)];
     if (!token) return null;
     return { email: normalizeEmail(email), deviceToken: token };
   }
@@ -3506,14 +3416,7 @@ async function pushToMessagingId(messagingId, data) {
 
   try {
     const resp = await admin.messaging().sendEachForMulticast(message);
-    console.log(
-      "✅ FCM push →",
-      resp.successCount,
-      "success,",
-      resp.failureCount,
-      "failure for type=",
-      dataStrings.type || ""
-    );
+    logger.debug('FCM push sent', { type: dataStrings.type, success: resp.successCount, failure: resp.failureCount });
     return resp;
   } catch (err) {
     console.error("🔥 pushToMessagingId error:", err);
@@ -3534,10 +3437,10 @@ app.post('/store-credentials', (req, res) => {
   const credentials = req.body?.credentials;
 
   if (!emailNorm || !deviceId || !Array.isArray(credentials)) {
-    console.log('❌ /store-credentials 400 shape', {
-      emailNorm,
-      deviceId,
-      credsType: Array.isArray(credentials) ? 'array' : typeof credentials,
+    logger.warn('Store credentials bad request', { 
+      hasEmail: !!emailNorm, 
+      hasDeviceId: !!deviceId, 
+      credsType: Array.isArray(credentials) ? 'array' : typeof credentials 
     });
     return res.status(400).json({ success: false, error: 'Missing or invalid fields' });
   }
@@ -3546,27 +3449,22 @@ app.post('/store-credentials', (req, res) => {
     sessionApprovals[emailNorm] && Date.now() < sessionApprovals[emailNorm];
 
   if (!verifiedEmails[emailNorm] && !hasLiveSession) {
-    console.log('❌ /store-credentials 403 session gate', {
-      emailNorm,
-      verified: !!verifiedEmails[emailNorm],
-      hasLiveSession,
-      sessionExpiry: sessionApprovals[emailNorm] || null,
-    });
-    return res.status(403).json({ success: false, error: 'Session locked or expired' });
+      logger.warn('Store credentials session rejected', {
+        email: hashEmail(emailNorm),
+        verified: !!verifiedEmails[emailNorm],
+        hasLiveSession
+      });
+      return res.status(403).json({ success: false, error: 'Session locked or expired' });
   }
 
-  const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
+  const token = userTokens[emailNorm] || null;
   if (!token) {
-    console.log('❌ /store-credentials 403 token gate', {
-      emailNorm,
-      hasUserToken: !!userTokens[emailNorm],
-      hasTestToken: !!process.env.TEST_PUSH_TOKEN,
-    });
+    logger.warn('Store credentials rejected - no token', { email: hashEmail(emailNorm) });
     return res.status(403).json({ success: false, error: 'Unregistered device' });
   }
 
   userCredentials[emailNorm] = credentials;
-  console.log(`💾 Stored ${credentials.length} encrypted credentials for ${emailNorm}`);
+  logger.info('Credentials stored', { email: hashEmail(emailNorm), count: credentials.length });
   return res.json({ success: true });
 });
 
@@ -3575,8 +3473,8 @@ app.post('/delete-credential', (req, res) => {
   const emailNorm = normalizeEmail(req.body?.email || '');
   const deviceId = String(req.body?.deviceId || '');
   const credentialId = req.body?.credentialId;
-  console.log("🧠 Incoming DELETE request with:", { email: emailNorm, deviceId, credentialId });
-
+  logger.debug('Delete credential request', { email: hashEmail(emailNorm), credentialId });
+  
   if (!emailNorm || !deviceId || !credentialId) {
     return res.status(400).json({ success: false, error: 'Missing fields' });
   }
@@ -3591,7 +3489,7 @@ app.post('/delete-credential', (req, res) => {
 
   userCredentials[emailNorm] = updated;
 
-  console.log(`🗑️ Delete ${credentialId} for ${emailNorm} → removed=${removed} (before=${before}, after=${updated.length})`);
+  logger.info('Credential deleted', { email: hashEmail(emailNorm), removed, remaining: updated.length });
   return res.json({ success: true, removed });
 });
 
@@ -4545,7 +4443,7 @@ app.post('/mint-nft', async (req, res) => {
     if (!emailNorm || !deviceFpr || !to) return res.status(400).json({ success: false, error: 'email, deviceFpr, to required' });
     if (!isAddress(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
 
-    const token = userTokens[emailNorm] || process.env.TEST_PUSH_TOKEN || null;
+    const token = userTokens[emailNorm] || null;
     if (!token) return res.status(403).json({ success: false, error: 'No registered device token for this email' });
 
     const userIdHash = commitUserId(emailNorm);

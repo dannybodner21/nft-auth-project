@@ -985,16 +985,11 @@ async function verifyNFTOwnership(emailNorm, forceRefresh = false) {
     return result;
     
   } catch (err) {
+
     logger.error('NFT ownership check error', { error: err.message });
     
-    // On error, check cache even if stale (better than failing)
-    const staleCache = nftOwnershipCache.get(emailNorm);
-    if (staleCache) {
-      logger.warn('Using stale NFT cache due to RPC error');
-      return { ...staleCache, fromCache: true, stale: true };
-    }
-    
-    return { owned: false, reason: 'rpc_error', error: err.message };
+    // Fail closed - deny access when ownership cannot be verified
+    return { owned: false, reason: 'verification_unavailable', error: err.message };
   }
 }
 

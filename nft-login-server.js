@@ -987,7 +987,7 @@ async function verifyNFTOwnership(emailNorm, forceRefresh = false) {
   } catch (err) {
 
     logger.error('NFT ownership check error', { error: err.message });
-    
+
     // Fail closed - deny access when ownership cannot be verified
     return { owned: false, reason: 'verification_unavailable', error: err.message };
   }
@@ -2084,6 +2084,54 @@ app.get('/get-security-settings', async (req, res) => {
   }
 });
 
+// Check if this device is still authorized for the account
+// login
+app.post('/verify-device-status', async (req, res) => {
+  try {
+    const { email } = req.body;
+    const emailNorm = (email || '').toLowerCase().trim();
+    
+    if (!emailNorm) {
+      return res.status(400).json({ success: false, error: 'missing_email' });
+    }
+    
+    // Get the device public key from the request (signed check)
+    const devicePublicKeyJwk = req.body.devicePublicKeyJwk;
+    
+    if (!devicePublicKeyJwk) {
+      return res.status(400).json({ success: false, error: 'missing_device_key' });
+    }
+    
+    // Get stored device key for this email
+    const storedKeyJson = await redis.get(`deviceKey:${emailNorm}`);
+    
+    if (!storedKeyJson) {
+      // No device key registered - account may not exist or was reset
+      return res.json({ success: true, authorized: false, reason: 'no_registered_device' });
+    }
+    
+    const storedKey = JSON.parse(storedKeyJson);
+    
+    // Compare the x and y coordinates of the public keys
+    const keysMatch = storedKey.x === devicePublicKeyJwk.x && 
+                      storedKey.y === devicePublicKeyJwk.y;
+    
+    if (!keysMatch) {
+      logger.info('Device key mismatch - device revoked', { 
+        email: hashForLog(emailNorm),
+        reason: 'key_mismatch' 
+      });
+      return res.json({ success: true, authorized: false, reason: 'device_revoked' });
+    }
+    
+    // Device is still authorized
+    return res.json({ success: true, authorized: true });
+    
+  } catch (err) {
+    logger.error('verify-device-status error', { error: err.message });
+    return res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
 
 // ========================= END: LOGIN APP ENDPOINTS ==========================
 

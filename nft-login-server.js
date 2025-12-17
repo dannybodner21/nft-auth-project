@@ -1650,9 +1650,17 @@ app.post('/register-device-key', async (req, res) => {
       return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 300 });
     }
     
-    // Require email to be recently verified (within last 10 minutes)
+    // Require email to be recently verified OR valid NFT ownership (recovery case)
     if (!verifiedEmails[emailNorm]) {
-      return res.status(403).json({ success: false, error: 'Email not verified' });
+      // Check if user has NFT - proves account ownership for recovery
+      const nftCheck = await verifyNFTOwnership(emailNorm);
+      if (!nftCheck.owned) {
+        logger.warn('register-device-key rejected - email not verified and no NFT', { email: hashEmail(emailNorm) });
+        return res.status(403).json({ success: false, error: 'Email not verified' });
+      }
+      // User has NFT, mark email as verified
+      verifiedEmails[emailNorm] = Date.now();
+      logger.info('Email auto-verified via NFT ownership during recovery', { email: hashEmail(emailNorm) });
     }
     
     // Store the key

@@ -1140,7 +1140,7 @@ app.get('/', (req, res) => {
 // ----- Token registration -----
 // door, pay, login, kyc, chat, vault
 app.post('/save-token', (req, res) => {
-  const { email, deviceToken } = req.body || {};
+  const { email, deviceToken, isRecovery } = req.body || {};
   const messagingId = String(req.body?.messagingId || '').trim();
 
   if (!email || !deviceToken) {
@@ -1152,11 +1152,16 @@ app.post('/save-token', (req, res) => {
   // Preserve existing single-token mapping
   userTokens[emailNorm] = deviceToken;
 
-  // NEW: maintain a set of tokens per email for pushes (login, payments, etc.)
-  if (!emailToTokens[emailNorm]) {
-    emailToTokens[emailNorm] = new Set();
+  // If recovery, clear all old tokens and use only this one
+  // Otherwise add to the set (allows multiple devices)
+  if (isRecovery) {
+    emailToTokens[emailNorm] = new Set([deviceToken]);
+  } else {
+    if (!emailToTokens[emailNorm]) {
+      emailToTokens[emailNorm] = new Set();
+    }
+    emailToTokens[emailNorm].add(deviceToken);
   }
-  emailToTokens[emailNorm].add(deviceToken);
 
   // If the client passes a messagingId (Curve25519 pubkey), map it to this device token.
   if (messagingId.length > 0) {

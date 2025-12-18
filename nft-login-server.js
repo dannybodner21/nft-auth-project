@@ -1820,9 +1820,7 @@ app.post('/confirm-login-secure', async (req, res) => {
 
     let deviceKey;
     try {
-      const publicKeyJwk = JSON.parse(deviceKeyJson);
-      const publicKeyPem = jwkToPem(publicKeyJwk);
-      deviceKey = { publicKeyPem, publicKeyJwk };
+      deviceKey = JSON.parse(deviceKeyJson);
     } catch (e) {
       console.error(`❌ Failed to parse device key for ${emailNorm}:`, e);
       return res.status(500).json({ success: false, error: 'device_key_invalid' });

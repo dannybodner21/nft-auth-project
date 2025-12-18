@@ -1669,7 +1669,7 @@ app.post('/register-device-key', async (req, res) => {
       registeredAt: Date.now()
     }));
 
-    console.log('📝 Stored device key for', emailNorm, '- PEM starts with:', publicKeyPem.substring(0, 50));
+    //console.log('📝 Stored device key for', emailNorm, '- PEM starts with:', publicKeyPem.substring(0, 50));
     
     // Initialize security settings
     if (!userSecuritySettings[emailNorm]) {
@@ -1826,7 +1826,7 @@ app.post('/confirm-login-secure', async (req, res) => {
       return res.status(500).json({ success: false, error: 'device_key_invalid' });
     }
 
-    console.log('📖 Read device key for', emailNorm, '- PEM starts with:', deviceKey.publicKeyPem?.substring(0, 50));
+    //console.log('📖 Read device key for', emailNorm, '- PEM starts with:', deviceKey.publicKeyPem?.substring(0, 50));
     
     // 2. Validate required fields
     if (!timestamp || !signature) {
@@ -2111,52 +2111,50 @@ app.get('/get-security-settings', async (req, res) => {
 
 // Check if this device is still authorized for the account
 // login
-// app.post('/verify-device-status', async (req, res) => {
-//   try {
-//     const { email } = req.body;
-//     const emailNorm = (email || '').toLowerCase().trim();
+app.post('/verify-device-status', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.body?.email || '');
+    const devicePublicKeyJwk = req.body?.devicePublicKeyJwk;
     
-//     if (!emailNorm) {
-//       return res.status(400).json({ success: false, error: 'missing_email' });
-//     }
+    if (!emailNorm) {
+      return res.status(400).json({ success: false, error: 'missing_email' });
+    }
     
-//     // Get the device public key from the request (signed check)
-//     const devicePublicKeyJwk = req.body.devicePublicKeyJwk;
+    if (!devicePublicKeyJwk) {
+      return res.status(400).json({ success: false, error: 'missing_device_key' });
+    }
     
-//     if (!devicePublicKeyJwk) {
-//       return res.status(400).json({ success: false, error: 'missing_device_key' });
-//     }
+    // Get stored device key from Redis
+    const deviceKeyJson = await redis.get(`deviceKey:${emailNorm}`);
     
-//     // Get stored device key for this email
-//     const storedKeyJson = await redis.get(`deviceKey:${emailNorm}`);
+    if (!deviceKeyJson) {
+      return res.json({ success: true, authorized: false, reason: 'no_registered_device' });
+    }
     
-//     if (!storedKeyJson) {
-//       // No device key registered - account may not exist or was reset
-//       return res.json({ success: true, authorized: false, reason: 'no_registered_device' });
-//     }
+    let storedKey;
+    try {
+      storedKey = JSON.parse(deviceKeyJson);
+    } catch (e) {
+      return res.status(500).json({ success: false, error: 'stored_key_invalid' });
+    }
     
-//     const storedKey = JSON.parse(storedKeyJson);
+    // Compare the x and y coordinates of the public keys
+    const storedJwk = storedKey.publicKeyJwk;
+    const keysMatch = storedJwk.x === devicePublicKeyJwk.x && 
+                      storedJwk.y === devicePublicKeyJwk.y;
     
-//     // Compare the x and y coordinates of the public keys
-//     const keysMatch = storedKey.x === devicePublicKeyJwk.x && 
-//                       storedKey.y === devicePublicKeyJwk.y;
+    if (!keysMatch) {
+      logger.info('Device status check - device revoked', { email: hashEmail(emailNorm) });
+      return res.json({ success: true, authorized: false, reason: 'device_revoked' });
+    }
     
-//     if (!keysMatch) {
-//       logger.info('Device key mismatch - device revoked', { 
-//         email: hashForLog(emailNorm),
-//         reason: 'key_mismatch' 
-//       });
-//       return res.json({ success: true, authorized: false, reason: 'device_revoked' });
-//     }
+    return res.json({ success: true, authorized: true });
     
-//     // Device is still authorized
-//     return res.json({ success: true, authorized: true });
-    
-//   } catch (err) {
-//     logger.error('verify-device-status error', { error: err.message });
-//     return res.status(500).json({ success: false, error: 'server_error' });
-//   }
-// });
+  } catch (err) {
+    console.error('❌ /verify-device-status error:', err);
+    return res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
 
 // ========================= END: LOGIN APP ENDPOINTS ==========================
 

@@ -1668,6 +1668,8 @@ app.post('/register-device-key', async (req, res) => {
       publicKeyJwk,
       registeredAt: Date.now()
     }));
+
+    console.log('📝 Stored device key for', emailNorm, '- PEM starts with:', publicKeyPem.substring(0, 50));
     
     // Initialize security settings
     if (!userSecuritySettings[emailNorm]) {
@@ -1825,6 +1827,8 @@ app.post('/confirm-login-secure', async (req, res) => {
       console.error(`❌ Failed to parse device key for ${emailNorm}:`, e);
       return res.status(500).json({ success: false, error: 'device_key_invalid' });
     }
+
+    console.log('📖 Read device key for', emailNorm, '- PEM starts with:', deviceKey.publicKeyPem?.substring(0, 50));
     
     // 2. Validate required fields
     if (!timestamp || !signature) {

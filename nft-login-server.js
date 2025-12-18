@@ -1650,25 +1650,17 @@ app.post('/register-device-key', async (req, res) => {
       return res.status(429).json({ success: false, error: 'rate_limited', retryAfter: 300 });
     }
     
-    // Require email to be recently verified OR valid NFT ownership (recovery case)
+    // Require email to be recently verified (within last 10 minutes)
     if (!verifiedEmails[emailNorm]) {
-      // Check if user has NFT - proves account ownership for recovery
-      const nftCheck = await verifyNFTOwnership(emailNorm);
-      if (!nftCheck.owned) {
-        logger.warn('register-device-key rejected - email not verified and no NFT', { email: hashEmail(emailNorm) });
-        return res.status(403).json({ success: false, error: 'Email not verified' });
-      }
-      // User has NFT, mark email as verified
-      verifiedEmails[emailNorm] = Date.now();
-      logger.info('Email auto-verified via NFT ownership during recovery', { email: hashEmail(emailNorm) });
+      return res.status(403).json({ success: false, error: 'Email not verified' });
     }
     
     // Store the key
-    await redis.set(
-      `deviceKey:${emailNorm}`,
-      JSON.stringify(publicKeyJwk)
-    );
-    
+    deviceSigningKeys[emailNorm] = {
+      publicKeyPem,
+      publicKeyJwk,
+      registeredAt: Date.now()
+    };
     
     // Initialize security settings
     if (!userSecuritySettings[emailNorm]) {
@@ -1803,23 +1795,12 @@ app.post('/confirm-login-secure', async (req, res) => {
     
     // APPROVAL: Requires cryptographic proof
     
-    // 1. Get device signing key from Redis
-    const deviceKeyJson = await redis.get(`deviceKey:${emailNorm}`);
-    if (!deviceKeyJson) {
+    // 1. Get device signing key
+    const deviceKey = deviceSigningKeys[emailNorm];
+    if (!deviceKey) {
       console.error(`❌ No device key for ${emailNorm}`);
       return res.status(403).json({ success: false, error: 'no_device_key' });
     }
-
-    const publicKeyJwk = JSON.parse(deviceKeyJson);
-    let publicKeyPem;
-    try {
-      publicKeyPem = jwkToPem(publicKeyJwk);
-    } catch (e) {
-      console.error(`❌ Failed to convert device key for ${emailNorm}:`, e);
-      return res.status(500).json({ success: false, error: 'device_key_invalid' });
-    }
-
-    const deviceKey = { publicKeyPem, publicKeyJwk };
     
     // 2. Validate required fields
     if (!timestamp || !signature) {
@@ -1902,8 +1883,8 @@ app.post('/confirm-login-secure', async (req, res) => {
     try {
       // Get device key fingerprint for token binding
       const deviceKeyFingerprint = deviceKey.publicKeyPem ? 
-      crypto.createHash('sha256').update(deviceKey.publicKeyPem).digest('hex').slice(0, 16) : 
-      null;
+        crypto.createHash('sha256').update(deviceKey.publicKeyPem).digest('hex').slice(0, 16) : 
+        null;
       
       loginToken = makeLoginToken({
         emailNorm,

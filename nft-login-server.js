@@ -1803,12 +1803,23 @@ app.post('/confirm-login-secure', async (req, res) => {
     
     // APPROVAL: Requires cryptographic proof
     
-    // 1. Get device signing key
-    const deviceKey = deviceSigningKeys[emailNorm];
-    if (!deviceKey) {
+    // 1. Get device signing key from Redis
+    const deviceKeyJson = await redis.get(`deviceKey:${emailNorm}`);
+    if (!deviceKeyJson) {
       console.error(`❌ No device key for ${emailNorm}`);
       return res.status(403).json({ success: false, error: 'no_device_key' });
     }
+
+    const publicKeyJwk = JSON.parse(deviceKeyJson);
+    let publicKeyPem;
+    try {
+      publicKeyPem = jwkToPem(publicKeyJwk);
+    } catch (e) {
+      console.error(`❌ Failed to convert device key for ${emailNorm}:`, e);
+      return res.status(500).json({ success: false, error: 'device_key_invalid' });
+    }
+
+    const deviceKey = { publicKeyPem, publicKeyJwk };
     
     // 2. Validate required fields
     if (!timestamp || !signature) {
@@ -1890,10 +1901,9 @@ app.post('/confirm-login-secure', async (req, res) => {
     let loginToken;
     try {
       // Get device key fingerprint for token binding
-      const deviceKey = deviceSigningKeys[emailNorm];
-      const deviceKeyFingerprint = deviceKey ? 
-        crypto.createHash('sha256').update(deviceKey.publicKeyPem).digest('hex').slice(0, 16) : 
-        null;
+      const deviceKeyFingerprint = deviceKey.publicKeyPem ? 
+      crypto.createHash('sha256').update(deviceKey.publicKeyPem).digest('hex').slice(0, 16) : 
+      null;
       
       loginToken = makeLoginToken({
         emailNorm,

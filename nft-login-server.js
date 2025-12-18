@@ -1664,11 +1664,11 @@ app.post('/register-device-key', async (req, res) => {
     }
     
     // Store the key
-    deviceSigningKeys[emailNorm] = {
-      publicKeyPem,
-      publicKeyJwk,
-      registeredAt: Date.now()
-    };
+    await redis.set(
+      `deviceKey:${emailNorm}`,
+      JSON.stringify(publicKeyJwk)
+    );
+    
     
     // Initialize security settings
     if (!userSecuritySettings[emailNorm]) {

@@ -1656,11 +1656,18 @@ app.post('/register-device-key', async (req, res) => {
     }
     
     // Store the key
-    deviceSigningKeys[emailNorm] = {
+    // deviceSigningKeys[emailNorm] = {
+    //   publicKeyPem,
+    //   publicKeyJwk,
+    //   registeredAt: Date.now()
+    // };
+
+    // Store the key in Redis
+    await redis.set(`deviceKey:${emailNorm}`, JSON.stringify({
       publicKeyPem,
       publicKeyJwk,
       registeredAt: Date.now()
-    };
+    }));
     
     // Initialize security settings
     if (!userSecuritySettings[emailNorm]) {
@@ -1796,10 +1803,27 @@ app.post('/confirm-login-secure', async (req, res) => {
     // APPROVAL: Requires cryptographic proof
     
     // 1. Get device signing key
-    const deviceKey = deviceSigningKeys[emailNorm];
-    if (!deviceKey) {
+    // const deviceKey = deviceSigningKeys[emailNorm];
+    // if (!deviceKey) {
+    //   console.error(`❌ No device key for ${emailNorm}`);
+    //   return res.status(403).json({ success: false, error: 'no_device_key' });
+    // }
+
+    // 1. Get device signing key from Redis
+    const deviceKeyJson = await redis.get(`deviceKey:${emailNorm}`);
+    if (!deviceKeyJson) {
       console.error(`❌ No device key for ${emailNorm}`);
       return res.status(403).json({ success: false, error: 'no_device_key' });
+    }
+
+    let deviceKey;
+    try {
+      const publicKeyJwk = JSON.parse(deviceKeyJson);
+      const publicKeyPem = jwkToPem(publicKeyJwk);
+      deviceKey = { publicKeyPem, publicKeyJwk };
+    } catch (e) {
+      console.error(`❌ Failed to parse device key for ${emailNorm}:`, e);
+      return res.status(500).json({ success: false, error: 'device_key_invalid' });
     }
     
     // 2. Validate required fields
